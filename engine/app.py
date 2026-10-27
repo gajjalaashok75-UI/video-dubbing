@@ -65,10 +65,10 @@ jobs: dict = {}
 
 # Where a run keeps its uploads, per-project folders and intermediate audio.
 # The default sits beside the code, which is right for a desktop install; a
-# hosted deployment (Colab, Kaggle, Docker) points MULTIVA_UPLOAD_DIR at a
+# hosted deployment (Colab, Kaggle, Docker) points VIDEOTRANS_UPLOAD_DIR at a
 # writable volume instead, because the checkout is not durable there.
 UPLOAD_DIR = os.path.abspath(
-    os.getenv("MULTIVA_UPLOAD_DIR") or os.path.join(_PROJECT_ROOT, "temp_uploads"))
+    os.getenv("VIDEOTRANS_UPLOAD_DIR") or os.path.join(_PROJECT_ROOT, "temp_uploads"))
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 # The heavy stages (TTS + Wav2Lip) share one GPU. Running two jobs through them
@@ -98,7 +98,7 @@ def sweep_workdirs() -> int:
     """
     if not os.path.isdir(UPLOAD_DIR):
         return 0
-    cutoff = time.time() - engines.tunable("MULTIVA_SWEEP_HOURS") * 3600
+    cutoff = time.time() - engines.tunable("VIDEOTRANS_SWEEP_HOURS") * 3600
     live = {j.get("workdir") for j in jobs.values()}
     freed = 0
 
@@ -283,7 +283,7 @@ def _warm_lipsync():
     lip_sync.warmup()
 
 
-app = FastAPI(title="Multiva.Ai — Indian-language Voice Cloning API",
+app = FastAPI(title="VideoTrans.Ai — Indian-language Voice Cloning API",
               lifespan=lifespan)
 
 app.add_middleware(
@@ -963,8 +963,8 @@ async def get_job_video(job_id: str, download: bool = False):
         return FileResponse(path, media_type="video/mp4")
 
     # Name it after the project and language, not the job id.
-    stem = _project_name(job, job_id).rsplit(".", 1)[0].strip() or "multiva"
-    stem = re.sub(r"[^\w\- ]+", "", stem).strip() or "multiva"
+    stem = _project_name(job, job_id).rsplit(".", 1)[0].strip() or "videotrans"
+    stem = re.sub(r"[^\w\- ]+", "", stem).strip() or "videotrans"
     lang = job.get("target_language") or "dub"
     return FileResponse(path, media_type="video/mp4",
                         filename=f"{stem}_{lang}.mp4")
@@ -1155,7 +1155,7 @@ def _download_name(job_id: str, stem: str = "") -> str:
     pretty = (job.get("title") or "").strip()
     if not pretty:
         pretty = re.sub(r"^[0-9a-f]{8,}[-_]", "", stem or job_id)
-    return re.sub(r"[^\w\- ]+", "", pretty).strip() or "multiva"
+    return re.sub(r"[^\w\- ]+", "", pretty).strip() or "videotrans"
 
 
 def _file_render(job_id: str, source_path: str, stem: str, language: str,
@@ -1177,7 +1177,7 @@ def _file_render(job_id: str, source_path: str, stem: str, language: str,
         pretty = (job.get("title") or "").strip()
         if not pretty:
             pretty = re.sub(r"^[0-9a-f]{8,}[-_]", "", stem)
-        pretty = re.sub(r"[^\w\- ]+", "", pretty).strip() or stem or "multiva"
+        pretty = re.sub(r"[^\w\- ]+", "", pretty).strip() or stem or "videotrans"
         base = f"{pretty}_{language}{suffix}"
         target = os.path.join(folder, f"{base}.mp4")
         n = 2

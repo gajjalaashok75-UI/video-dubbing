@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Start Multiva: check what it needs, start what is missing, open the studio.
+# Start VideoTrans: check what it needs, start what is missing, open the studio.
 #
 #   ./run.sh                  desktop app, local model through Ollama
 #   ./run.sh --provider groq  a hosted script model
@@ -48,17 +48,17 @@ done
 say()  { printf '  %s\n' "$*"; }
 fail() { printf '\n  %s\n\n' "$*" >&2; exit 1; }
 
-printf '\n  Multiva\n  %s\n' "------------------------------------------------"
+printf '\n  VideoTrans\n  %s\n' "------------------------------------------------"
 
 if [ "$FRESH" = "1" ]; then
     # A named sandbox persists between runs, so a test can be picked up where
     # it was left and the files inspected afterwards. An unnamed one is
     # thrown away with the temp directory.
-    SANDBOX="${SANDBOX_DIR:-${TMPDIR:-/tmp}/multiva-fresh-$$}"
+    SANDBOX="${SANDBOX_DIR:-${TMPDIR:-/tmp}/videotrans-fresh-$$}"
     mkdir -p "$SANDBOX/projects"
-    export MULTIVA_ENGINES="$SANDBOX/engines.json"
-    export MULTIVA_SETTINGS="$SANDBOX/llm.json"
-    export MULTIVA_OUTPUT_DIR="$SANDBOX/projects"
+    export VIDEOTRANS_ENGINES="$SANDBOX/engines.json"
+    export VIDEOTRANS_SETTINGS="$SANDBOX/llm.json"
+    export VIDEOTRANS_OUTPUT_DIR="$SANDBOX/projects"
     say "First-run mode. Your real settings are untouched."
     say "Sandbox: $SANDBOX"
     say "Models are shared, so nothing is downloaded twice."
@@ -70,7 +70,7 @@ fi
 command -v ffmpeg >/dev/null 2>&1 || fail "ffmpeg is not installed. Run:
     brew install ffmpeg        (macOS)
     sudo apt install ffmpeg    (Ubuntu)
-then start Multiva again."
+then start VideoTrans again."
 
 # Ask, unless nobody is there to answer.
 confirm() {
@@ -96,10 +96,10 @@ if [ ! -x "$PY" ]; then
     BOOT_PY=$(find_python) || fail "Python 3.10 or newer is not installed. Run:
     brew install python@3.10        (macOS)
     sudo apt install python3.10 python3.10-venv    (Ubuntu)
-then start Multiva again."
+then start VideoTrans again."
 
     say ""
-    say "Multiva needs a Python environment before it can run."
+    say "VideoTrans needs a Python environment before it can run."
     say "It is about 2 GB, goes in venv/ inside this folder, and touches"
     say "nothing else on your machine. Deleting that folder undoes it."
     say ""
@@ -144,7 +144,7 @@ if ! "$PY" scripts/download_models.py --check 2>/dev/null | grep -q "0 item"; th
     say ""
     if confirm "Download them now?"; then
         "$PY" scripts/download_models.py || fail "The download did not finish.
-Run Multiva again to pick up where it stopped."
+Run VideoTrans again to pick up where it stopped."
     else
         say "Skipping. Dubbing will fail until the models are here; you can"
         say "fetch them from the studio's setup screen instead."
@@ -204,15 +204,15 @@ fi
 # this machine, and it opens as a window on this machine. If the window has
 # not been built yet, build it - that needs the Rust toolchain, which is the
 # one thing beyond Python and ffmpeg the desktop app depends on.
-APP_BUNDLE="apps/studio/src-tauri/target/release/bundle/macos/Multiva Studio.app"
-APP_LINUX="apps/studio/src-tauri/target/release/multiva-studio"
+APP_BUNDLE="apps/studio/src-tauri/target/release/bundle/macos/VideoTrans Studio.app"
+APP_LINUX="apps/studio/src-tauri/target/release/videotrans-studio"
 DESKTOP=""
 [ -d "$APP_BUNDLE" ] && DESKTOP="$APP_BUNDLE"
 [ -z "$DESKTOP" ] && [ -x "$APP_LINUX" ] && DESKTOP="$APP_LINUX"
 
 if [ -z "$DESKTOP" ]; then
     command -v cargo >/dev/null 2>&1 || fail "The desktop window has not been built, and Rust is not installed.
-Install it from https://rustup.rs, then start Multiva again and it will build itself.
+Install it from https://rustup.rs, then start VideoTrans again and it will build itself.
     curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh"
     say ""
     say "The desktop window has not been built yet. Building it takes a few"
@@ -263,8 +263,8 @@ say "Ctrl-C stops it."
 printf '  %s\n\n' "------------------------------------------------"
 
 cd engine
-export MULTIVA_LLM_PROVIDER="$PROVIDER"
-[ -n "$MODEL" ] && export MULTIVA_LLM_MODEL="$MODEL"
+export VIDEOTRANS_LLM_PROVIDER="$PROVIDER"
+[ -n "$MODEL" ] && export VIDEOTRANS_LLM_MODEL="$MODEL"
 export PYTORCH_ENABLE_MPS_FALLBACK=1
 export TOKENIZERS_PARALLELISM=false
 exec "../${PY#./}" -m uvicorn app:app --port "$PORT"

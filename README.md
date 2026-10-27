@@ -1,4 +1,4 @@
-# Multiva
+# VideoTrans
 
 Offline video dubbing for Indian languages. Point it at a talking-head video,
 pick a language, and get the same person saying the same thing in that language
@@ -91,7 +91,7 @@ and the Media / Edit / Deliver pages of a project. The engine is the job store
 and the pipeline: it writes a manifest per project so everything reopens after a
 restart, and files the finished output where you asked.
 
-There is no database and no object store. Settings live in `~/.multiva/`,
+There is no database and no object store. Settings live in `~/.videotrans/`,
 working files in `temp_uploads/job_*/`, finished renders in your output folder.
 
 ---
@@ -124,8 +124,8 @@ Two notebooks, same steps, one for each host. Open the one you want, select a
 
 | Notebook | Where it writes | How you open the UI |
 |---|---|---|
-| [`deploy/notebooks/colab.ipynb`](deploy/notebooks/colab.ipynb) | `/content/multiva-runtime` | Colab's own port proxy, printed by the notebook |
-| [`deploy/notebooks/kaggle.ipynb`](deploy/notebooks/kaggle.ipynb) | `/kaggle/working/multiva-runtime` | a Cloudflare quick tunnel, started by the notebook |
+| [`deploy/notebooks/colab.ipynb`](deploy/notebooks/colab.ipynb) | `/content/videotrans-runtime` | Colab's own port proxy, printed by the notebook |
+| [`deploy/notebooks/kaggle.ipynb`](deploy/notebooks/kaggle.ipynb) | `/kaggle/working/videotrans-runtime` | a Cloudflare quick tunnel, started by the notebook |
 
 Each notebook clones the repo, checks the GPU, redirects the runtime directories
 to a writable volume, installs the CUDA PyTorch build and the rest of
@@ -133,7 +133,7 @@ to a writable volume, installs the CUDA PyTorch build and the rest of
 of the kernel, prints the public URL, and stops the server at the end.
 
 Everything the server writes also goes to a log file under the runtime root
-(`<runtime>/logs/server.log`, e.g. `/content/multiva-runtime/logs/server.log`),
+(`<runtime>/logs/server.log`, e.g. `/content/videotrans-runtime/logs/server.log`),
 so a failed render can be diagnosed after the fact. Section 7a of the notebook
 follows the file live, and `server.tail()` prints the last lines from Python.
 
@@ -156,8 +156,8 @@ a `.env` beside the compose file to unlock the gated voice model.
 To build the image directly:
 
 ```bash
-docker build -f deploy/docker/Dockerfile -t multiva:latest .
-docker run --gpus all -p 8000:8000 -v multiva-data:/data multiva:latest
+docker build -f deploy/docker/Dockerfile -t videotrans:latest .
+docker run --gpus all -p 8000:8000 -v videotrans-data:/data videotrans:latest
 ```
 
 `deploy/docker/entrypoint.sh` also takes `models` (fetch weights and exit) and
@@ -167,7 +167,7 @@ docker run --gpus all -p 8000:8000 -v multiva-data:/data multiva:latest
 
 ## Install locally
 
-Python 3.10, ffmpeg, and Rust. Multiva is a desktop application: the studio is a
+Python 3.10, ffmpeg, and Rust. VideoTrans is a desktop application: the studio is a
 native window and Rust builds it once. The interface files ship built in `web/`,
 so Node is only needed to change them.
 

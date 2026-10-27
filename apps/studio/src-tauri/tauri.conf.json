@@ -1,8 +1,8 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
-  "productName": "Multiva Studio",
+  "productName": "VideoTrans Studio",
   "version": "0.1.0",
-  "identifier": "com.multiva.studio",
+  "identifier": "com.videotrans.studio",
   "build": {
     "frontendDist": "splash"
   },
@@ -11,7 +11,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "Multiva Studio",
+        "title": "VideoTrans Studio",
         "width": 900,
         "height": 420,
         "resizable": true,

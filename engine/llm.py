@@ -104,11 +104,11 @@ PROVIDERS = {
     },
 }
 
-TIMEOUT = float(os.getenv("MULTIVA_LLM_TIMEOUT", "90"))
+TIMEOUT = float(os.getenv("VIDEOTRANS_LLM_TIMEOUT", "90"))
 
 # Kept outside the checkout: an API key does not belong anywhere near a repo.
 SETTINGS_PATH = os.path.expanduser(
-    os.getenv("MULTIVA_SETTINGS", "~/.multiva/llm.json"))
+    os.getenv("VIDEOTRANS_SETTINGS", "~/.videotrans/llm.json"))
 
 _DEFAULTS = {
     "provider": "ollama",
@@ -135,21 +135,21 @@ def load_settings() -> dict:
 
     # The environment wins, so a deployment can pin configuration without a
     # settings file and without the UI being able to override it.
-    if os.getenv("MULTIVA_LLM_PROVIDER"):
-        chosen = os.environ["MULTIVA_LLM_PROVIDER"]
+    if os.getenv("VIDEOTRANS_LLM_PROVIDER"):
+        chosen = os.environ["VIDEOTRANS_LLM_PROVIDER"]
         # Naming a provider but no model would otherwise carry the previous
         # provider's model across, and send "qwen2.5:7b" to Groq. The explicit
         # model override below still wins when one is given.
         if chosen != data["provider"] and chosen in PROVIDERS:
             data["model"] = PROVIDERS[chosen]["default_model"]
         data["provider"] = chosen
-    if os.getenv("MULTIVA_LLM_MODEL"):
-        data["model"] = os.environ["MULTIVA_LLM_MODEL"]
-    if os.getenv("MULTIVA_LLM_URL") or os.getenv("OLLAMA_HOST"):
-        data["ollama_host"] = (os.getenv("MULTIVA_LLM_URL")
+    if os.getenv("VIDEOTRANS_LLM_MODEL"):
+        data["model"] = os.environ["VIDEOTRANS_LLM_MODEL"]
+    if os.getenv("VIDEOTRANS_LLM_URL") or os.getenv("OLLAMA_HOST"):
+        data["ollama_host"] = (os.getenv("VIDEOTRANS_LLM_URL")
                                or os.getenv("OLLAMA_HOST"))
-    if os.getenv("MULTIVA_LLM_CUSTOM_URL"):
-        data["custom_url"] = os.environ["MULTIVA_LLM_CUSTOM_URL"]
+    if os.getenv("VIDEOTRANS_LLM_CUSTOM_URL"):
+        data["custom_url"] = os.environ["VIDEOTRANS_LLM_CUSTOM_URL"]
 
     keys = dict(data.get("keys") or {})
     for provider, var in (("anthropic", "ANTHROPIC_API_KEY"),
@@ -164,8 +164,8 @@ def load_settings() -> dict:
     # sets the OpenAI-compatible "custom" provider, which has no vendor name to
     # hang a variable on. Read after the provider is resolved, so it lands on
     # the provider that is actually in use.
-    if os.getenv("MULTIVA_LLM_API_KEY"):
-        keys[data["provider"]] = os.environ["MULTIVA_LLM_API_KEY"]
+    if os.getenv("VIDEOTRANS_LLM_API_KEY"):
+        keys[data["provider"]] = os.environ["VIDEOTRANS_LLM_API_KEY"]
     data["keys"] = keys
 
     if data["provider"] not in PROVIDERS:
@@ -236,7 +236,7 @@ def configured() -> bool:
     pulled, because "installed but not pulled" is the common case and produces
     a confusing failure at the worst moment.
     """
-    if os.getenv("MULTIVA_LLM", "").lower() in ("0", "off", "false", "no"):
+    if os.getenv("VIDEOTRANS_LLM", "").lower() in ("0", "off", "false", "no"):
         return False
 
     cfg = load_settings()

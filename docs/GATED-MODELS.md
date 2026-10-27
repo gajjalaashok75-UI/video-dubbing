@@ -1,12 +1,12 @@
 # Gated models: getting the voice model
 
-Multiva's voice model, [ai4bharat/IndicF5](https://huggingface.co/ai4bharat/IndicF5),
+VideoTrans's voice model, [ai4bharat/IndicF5](https://huggingface.co/ai4bharat/IndicF5),
 is a **gated** repository on the Hugging Face Hub. Gated means the author
 requires you to accept a licence before the weights can be downloaded, and the
 download must be authenticated with a token. An anonymous fetch is refused with
 `401 Client Error ... Cannot access gated repo`, and writes only the README.
 
-Everything else Multiva downloads is open and needs no account. This one model
+Everything else VideoTrans downloads is open and needs no account. This one model
 does, and it is the model that speaks the dub, so without it no video can be
 dubbed into any Indian language. Transcription, translation, subtitles and lip
 sync all work without it.

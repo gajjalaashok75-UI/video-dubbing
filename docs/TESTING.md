@@ -1,9 +1,9 @@
-# Testing Multiva end to end
+# Testing VideoTrans end to end
 
 A walkthrough from first launch to a finished dub, in a sandbox that cannot
 touch your real settings or your existing projects.
 
-Everything happens in `~/Multiva-Test/`. Delete that folder and the test never
+Everything happens in `~/VideoTrans-Test/`. Delete that folder and the test never
 happened.
 
 **Roughly 30 minutes**, most of it waiting on one render.
@@ -32,7 +32,7 @@ ollama pull qwen2.5:7b
 ## Part 1 — First run
 
 ```bash
-./run.sh --sandbox ~/Multiva-Test
+./run.sh --sandbox ~/VideoTrans-Test
 ```
 
 **Expect:** a few lines in the terminal, then the desktop window opens on the
@@ -48,7 +48,7 @@ Check as you go:
       "everything is here"
 - [ ] Each of the four stages (speech recognition, translation, lip sync, voice)
       shows its options with sizes
-- [ ] **Where finished videos go** points at `~/Multiva-Test/projects`, not your
+- [ ] **Where finished videos go** points at `~/VideoTrans-Test/projects`, not your
       real Movies folder
 
 Now press **Finish setup**.
@@ -78,7 +78,7 @@ nothing to edit and no clip to deliver yet.
 Press **Import** and choose:
 
 ```
-~/Multiva-Test/clips/sample-english-17s.mp4
+~/VideoTrans-Test/clips/sample-english-17s.mp4
 ```
 
 - [ ] A thumbnail appears in the media list showing an actual frame, not a
@@ -101,11 +101,11 @@ through transcribing, translating, cloning the voice, then lip sync.
 - [ ] When it finishes you land on **Deliver** automatically, with the video
       playing in the viewer
 - [ ] **Voice match** shows a percentage — 70% or higher is good
-- [ ] **Saved to** shows a path inside `~/Multiva-Test/projects`
+- [ ] **Saved to** shows a path inside `~/VideoTrans-Test/projects`
 - [ ] The file is really there:
 
 ```bash
-ls -lh ~/Multiva-Test/projects/
+ls -lh ~/VideoTrans-Test/projects/
 ```
 
 - [ ] Play it. The Hindi should be in the speaker's voice, and the mouth should
@@ -177,7 +177,7 @@ Click the **gear** in the top right.
 Quit the app (Ctrl-C in the terminal), then:
 
 ```bash
-./run.sh --sandbox ~/Multiva-Test
+./run.sh --sandbox ~/VideoTrans-Test
 ```
 
 - [ ] It goes **straight to Projects** — no setup screen this time
@@ -200,7 +200,7 @@ Quit the app (Ctrl-C in the terminal), then:
 ## When you are done
 
 ```bash
-rm -rf ~/Multiva-Test
+rm -rf ~/VideoTrans-Test
 ```
 
 Models are shared, so nothing you need is deleted.

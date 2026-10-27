@@ -1,5 +1,5 @@
 // =============================================================================
-// Multiva Studio - desktop shell
+// VideoTrans Studio - desktop shell
 //
 // The pipeline is a Python service. This shell finds the project checkout,
 // starts the API, waits for it to answer, and points the webview at it. The
@@ -60,7 +60,7 @@ fn looks_like_checkout(dir: &Path) -> bool {
 /// upward from the working directory. Covers both `tauri dev` and a bundled
 /// app sitting inside the checkout.
 fn find_project_root() -> Option<PathBuf> {
-    if let Ok(explicit) = std::env::var("MULTIVA_ROOT") {
+    if let Ok(explicit) = std::env::var("VIDEOTRANS_ROOT") {
         let path = PathBuf::from(explicit);
         if looks_like_checkout(&path) {
             return Some(path);
@@ -79,7 +79,7 @@ fn find_project_root() -> Option<PathBuf> {
         let mut dir = start.as_path();
         // Bounded so a misconfigured install cannot scan the whole disk, but
         // deep enough to climb out of a macOS bundle: the executable sits at
-        // target/release/bundle/macos/Multiva Studio.app/Contents/MacOS/, which
+        // target/release/bundle/macos/VideoTrans Studio.app/Contents/MacOS/, which
         // is ten hops below the checkout. At eight the bundled app never found
         // the project and silently started no engine.
         for _ in 0..16 {
@@ -190,7 +190,7 @@ fn read_boot(port: u16) -> Option<Boot> {
 }
 
 fn boot(app: tauri::AppHandle) {
-    let port: u16 = std::env::var("MULTIVA_PORT")
+    let port: u16 = std::env::var("VIDEOTRANS_PORT")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(DEFAULT_PORT);
@@ -207,8 +207,8 @@ fn boot(app: tauri::AppHandle) {
         Some(r) => r,
         None => {
             emit(&app, "error",
-                 "Could not find the Multiva project. Put this app inside the \
-                  checkout, or set MULTIVA_ROOT to its path.", 0, true);
+                 "Could not find the VideoTrans project. Put this app inside the \
+                  checkout, or set VIDEOTRANS_ROOT to its path.", 0, true);
             return;
         }
     };
@@ -302,5 +302,5 @@ pub fn run() {
             }
         })
         .run(tauri::generate_context!())
-        .expect("error while running Multiva Studio");
+        .expect("error while running VideoTrans Studio");
 }

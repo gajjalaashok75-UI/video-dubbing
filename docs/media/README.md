@@ -11,7 +11,7 @@ Everything in this folder exists so the README can show the product:
 | `studio.png`, `models.png` | the studio and the Models page |
 | `subtitles.gif` | one line drawn by the subtitle engine in thirteen scripts |
 
-**These files, the Multiva name and the Multiva mark are © Ashok Gajjala,
+**These files, the VideoTrans name and the VideoTrans mark are © Ashok Gajjala,
 all rights reserved.** They are published here to be looked at, not reused:
 do not copy them into other projects, marketing, or documentation. The
 demo video and the studio screenshots show the speaker's likeness and

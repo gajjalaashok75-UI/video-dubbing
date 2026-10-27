@@ -3,5 +3,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
-    multiva_studio_lib::run();
+    videotrans_studio_lib::run();
 }

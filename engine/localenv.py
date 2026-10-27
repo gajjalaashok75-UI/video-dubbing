@@ -1,7 +1,7 @@
 """
 Read a .env file into the process environment.
 
-Everything about running Multiva is meant to work from a clone with no
+Everything about running VideoTrans is meant to work from a clone with no
 external services, so the obvious place to put a key is a .env beside the
 code - and until now nothing read it, which made a key put there look
 configured while behaving exactly like no key at all.

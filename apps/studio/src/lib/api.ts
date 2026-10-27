@@ -170,8 +170,8 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
    "user-123", so all visitors shared one library. A per-browser id keeps
    libraries separate. This is scoping, not authentication: the app runs
    locally and there is no login. */
-const ID_KEY = "multiva.uid";
-const NAME_KEY = "multiva.name";
+const ID_KEY = "videotrans.uid";
+const NAME_KEY = "videotrans.name";
 
 export function userId(): string {
   let id = localStorage.getItem(ID_KEY);

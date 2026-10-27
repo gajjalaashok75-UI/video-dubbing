@@ -1,4 +1,4 @@
-# Multiva — Docker Compose
+# VideoTrans — Docker Compose
 #
 # Bring the whole thing up on the GPU in one command, from the repository root:
 #
@@ -10,21 +10,21 @@
 # block below can hand the GPU to the container. Without a GPU, delete that
 # block and the render still works — on the CPU, slowly.
 services:
-  multiva:
+  videotrans:
     build:
       # Context is the repository root, so `COPY . /app` gets the whole tree and
       # `deploy/docker/...` paths resolve inside the Dockerfile.
       context: ../..
       dockerfile: deploy/docker/Dockerfile
-    image: multiva:latest
-    container_name: multiva
+    image: videotrans:latest
+    container_name: videotrans
     ports:
       - "8000:8000"
     volumes:
       # Everything the container writes that is worth keeping: uploaded clips,
       # finished renders, and the Hugging Face model cache. Persisted on the
       # host so a rebuild does not re-download 7.5 GB of weights.
-      - multiva-data:/data
+      - videotrans-data:/data
       # Optional: a folder of your own to read source videos from.
       # - ./samples:/samples:ro
     environment:
@@ -32,8 +32,8 @@ services:
       # .env beside this file (compose reads it automatically) or export it.
       # Without it the 11 Indian languages are unavailable; everything else runs.
       HF_TOKEN: "${HF_TOKEN:-}"
-      MULTIVA_UPLOAD_DIR: /data/uploads
-      MULTIVA_OUTPUT_DIR: /data/output
+      VIDEOTRANS_UPLOAD_DIR: /data/uploads
+      VIDEOTRANS_OUTPUT_DIR: /data/output
       HF_HOME: /data/hf
       # Set to 1 to skip the model pre-fetch on start (models load lazily then).
       SKIP_MODEL_DOWNLOAD: "${SKIP_MODEL_DOWNLOAD:-0}"
@@ -57,4 +57,4 @@ services:
       start_period: 180s
 
 volumes:
-  multiva-data:
+  videotrans-data:

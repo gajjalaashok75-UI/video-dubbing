@@ -57,7 +57,7 @@ None referenced by anything, all removed:
 - **`wav2lip_loader`** — dead code pointing at `models/wav2lip_gan.pth`, a path
   that does not exist
 
-`Multiva Studio.command` was a second, diverging 78-line launcher that opened a
+`VideoTrans Studio.command` was a second, diverging 78-line launcher that opened a
 browser while `run.sh` opens the desktop app. It is now nine lines that
 delegate.
 

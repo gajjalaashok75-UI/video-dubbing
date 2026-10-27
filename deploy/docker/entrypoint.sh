@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Multiva container entrypoint.
+# VideoTrans container entrypoint.
 #
 # Two jobs: make sure the runtime tree and the model weights exist on the
 # mounted volume, then start the API (which serves the built studio interface
@@ -17,20 +17,20 @@ set -euo pipefail
 cd /app
 
 RUNTIME_ROOT="${RUNTIME_ROOT:-/data}"
-UPLOAD_DIR="${MULTIVA_UPLOAD_DIR:-$RUNTIME_ROOT/uploads}"
-OUTPUT_DIR="${MULTIVA_OUTPUT_DIR:-$RUNTIME_ROOT/output}"
+UPLOAD_DIR="${VIDEOTRANS_UPLOAD_DIR:-$RUNTIME_ROOT/uploads}"
+OUTPUT_DIR="${VIDEOTRANS_OUTPUT_DIR:-$RUNTIME_ROOT/output}"
 HF_HOME="${HF_HOME:-$RUNTIME_ROOT/hf}"
 PORT="${PORT:-8000}"
 HOST="${HOST:-0.0.0.0}"
 SKIP_MODELS="${SKIP_MODEL_DOWNLOAD:-0}"
 
-export MULTIVA_UPLOAD_DIR="$UPLOAD_DIR"
-export MULTIVA_OUTPUT_DIR="$OUTPUT_DIR"
+export VIDEOTRANS_UPLOAD_DIR="$UPLOAD_DIR"
+export VIDEOTRANS_OUTPUT_DIR="$OUTPUT_DIR"
 export HF_HOME
 
 mkdir -p "$UPLOAD_DIR" "$OUTPUT_DIR" "$HF_HOME"
 
-banner() { printf '\n  Multiva — %s\n  %s\n\n' "$1" "------------------------------------------------"; }
+banner() { printf '\n  VideoTrans — %s\n  %s\n\n' "$1" "------------------------------------------------"; }
 
 banner "container starting"
 

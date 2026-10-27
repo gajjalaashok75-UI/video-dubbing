@@ -321,9 +321,9 @@ def run_pipeline(video_path, source_lang, target_lang, do_lip_sync,
 # ---------------------------------------------------------------------------
 # UI
 # ---------------------------------------------------------------------------
-with gr.Blocks(title="Multiva.Ai — pipeline test", **_BLOCKS_KW) as demo:
+with gr.Blocks(title="VideoTrans.Ai — pipeline test", **_BLOCKS_KW) as demo:
     gr.Markdown(
-        "# 🎬 Multiva.Ai — dubbing pipeline test harness\n"
+        "# 🎬 VideoTrans.Ai — dubbing pipeline test harness\n"
         "Runs the real pipeline and exposes the intermediates. "
         "Uncheck **lip sync** to iterate on voice quality ~5× faster."
     )
@@ -411,6 +411,6 @@ def _free_port(preferred: int) -> int:
 
 if __name__ == "__main__":
     port = _free_port(int(os.getenv("GRADIO_SERVER_PORT", 7860)))
-    print(f"\n[UI] Multiva.Ai test harness -> http://127.0.0.1:{port}\n")
+    print(f"\n[UI] VideoTrans.Ai test harness -> http://127.0.0.1:{port}\n")
     demo.launch(server_name="127.0.0.1", server_port=port,
                 share=False, inbrowser=True, **_LAUNCH_KW)

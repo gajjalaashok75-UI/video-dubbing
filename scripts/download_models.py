@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Pre-download every model Multiva needs.
+Pre-download every model VideoTrans needs.
 
 The studio can do this for you on its setup page; this is the same code with a
 command line in front of it, for people who would rather not click.
@@ -25,7 +25,7 @@ import models  # noqa: E402
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Download Multiva's models")
+    ap = argparse.ArgumentParser(description="Download VideoTrans's models")
     ap.add_argument("--core", action="store_true",
                     help="skip optional models (evaluation harness)")
     ap.add_argument("--check", action="store_true",
@@ -34,7 +34,7 @@ def main() -> int:
 
     rows = [r for r in models.inventory() if r["required"] or not args.core]
 
-    print("\n  Multiva models")
+    print("\n  VideoTrans models")
     print("  " + "-" * 62)
     print(f"  Cache: {models.cache_root()}")
     print(f"  Free disk: {models.free_space_gb():.1f} GB\n")

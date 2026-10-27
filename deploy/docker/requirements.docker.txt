@@ -1,5 +1,5 @@
 # =============================================================================
-# Multiva — Docker / Linux dependencies
+# VideoTrans — Docker / Linux dependencies
 # =============================================================================
 # Mirrors requirements.txt for the image in deploy/docker/Dockerfile, with one
 # change: the torch stack is NOT here. The Dockerfile installs torch, torchaudio

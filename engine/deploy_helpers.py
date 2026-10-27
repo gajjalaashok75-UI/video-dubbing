@@ -24,7 +24,7 @@ Three rules shape this module:
   registry. A notebook cannot afford a subprocess tree either, since the kernel
   must stay responsive.
 
-Nothing here is Multiva-specific except the health path and the environment
+Nothing here is VideoTrans-specific except the health path and the environment
 variable names; the layout mirrors the shape a hosted deployment always needs.
 """
 
@@ -61,8 +61,8 @@ __all__ = [
 # persistent, writable volume; writing into the checkout is not durable there
 # and on Kaggle the checkout can be read-only.
 _PLATFORM_ROOTS = {
-    "colab": "/content/multiva-runtime",
-    "kaggle": "/kaggle/working/multiva-runtime",
+    "colab": "/content/videotrans-runtime",
+    "kaggle": "/kaggle/working/videotrans-runtime",
     "docker": "/data",
 }
 
@@ -120,7 +120,7 @@ def default_runtime_root(platform: str | None = None) -> Path:
     if override:
         return Path(override).expanduser()
     platform = platform or detect_platform()
-    return Path(_PLATFORM_ROOTS.get(platform, "/tmp/multiva-runtime"))
+    return Path(_PLATFORM_ROOTS.get(platform, "/tmp/videotrans-runtime"))
 
 
 def runtime_dirs(root: str | Path | None = None) -> dict[str, Path]:
@@ -138,7 +138,7 @@ def configure_runtime(root: str | Path | None = None) -> dict[str, Path]:
     """
     Point the application's runtime directories at a writable tree and create it.
 
-    Sets `MULTIVA_UPLOAD_DIR` and `MULTIVA_OUTPUT_DIR` in the environment, then
+    Sets `VIDEOTRANS_UPLOAD_DIR` and `VIDEOTRANS_OUTPUT_DIR` in the environment, then
     creates each directory. **Call this before importing `app`**: `engine/app.py`
     snapshots the upload directory at import time and creates it, and
     `engines.output_dir()` reads the output variable.
@@ -153,8 +153,8 @@ def configure_runtime(root: str | Path | None = None) -> dict[str, Path]:
     for path in dirs.values():
         path.mkdir(parents=True, exist_ok=True)
 
-    os.environ["MULTIVA_UPLOAD_DIR"] = str(dirs["uploads"])
-    os.environ["MULTIVA_OUTPUT_DIR"] = str(dirs["output"])
+    os.environ["VIDEOTRANS_UPLOAD_DIR"] = str(dirs["uploads"])
+    os.environ["VIDEOTRANS_OUTPUT_DIR"] = str(dirs["output"])
     # Pin the Hugging Face cache to the runtime tree. Left to itself it uses
     # ~/.cache/huggingface, which on a hosted runtime is either small or
     # discarded on restart, so the ~7.5 GB of weights would be re-fetched every
@@ -530,7 +530,7 @@ def start_server(host: str = "0.0.0.0", port: int = 8000,
         app_module.app, host=host, port=port, log_level=log_level, workers=1)
     server = uvicorn.Server(config)
 
-    thread = threading.Thread(target=server.run, name="multiva-server",
+    thread = threading.Thread(target=server.run, name="videotrans-server",
                               daemon=True)
     thread.start()
 

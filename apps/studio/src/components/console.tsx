@@ -192,7 +192,7 @@ export function TitleBar({
     <header className="raised flex items-center gap-3 border-b border-c-edge px-2.5">
       <span className="flex items-center gap-2 text-c-text">
         <Mark />
-        <span className="text-[11px] font-semibold tracking-[0.12em]">MULTIVA</span>
+        <span className="text-[11px] font-semibold tracking-[0.12em]">VIDEOTRANS</span>
       </span>
 
       <div className="h-3.5 w-px bg-c-rule" />

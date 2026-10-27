@@ -14,7 +14,7 @@
 
 - Engine is started with `../venv/bin/python -m uvicorn app:app --host 0.0.0.0
   --port 12000` from `engine/`. Port **12000** is the public one; `selftest.py`
-  defaults to 8000, so pass `MULTIVA_URL=http://127.0.0.1:12000`.
+  defaults to 8000, so pass `VIDEOTRANS_URL=http://127.0.0.1:12000`.
 - `run.sh` is the single entry point; `--setup --yes` installs everything
   (venv, models, frontend, desktop window) and exits.
 - Desktop build: `cd apps/studio && npx tauri build`. Needs Rust plus
@@ -64,7 +64,7 @@
   pre-existing style findings; do not treat those as regressions.
 - Frontend: `npx tsc -b && vite build` from `apps/studio`; `npx oxlint src`
   for warnings.
-- End-to-end: `MULTIVA_URL=http://127.0.0.1:12000 ./venv/bin/python
+- End-to-end: `VIDEOTRANS_URL=http://127.0.0.1:12000 ./venv/bin/python
   scripts/selftest.py [clip.mp4]`. With no clip it runs 38 checks; with a clip
   it adds the render, editor, export and voice-over checks.
 
@@ -73,7 +73,7 @@
 - `engine/deploy_helpers.py` is the shared runtime for Colab, Kaggle and Docker:
   `detect_platform`, `configure_runtime`, `hardware_report`, `start_server`,
   `notebook_public_url`. Keep the notebooks thin — the logic belongs here.
-- `configure_runtime()` sets `MULTIVA_UPLOAD_DIR` / `MULTIVA_OUTPUT_DIR` and MUST
+- `configure_runtime()` sets `VIDEOTRANS_UPLOAD_DIR` / `VIDEOTRANS_OUTPUT_DIR` and MUST
   run before `app` is imported: `engine/app.py` snapshots `UPLOAD_DIR` at import.
   It also pins `HF_HOME` to `<runtime>/hf` via `setdefault`, so weights land on
   the writable volume instead of `~/.cache/huggingface`, which hosted runtimes
@@ -97,13 +97,13 @@
   downloaded model: it only rewrites one over-long line when the user presses
   Fit on a segment (`POST /jobs/{id}/segments/{i}/fit`). No render/worker path
   calls `llm.*`, so an unreachable provider cannot break a dub.
-- Provider config lives at `~/.multiva/llm.json` (mode 0600, holds keys) and is
-  overlaid by the environment, which wins. Env names: `MULTIVA_LLM_PROVIDER`,
-  `MULTIVA_LLM_MODEL`, `MULTIVA_LLM_URL`/`OLLAMA_HOST`, `MULTIVA_LLM_CUSTOM_URL`
-  and `MULTIVA_LLM_API_KEY` (generic key for whichever provider is chosen — the
+- Provider config lives at `~/.videotrans/llm.json` (mode 0600, holds keys) and is
+  overlaid by the environment, which wins. Env names: `VIDEOTRANS_LLM_PROVIDER`,
+  `VIDEOTRANS_LLM_MODEL`, `VIDEOTRANS_LLM_URL`/`OLLAMA_HOST`, `VIDEOTRANS_LLM_CUSTOM_URL`
+  and `VIDEOTRANS_LLM_API_KEY` (generic key for whichever provider is chosen — the
   only way to configure the OpenAI-compatible `custom` provider headlessly).
   Per-vendor keys: `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `OPENAI_API_KEY`,
-  `GROQ_API_KEY`, `XAI_API_KEY`. `MULTIVA_LLM=off` disables the stage.
+  `GROQ_API_KEY`, `XAI_API_KEY`. `VIDEOTRANS_LLM=off` disables the stage.
 - `llm.status()` must never return a key, only `has_key`. Keep it that way: the
   response is served to the studio and appears in `/api/health`.
 - Provider model ids drift and the "Test" button makes a real call, so a stale

@@ -25,7 +25,7 @@ import time
 import urllib.error
 import urllib.request
 
-BASE = os.getenv("MULTIVA_URL", "http://127.0.0.1:8000")
+BASE = os.getenv("VIDEOTRANS_URL", "http://127.0.0.1:8000")
 passed, failed, notes = 0, 0, []
 skipped = []
 speakable = set()
@@ -61,7 +61,7 @@ def call(method, path, body=None, files=None, raw=False):
     url = f"{BASE}{path}"
     data, headers = None, {}
     if files:
-        boundary = "----multiva" + str(int(time.time() * 1000))
+        boundary = "----videotrans" + str(int(time.time() * 1000))
         parts = []
         for key, (fname, content) in files.items():
             parts.append(f"--{boundary}\r\n".encode())
@@ -144,7 +144,7 @@ def main() -> int:
     ap.add_argument("--lang", default="hi")
     args = ap.parse_args()
 
-    print(f"\n  Multiva self test  ->  {BASE}\n")
+    print(f"\n  VideoTrans self test  ->  {BASE}\n")
 
     # ---- engine ----------------------------------------------------------
     print("  Engine")
@@ -154,7 +154,7 @@ def main() -> int:
         # a traceback out of the first one that indexes a response says
         # less than this does.
         print(f"  Nothing is listening at {BASE}. Start the engine first:\n"
-              f"      ./run.sh\n  or point the test at it with MULTIVA_URL.\n")
+              f"      ./run.sh\n  or point the test at it with VIDEOTRANS_URL.\n")
         return 1
     check("health responds", code == 200, str(health)[:60])
     check("no cloud storage reported", isinstance(health, dict)
@@ -283,7 +283,7 @@ def main() -> int:
             try:
                 drawn = _subs._render_cue(sample, 640, 28,
                                           os.path.join(tempfile.gettempdir(),
-                                                       f"multiva_cue_{lang}.png"))
+                                                       f"videotrans_cue_{lang}.png"))
             except Exception as exc:                         # noqa: BLE001
                 missing = missing or {0}
                 drawn = str(exc)

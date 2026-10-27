@@ -1875,7 +1875,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "multiva-studio"
+name = "videotrans-studio"
 version = "0.1.0"
 dependencies = [
  "log",

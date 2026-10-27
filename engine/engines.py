@@ -19,7 +19,7 @@ import os
 import stat
 
 SETTINGS_PATH = os.path.expanduser(
-    os.getenv("MULTIVA_ENGINES", "~/.multiva/engines.json"))
+    os.getenv("VIDEOTRANS_ENGINES", "~/.videotrans/engines.json"))
 
 # `key` is what the stage's module reads. `size` is the download, not the
 # on-disk footprint after conversion.
@@ -103,7 +103,7 @@ def default_output_dir() -> str:
     movies = os.path.join(home, "Movies")          # macOS
     videos = os.path.join(home, "Videos")          # Windows and most Linux
     base = movies if os.path.isdir(movies) else (videos if os.path.isdir(videos) else home)
-    return os.path.join(base, "Multiva")
+    return os.path.join(base, "VideoTrans")
 
 
 _DEFAULTS = {stage: spec["default"] for stage, spec in CATALOG.items()}
@@ -129,8 +129,8 @@ def load() -> dict:
     for stage, spec in CATALOG.items():
         if os.getenv(spec["env"]):
             data[stage] = os.environ[spec["env"]]
-    if os.getenv("MULTIVA_OUTPUT_DIR"):
-        data["output_dir"] = os.environ["MULTIVA_OUTPUT_DIR"]
+    if os.getenv("VIDEOTRANS_OUTPUT_DIR"):
+        data["output_dir"] = os.environ["VIDEOTRANS_OUTPUT_DIR"]
     return data
 
 
@@ -224,7 +224,7 @@ TUNABLES = {
                   "lipsync:wav2lip"),
     "W2L_DET_BATCH": (16, "int", "Face detection batch",
                       "Frames per detection pass.", "lipsync:wav2lip"),
-    "MULTIVA_SWEEP_HOURS": (48, "float", "Keep unfinished runs for",
+    "VIDEOTRANS_SWEEP_HOURS": (48, "float", "Keep unfinished runs for",
                             "Hours before an abandoned working folder is "
                             "swept. Saved projects are never swept.", None),
 }

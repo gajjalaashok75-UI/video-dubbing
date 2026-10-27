@@ -1,4 +1,4 @@
-# Multiva studio
+# VideoTrans studio
 
 React 19 + TypeScript + Vite 8 + Tailwind v4 + Motion. Builds to `../../web/`,
 which the FastAPI service mounts at `/app`.

@@ -1,5 +1,5 @@
 """
-Every model Multiva needs, and how to get it.
+Every model VideoTrans needs, and how to get it.
 
 Shared by the command line and the studio's setup page. Downloading a few
 gigabytes should not require opening a terminal, but the terminal path has to

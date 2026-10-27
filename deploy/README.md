@@ -1,6 +1,6 @@
 # deploy/
 
-Three ways to run Multiva on a GPU instead of a CPU. The engine detects its
+Three ways to run VideoTrans on a GPU instead of a CPU. The engine detects its
 device on its own — CUDA, then Apple silicon, then CPU — so nothing in the code
 changes between them; only where it runs does.
 

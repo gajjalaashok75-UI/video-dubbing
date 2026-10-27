@@ -1,12 +1,12 @@
 # =============================================================================
-# Multiva — Docker image
+# VideoTrans — Docker image
 # =============================================================================
 # A CUDA base image so the whole pipeline (faster-whisper, NLLB-200, IndicF5,
 # Wav2Lip) runs on the GPU instead of the CPU. On a CPU-only machine the same
 # image still runs — the engine picks the device itself — it is just slow.
 #
 # Build from the repository root, so `deploy/docker/...` paths resolve:
-#     docker build -f deploy/docker/Dockerfile -t multiva:latest .
+#     docker build -f deploy/docker/Dockerfile -t videotrans:latest .
 # or with compose:
 #     docker compose -f deploy/docker/docker-compose.yml up --build
 #

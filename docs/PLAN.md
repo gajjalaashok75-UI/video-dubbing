@@ -47,12 +47,12 @@ are never switching documents, you are switching what you are doing to the same
 one. Deliver is where you choose what comes out, and it holds a render queue
 rather than a single button.
 
-Multiva has the same shape hiding in it — import and trim, then edit phrases,
+VideoTrans has the same shape hiding in it — import and trim, then edit phrases,
 then produce something. Today all three are stacked in one scrolling sidebar,
 which is why the render button and the re-render button ended up in different
 places with no relationship between them.
 
-| Resolve page | Multiva equivalent | Holds |
+| Resolve page | VideoTrans equivalent | Holds |
 |---|---|---|
 | Media | Media | Import, project name, clip inspection, in and out points |
 | Edit | Edit | Phrase timeline, cut/copy/paste, re-roll, reference window |

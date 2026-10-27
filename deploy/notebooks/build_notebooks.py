@@ -59,7 +59,7 @@ def _assign_ids(cells: list[dict]) -> None:
 # ---------------------------------------------------------------------------
 
 TITLE = md("""
-# Multiva - run the whole pipeline on a free GPU
+# VideoTrans - run the whole pipeline on a free GPU
 
 Dub a talking-head video into another language - transcribe, translate, clone
 the speaker's voice, lip-sync - on the machine this notebook is attached to,
@@ -353,7 +353,7 @@ server = runtime.start_server(host="0.0.0.0", port=PORT, ready_timeout=600)
 url = runtime.notebook_public_url(PORT)
 print()
 print("=" * 62)
-print("  Multiva is running")
+print("  VideoTrans is running")
 print(f"  Open:  {url}/app/")
 print("=" * 62)
 print()

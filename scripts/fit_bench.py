@@ -60,9 +60,9 @@ def main() -> int:
 
     # Override for this process only - the user's settings file is not touched.
     if args.provider:
-        os.environ["MULTIVA_LLM_PROVIDER"] = args.provider
+        os.environ["VIDEOTRANS_LLM_PROVIDER"] = args.provider
     if args.model:
-        os.environ["MULTIVA_LLM_MODEL"] = args.model
+        os.environ["VIDEOTRANS_LLM_MODEL"] = args.model
 
     # A key in .env is the documented place to put one, so read it here too.
     import localenv
