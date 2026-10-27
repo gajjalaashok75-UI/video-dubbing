@@ -81,7 +81,7 @@ test_videos/
 *.flac
 *.m4a
 *.aac
-*.mp4
+
 *.mov
 *.mkv
 *.avi
