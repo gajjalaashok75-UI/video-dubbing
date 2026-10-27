@@ -78,9 +78,11 @@ PROVIDERS = {
     "grok": {
         "label": "Grok (xAI)",
         "needs_key": True,
-        "default_model": "grok-2-latest",
-        "suggested": ["grok-2-latest"],
-        "note": "Sends one line of translated text per rewrite.",
+        "default_model": "grok-4.7",
+        "suggested": ["grok-4.7", "grok-4.5", "grok-4.3"],
+        "note": "Sends one line of translated text per rewrite. xAI retires "
+                "model ids often, so a 400 or 404 here usually means the id "
+                "moved, not that the key is wrong.",
     },
     "groq": {
         "label": "Groq Cloud",
@@ -146,6 +148,8 @@ def load_settings() -> dict:
     if os.getenv("MULTIVA_LLM_URL") or os.getenv("OLLAMA_HOST"):
         data["ollama_host"] = (os.getenv("MULTIVA_LLM_URL")
                                or os.getenv("OLLAMA_HOST"))
+    if os.getenv("MULTIVA_LLM_CUSTOM_URL"):
+        data["custom_url"] = os.environ["MULTIVA_LLM_CUSTOM_URL"]
 
     keys = dict(data.get("keys") or {})
     for provider, var in (("anthropic", "ANTHROPIC_API_KEY"),
@@ -155,6 +159,13 @@ def load_settings() -> dict:
                           ("grok", "XAI_API_KEY")):
         if os.getenv(var):
             keys[provider] = os.environ[var]
+    # A generic key for whichever provider is selected. The named variables
+    # above cover the first-party providers; this is how a headless deployment
+    # sets the OpenAI-compatible "custom" provider, which has no vendor name to
+    # hang a variable on. Read after the provider is resolved, so it lands on
+    # the provider that is actually in use.
+    if os.getenv("MULTIVA_LLM_API_KEY"):
+        keys[data["provider"]] = os.environ["MULTIVA_LLM_API_KEY"]
     data["keys"] = keys
 
     if data["provider"] not in PROVIDERS:

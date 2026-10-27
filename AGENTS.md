@@ -92,6 +92,23 @@
 - The notebooks' first cell runs `git fetch` + `git reset --hard FETCH_HEAD`
   when the checkout already exists. Never run that cell against this working
   copy: it discards uncommitted work.
+- Script intelligence (`engine/llm.py`) is a SEPARATE, OPTIONAL stage from the
+  model downloads. Picking a provider there never replaces, skips or affects a
+  downloaded model: it only rewrites one over-long line when the user presses
+  Fit on a segment (`POST /jobs/{id}/segments/{i}/fit`). No render/worker path
+  calls `llm.*`, so an unreachable provider cannot break a dub.
+- Provider config lives at `~/.multiva/llm.json` (mode 0600, holds keys) and is
+  overlaid by the environment, which wins. Env names: `MULTIVA_LLM_PROVIDER`,
+  `MULTIVA_LLM_MODEL`, `MULTIVA_LLM_URL`/`OLLAMA_HOST`, `MULTIVA_LLM_CUSTOM_URL`
+  and `MULTIVA_LLM_API_KEY` (generic key for whichever provider is chosen — the
+  only way to configure the OpenAI-compatible `custom` provider headlessly).
+  Per-vendor keys: `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `OPENAI_API_KEY`,
+  `GROQ_API_KEY`, `XAI_API_KEY`. `MULTIVA_LLM=off` disables the stage.
+- `llm.status()` must never return a key, only `has_key`. Keep it that way: the
+  response is served to the studio and appears in `/api/health`.
+- Provider model ids drift and the "Test" button makes a real call, so a stale
+  default fails the first time someone tries it. Confirm defaults against the
+  provider's own docs before changing them (xAI moved `grok-2-latest` on).
 - The device is chosen automatically (`_pick_device` in `tts_engines.py`,
   `lip_sync.py`, `translation_v2.py`). Do NOT add GPU-only code paths; the fix
   for "slow on CPU" is to run on a GPU, not to special-case one.
