@@ -21,6 +21,14 @@ import urllib.request
 # One entry per Hub snapshot. `files` are the files the model actually needs
 # to load: their presence is what "present" means. A README alone is not a
 # model, and treating it as one is how a gated repo used to look downloaded.
+#
+# These must match the repository's `main` revision exactly. Naming a file the
+# repo does not publish makes the model look permanently missing, so it is
+# re-downloaded on every run and the setup page never stops saying it is
+# absent. facebook/nllb-200-distilled-600M and microsoft/wavlm-base-plus-sv
+# ship `pytorch_model.bin`, not `model.safetensors`; check the repo's file list
+# before changing one of these.
+#
 # `gated` marks a repo that needs an accepted licence and a token.
 MODELS = [
     dict(label="Speech recognition", id="Systran/faster-whisper-large-v3",
@@ -30,7 +38,7 @@ MODELS = [
     dict(label="Translation", id="facebook/nllb-200-distilled-600M",
          why="Translates each segment into the target language",
          size="2.5 GB", required=True,
-         files=("config.json", "model.safetensors")),
+         files=("config.json", "pytorch_model.bin")),
     dict(label="Voice cloning", id="ai4bharat/IndicF5",
          why="Speaks the translation in the reference voice, 11 Indian languages",
          size="1.4 GB", required=True, gated=True,
@@ -42,7 +50,7 @@ MODELS = [
     dict(label="Speaker scoring", id="microsoft/wavlm-base-plus-sv",
          why="Scores clone similarity in the evaluation harness",
          size="400 MB", required=False,
-         files=("config.json", "model.safetensors")),
+         files=("config.json", "pytorch_model.bin")),
 ]
 
 # The Wav2Lip weights are not a Hub snapshot repo, and they are too large to
@@ -90,6 +98,12 @@ def cache_root() -> str:
     )
 
 
+# What a real weight file looks like. Used only for a repo with no manifest
+# entry, where there is no exact filename to check for.
+_WEIGHT_SUFFIXES = (".bin", ".safetensors", ".pth", ".pt", ".ckpt", ".onnx",
+                    ".gguf")
+
+
 def snapshot_root(repo_id: str) -> str:
     """The snapshots/ directory for a repo, whether or not it exists yet."""
     folder = "models--" + repo_id.replace("/", "--")
@@ -135,7 +149,12 @@ def is_cached(repo_id: str, files=()) -> bool:
                 files = entry["files"]
                 break
     if not files:
-        return False
+        # A repo the catalogue offers but the manifest does not name - the
+        # lighter Whisper and NLLB alternatives. There is no filename to
+        # check, so accept any real weight file. This still rejects a failed
+        # gated fetch, which leaves only a README behind, so a downloaded
+        # alternative stops reading as "not downloaded" and being re-fetched.
+        return any(f.endswith(_WEIGHT_SUFFIXES) for f in _snapshot_files(repo_id))
     have = _snapshot_files(repo_id)
     return all(f in have for f in files)
 

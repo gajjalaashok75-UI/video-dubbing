@@ -325,11 +325,20 @@ def configured() -> bool:
 # ---------------------------------------------------------------------------
 
 def _hf_cached(repo: str) -> bool:
-    root = os.environ.get("HF_HOME") or os.path.join(
-        os.path.expanduser("~"), ".cache", "huggingface")
-    folder = os.path.join(root, "hub", "models--" + repo.replace("/", "--"),
-                          "snapshots")
-    return os.path.isdir(folder) and bool(os.listdir(folder))
+    """
+    Whether a Hub repo's weights are actually on disk.
+
+    This used to mean "the snapshots folder has something in it", which is a
+    false positive: an unauthenticated fetch of a gated repo still writes the
+    README, so ai4bharat/IndicF5 looked installed while its 1.4 GB of weights
+    were absent. It now asks `models.py`, which knows the specific files each
+    repo needs, so the answer agrees with the setup page.
+    """
+    try:
+        import models
+        return models.is_cached(repo)
+    except Exception:  # noqa: BLE001 - never let a check break the catalogue
+        return False
 
 
 def _downloadable(local: str) -> bool:

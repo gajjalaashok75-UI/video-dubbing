@@ -29,6 +29,22 @@
   unavailable and that one download is skipped — everything else still works.
   `models.is_cached()` checks the files a model actually loads, not just the
   folder, because a failed gated fetch leaves only a `README.md` behind.
+- `MODELS` entries name the exact files a repo loads, and those names must match
+  the repo's `main` revision. `facebook/nllb-200-distilled-600M` and
+  `microsoft/wavlm-base-plus-sv` ship `pytorch_model.bin`, not
+  `model.safetensors`. Naming a file a repo does not publish makes the model
+  read as MISSING forever, so it is re-downloaded on every run and the setup
+  page never stops calling it absent. When adding or editing an entry, confirm
+  the filenames against the repo's file list first.
+- `engines._hf_cached()` delegates to `models.is_cached()` on purpose, so the
+  studio catalogue and the setup page cannot disagree about what is present.
+  The catalogue also offers models the `MODELS` manifest does not name (the
+  lighter Whisper and NLLB alternatives). For those `is_cached()` accepts any
+  real weight file, because there is no exact filename to check; without that
+  fallback a downloaded alternative reads as absent forever and is re-fetched
+  every run. A failed gated fetch still leaves only a README, so it is still
+  rejected. When you add a catalogue option that is not in `MODELS`, expect
+  readiness to come from this fallback rather than an exact-file check.
 - On this machine the gated voice model is absent, so a real dub cannot run.
   Subtitle renders (`kind=subtitles_translated`) exercise transcription,
   translation and font rendering end to end without it.
@@ -59,6 +75,23 @@
   `notebook_public_url`. Keep the notebooks thin — the logic belongs here.
 - `configure_runtime()` sets `MULTIVA_UPLOAD_DIR` / `MULTIVA_OUTPUT_DIR` and MUST
   run before `app` is imported: `engine/app.py` snapshots `UPLOAD_DIR` at import.
+  It also pins `HF_HOME` to `<runtime>/hf` via `setdefault`, so weights land on
+  the writable volume instead of `~/.cache/huggingface`, which hosted runtimes
+  discard between sessions.
+- `start_server()` mirrors stdout/stderr to `<runtime>/logs/server.log` (see
+  `server_log_path()`); `ServerHandle.tail()` reads it back. The tee is installed
+  once per process (`_install_log_tee`) — the engine's logging handler captures
+  `sys.stderr` at creation, so re-teeing on every start would write each line
+  twice. Do not move the tee into `stop()`.
+- `deploy/notebooks/build_notebooks.py` generates `colab.ipynb` and
+  `kaggle.ipynb` from one source. Edit the generator, not the notebooks, then
+  run it: `./venv/bin/python deploy/notebooks/build_notebooks.py`. It assigns
+  each cell a stable id (position + source hash), which nbformat 4.5 requires;
+  editing a notebook by hand instead leaves cells without ids and the
+  validator warns.
+- The notebooks' first cell runs `git fetch` + `git reset --hard FETCH_HEAD`
+  when the checkout already exists. Never run that cell against this working
+  copy: it discards uncommitted work.
 - The device is chosen automatically (`_pick_device` in `tts_engines.py`,
   `lip_sync.py`, `translation_v2.py`). Do NOT add GPU-only code paths; the fix
   for "slow on CPU" is to run on a GPU, not to special-case one.

@@ -38,6 +38,10 @@ export interface Language {
   code: string;
   name: string;
   engine: string;
+  /** Whether an installed engine can speak this language right now. */
+  available?: boolean;
+  /** What to install or set to make it available, when it is not. */
+  needs?: string;
 }
 
 export interface SyncReport {

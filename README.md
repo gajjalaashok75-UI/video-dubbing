@@ -132,6 +132,11 @@ to a writable volume, installs the CUDA PyTorch build and the rest of
 `requirements.txt`, fetches the models, starts the server in a background thread
 of the kernel, prints the public URL, and stops the server at the end.
 
+Everything the server writes also goes to a log file under the runtime root
+(`<runtime>/logs/server.log`, e.g. `/content/multiva-runtime/logs/server.log`),
+so a failed render can be diagnosed after the fact. Section 7a of the notebook
+follows the file live, and `server.tail()` prints the last lines from Python.
+
 > Kaggle: turn **Internet** on in the notebook settings, or the clone, the
 > install and the model downloads all fail.
 

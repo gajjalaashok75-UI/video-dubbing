@@ -53,10 +53,11 @@ except Exception as exc:  # noqa: BLE001
 PY
 
 # --- models ------------------------------------------------------------------
-# Wav2Lip's two checkpoints ship with the image (they are small enough to bake
-# in). The large Hub models — faster-whisper, NLLB, and the gated IndicF5 voice
-# model — download to $HF_HOME on first use. Fetching them here means the first
-# render does not stall for ten minutes wondering what is happening.
+# Wav2Lip's two checkpoints are excluded from the build context (they are
+# hundreds of megabytes) and fetched by the downloader below, alongside the
+# Hub models — faster-whisper, NLLB, and the gated IndicF5 voice model. All of
+# them land on $HF_HOME or under engine/vendor. Fetching them here means the
+# first render does not stall for ten minutes wondering what is happening.
 if [ "$SKIP_MODELS" != "1" ]; then
     banner "checking models"
     python3 scripts/download_models.py --check || true

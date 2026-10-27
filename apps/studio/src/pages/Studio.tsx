@@ -685,6 +685,11 @@ export default function Studio() {
   const progress = readProgress(job?.step, view === "done" ? "done" : undefined, kind);
   const stageIndex = progress.index;
   const engine = (langs ?? FALLBACK).find((l) => l.code === target)?.engine ?? "—";
+  // The chosen target when nothing installed can speak it, so the form can say
+  // so up front. The server refuses the same case with a 400, but only after
+  // the user has committed to a render.
+  const targetUnavailable = (langs ?? FALLBACK).find(
+    (l) => l.code === target && l.available === false);
   const src = tab === "dub" ? (job?.url ?? "") : preview;
   // A voice-over produces audio, not a video, so the dub tab plays a track.
   // In and out points are positions in the SOURCE clip. Once the dub is in the
@@ -1094,10 +1099,22 @@ export default function Studio() {
               <Sel value={target} onChange={(e) => setTarget(e.target.value)}
                    disabled={langs === null || view === "working"}>
                 {(langs ?? FALLBACK).map((l) => (
-                  <option key={l.code} value={l.code}>{l.name}</option>
+                  <option key={l.code} value={l.code}>
+                    {l.name}{l.available === false ? " — not installed" : ""}
+                  </option>
                 ))}
               </Sel>
             </Row>
+            {targetUnavailable && (
+              <p role="alert"
+                 className="mx-2 mb-2 flex items-start gap-1.5 rounded-[2px] bg-[#242a33] px-2 py-1.5 text-[10px] leading-snug text-c-bad">
+                <span>
+                  {langName(target)} cannot be spoken on this machine yet.{" "}
+                  {targetUnavailable.needs ??
+                    "Install the engine that speaks it, then try again."}
+                </span>
+              </p>
+            )}
             {mode === "subtitled" && (
               <Row label="Subtitles in"
                    hint="Choose the source language to subtitle the clip in the language it is already spoken in — that skips translation">

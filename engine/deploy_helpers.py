@@ -52,6 +52,7 @@ __all__ = [
     "notebook_public_url",
     "public_url",
     "runtime_dirs",
+    "server_log_path",
     "start_server",
     "wait_until_ready",
 ]
@@ -66,8 +67,12 @@ _PLATFORM_ROOTS = {
 }
 
 # The directory names under the runtime root. Declared once so `runtime_dirs`
-# and `configure_runtime` cannot disagree about what exists.
-_SUBDIRS = ("uploads", "output")
+# and `configure_runtime` cannot disagree about what exists. `hf` is the model
+# cache: it belongs on the writable volume too, both because it is many
+# gigabytes and because the Docker image already keeps it at /data/hf, so one
+# layout covers every hosted platform. `logs` holds the server log, so a
+# notebook can hand the user a file to read after something has gone wrong.
+_SUBDIRS = ("uploads", "output", "hf", "logs")
 
 
 def detect_platform() -> str:
@@ -150,7 +155,24 @@ def configure_runtime(root: str | Path | None = None) -> dict[str, Path]:
 
     os.environ["MULTIVA_UPLOAD_DIR"] = str(dirs["uploads"])
     os.environ["MULTIVA_OUTPUT_DIR"] = str(dirs["output"])
+    # Pin the Hugging Face cache to the runtime tree. Left to itself it uses
+    # ~/.cache/huggingface, which on a hosted runtime is either small or
+    # discarded on restart, so the ~7.5 GB of weights would be re-fetched every
+    # session (and can fail outright when the home volume is full).
+    os.environ.setdefault("HF_HOME", str(dirs["hf"]))
     return dirs
+
+
+def server_log_path() -> Path:
+    """
+    The file the server's own output is mirrored to.
+
+    `start_server` tees uvicorn and the application's stdout/stderr here, so a
+    notebook user has one file to read when something goes wrong rather than
+    having to scroll a cell. Lives under the runtime root because on Colab and
+    Kaggle the checkout is not writable for long.
+    """
+    return runtime_dirs()["logs"] / "server.log"
 
 
 def ensure_ffmpeg() -> bool:
@@ -328,6 +350,8 @@ class ServerHandle:
     `stop()` sets uvicorn's `should_exit` flag and joins the thread with a
     timeout, so re-running a notebook cell does not leave a server holding the
     port. Safe to call more than once.
+
+    `log_file` is the mirrored log, or None when logging to a file was off.
     """
 
     url: str
@@ -335,9 +359,25 @@ class ServerHandle:
     port: int
     server: object
     thread: threading.Thread
+    log_file: Path | None = None
 
     def is_running(self) -> bool:
         return self.thread.is_alive()
+
+    def tail(self, lines: int = 60) -> str:
+        """
+        The last `lines` of the server log, for printing after a failure.
+
+        Returns "" when there is no log to read, so a caller can print it
+        unconditionally.
+        """
+        if self.log_file is None or not self.log_file.is_file():
+            return ""
+        try:
+            with open(self.log_file, encoding="utf-8", errors="replace") as fh:
+                return "".join(fh.readlines()[-lines:])
+        except OSError:
+            return ""
 
     def stop(self, timeout: float = 15.0) -> None:
         try:
@@ -354,10 +394,91 @@ class ServerHandle:
         self.stop()
 
 
+class _Tee:
+    """
+    Mirror a stream to a second one, so output is both shown and filed.
+
+    The server runs inside the notebook kernel, so its output normally exists
+    only as cell output: it is lost when the cell is cleared and impossible to
+    attach to a bug report. Teeing stdout/stderr to a log file under the
+    runtime root keeps it, without the engine needing a logging framework.
+    """
+
+    def __init__(self, original, mirror) -> None:
+        self._original = original
+        self._mirror = mirror
+        self._lock = threading.Lock()
+
+    def write(self, text: str) -> int:
+        with self._lock:
+            try:
+                self._mirror.write(text)
+                self._mirror.flush()
+            except Exception:  # noqa: BLE001 - logging must never break a render
+                pass
+            return self._original.write(text)
+
+    def flush(self) -> None:
+        with self._lock:
+            try:
+                self._mirror.flush()
+            except Exception:  # noqa: BLE001
+                pass
+            self._original.flush()
+
+    def isatty(self) -> bool:
+        return False
+
+
+def _unwrap_tee(stream):
+    """
+    The real stream under any `_Tee` layers.
+
+    The server cell is meant to be re-run, and each run tees stdout again. Left
+    alone that nests the wrappers and writes every line to the log once per
+    previous run, so the file grows quadratically with the number of restarts.
+    """
+    seen = 0
+    while isinstance(stream, _Tee) and seen < 32:
+        stream = stream._original
+        seen += 1
+    return stream
+
+
+# The log tee is process-wide and installed once. The engine's logging handler
+# captures `sys.stderr` when it is created, so installing a fresh tee on every
+# server start would leave the previous tee reachable from that handler and
+# write each line to the log twice.
+_log_state: dict = {"path": None, "handle": None}
+
+
+def _install_log_tee(path: Path):
+    """
+    Mirror stdout/stderr to `path`, once per process; return the log handle.
+
+    Installing once matters: the engine's logging handler captures `sys.stderr`
+    when it is created, so teeing again on a re-run of the server cell would
+    leave the previous tee reachable from that handler and write each line to
+    the log twice. Returns None if the file cannot be opened.
+    """
+    if _log_state["handle"] is None:
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            handle = open(path, "a", encoding="utf-8", buffering=1)
+        except OSError:
+            return None
+        sys.stdout = _Tee(_unwrap_tee(sys.stdout), handle)
+        sys.stderr = _Tee(_unwrap_tee(sys.stderr), handle)
+        _log_state["path"] = path
+        _log_state["handle"] = handle
+    return _log_state["handle"]
+
+
 def start_server(host: str = "0.0.0.0", port: int = 8000,
                  *, ready_timeout: float = 300.0,
                  log_level: str = "info",
-                 warmup: bool = False) -> ServerHandle:
+                 warmup: bool = False,
+                 log_to_file: bool = True) -> ServerHandle:
     """
     Start the API (and the built UI, if present) in a background thread.
 
@@ -372,12 +493,31 @@ def start_server(host: str = "0.0.0.0", port: int = 8000,
     `warmup` preloads the models before the first render. It is off by default
     because the engine starts a warmup thread of its own at boot; pass True only
     when the caller wants the server to answer only once the weights are ready.
+
+    With `log_to_file`, everything the server writes to stdout/stderr is also
+    appended to `server_log_path()`, and the path is on the returned handle.
+    That is the file to read (or attach) when a render fails: on Colab and
+    Kaggle the server's output otherwise lives only in the cell.
     """
     # Make `engine/` importable regardless of the caller's cwd, so `import app`
     # resolves to engine/app.py and not to some other module named "app".
     engine_dir = str(Path(__file__).resolve().parent)
     if engine_dir not in sys.path:
         sys.path.insert(0, engine_dir)
+
+    log_file: Path | None = None
+    if log_to_file:
+        log_file = server_log_path()
+        handle = _install_log_tee(log_file)
+        if handle is None:
+            print(f"[deploy] Could not open the server log at {log_file}.")
+            log_file = None
+        else:
+            # A visible break between runs, so a log from a re-run cell is
+            # readable rather than one long undivided stream.
+            handle.write(f"\n{'=' * 62}\n"
+                         f"server starting {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                         f"{'=' * 62}\n")
 
     if warmup:
         os.environ["WARMUP_ON_START"] = "1"
@@ -398,8 +538,9 @@ def start_server(host: str = "0.0.0.0", port: int = 8000,
     if not wait_until_ready(url, timeout=ready_timeout):
         server.should_exit = True
         thread.join(timeout=15)
+        hint = (f" Full log: {log_file}." if log_file else "")
         raise RuntimeError(
             f"The server did not become ready at {url} within "
-            f"{ready_timeout:.0f}s. Check the log output above.")
+            f"{ready_timeout:.0f}s.{hint} Check the log output above.")
     return ServerHandle(url=url, host=host, port=port, server=server,
-                        thread=thread)
+                        thread=thread, log_file=log_file)
