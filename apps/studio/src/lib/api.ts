@@ -1,0 +1,656 @@
+/* ===========================================================================
+   Typed client for the FastAPI service.
+
+   Same-origin in production (FastAPI mounts the build at /app), proxied in dev
+   by vite.config.ts. Nothing here needs a base URL or a CORS shim.
+   =========================================================================== */
+
+import type { JobKind } from "@/lib/pipeline";
+
+export type ProcessingStatus =
+  | "uploaded"
+  | "processing"
+  | "done"
+  | "failed"
+  | string;
+
+export interface VideoRecord {
+  video_id?: string;
+  id?: string;
+  /** How many outputs this project holds: a dub, a subtitled video, ... */
+  outputs?: number;
+  user_id?: string;
+  title?: string;
+  original_language?: string;
+  target_language?: string;
+  duration?: string;
+  processing_status?: ProcessingStatus;
+  original_url?: string;
+  dubbed_url?: string;
+  error_message?: string;
+  created_at?: string;
+  /** The local project behind this row, when its working files still exist. */
+  job_id?: string | null;
+  openable?: boolean;
+}
+
+export interface Language {
+  code: string;
+  name: string;
+  engine: string;
+}
+
+export interface SyncReport {
+  ok: boolean;
+  video: number | null;
+  audio: number | null;
+  delta: number | null;
+  reason: string;
+}
+
+export interface JobStatus {
+  /** What the project is called. Falls back to the source file name. */
+  name?: string;
+  /** Set when the render finished but could not be copied to the output
+      folder — an unmounted drive, a permissions change. */
+  filed_error?: string | null;
+  /** "burned" onto the picture, or "muxed" as a switchable track. */
+  subtitle_mode?: "burned" | "muxed" | null;
+  /** Which language was put on the picture. */
+  subtitle_language?: string | null;
+  /** The project this output belongs to. Several outputs share one. */
+  project_id?: string;
+  job_id: string;
+  status: "queued" | "processing" | "done" | "failed" | "cancelled";
+  step: string;
+  /** Which pipeline produced this job. */
+  kind?: JobKind;
+  /** The language this output was asked for. */
+  target_language?: string | null;
+  original_language?: string | null;
+  /** Whether the clip it was made from is still on disk, so another output
+      can be rendered from the project without importing it again. */
+  has_input?: boolean;
+  /** Length of a rendered voice-over, in seconds. */
+  voiceover_seconds?: number | null;
+  url?: string | null;
+  video_id?: string | null;
+  translated_script?: string | null;
+  original_text?: string | null;
+  sync?: SyncReport;
+  source_language?: string;
+  segment_count?: number;
+  /** Transcript of the clip the voice was cloned from. */
+  reference_text?: string;
+  reference_seconds?: number;
+  /** How close the dub sounds to the reference speaker, 0..1, normalised
+      between a same-speaker ceiling and a different-speaker floor. */
+  voice_match?: { score: number; cosine: number } | null;
+  /** Whether this run stored the timings that transcript export needs. */
+  has_transcript?: boolean;
+  /** Whether the phrase timeline was kept, so the script can be revised. */
+  editable?: boolean;
+  /** The picture is behind the audio until it is re-rendered. */
+  video_stale?: boolean;
+  /** Length of the clip this project was built from. */
+  video_duration?: number | null;
+  /** Where the finished render was filed, if the copy succeeded. */
+  filed_at?: string | null;
+  /** Playback URLs, present once the job finishes. */
+  reference_audio?: string;
+  dub_audio?: string;
+  error?: string;
+}
+
+export interface Health {
+  status: string;
+  /** Finished projects on this machine. There is no remote store. */
+  projects: number;
+  active_jobs: number;
+  /** Whether script rewriting is configured. Off unless a key is set, and the
+      only stage that sends text off this machine. */
+  script_intelligence?: boolean;
+}
+
+export interface FitResult {
+  index: number;
+  changed: boolean;
+  text: string;
+  slot_seconds: number;
+  spoken_seconds: number;
+  was_seconds?: number;
+  fits?: boolean;
+  attempts: Array<{ text: string; seconds: number; source: string }>;
+  /** Words that may have been dropped rather than rephrased. Advisory. */
+  check?: string[];
+  detail?: string;
+}
+
+export class ApiError extends Error {
+  // Declared as a field rather than a constructor parameter property: the
+  // project builds with `erasableSyntaxOnly`, which bans syntax that emits
+  // runtime code from a type position.
+  status?: number;
+
+  constructor(message: string, status?: number) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+  }
+}
+
+async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  let res: Response;
+  try {
+    res = await fetch(path, init);
+  } catch {
+    throw new ApiError(
+      "Cannot reach the API. Start it with: ../venv/bin/python -m uvicorn app:app --port 8000"
+    );
+  }
+  if (!res.ok) {
+    let detail = `${res.status} ${res.statusText}`;
+    try {
+      const body = (await res.json()) as { detail?: string };
+      if (body?.detail) detail = body.detail;
+    } catch {
+      /* response had no JSON body */
+    }
+    throw new ApiError(detail, res.status);
+  }
+  return res.status === 204 ? (null as T) : ((await res.json()) as T);
+}
+
+/* --- identity --------------------------------------------------------------
+   The backend previously attributed every job to the literal string
+   "user-123", so all visitors shared one library. A per-browser id keeps
+   libraries separate. This is scoping, not authentication: the app runs
+   locally and there is no login. */
+const ID_KEY = "multiva.uid";
+const NAME_KEY = "multiva.name";
+
+export function userId(): string {
+  let id = localStorage.getItem(ID_KEY);
+  if (!id) {
+    id = crypto.randomUUID?.() ?? String(Date.now());
+    localStorage.setItem(ID_KEY, id);
+  }
+  return id;
+}
+export const userName = () => localStorage.getItem(NAME_KEY) ?? "";
+export const setUserName = (v: string) => localStorage.setItem(NAME_KEY, v);
+
+/* --- endpoints ------------------------------------------------------------ */
+export const getHealth = () => request<Health>("/api/health");
+export const getLanguages = () => request<Language[]>("/languages");
+export const getJob = (id: string) => request<JobStatus>(`/jobs/${id}/status`);
+
+export const listVideos = () =>
+  request<VideoRecord[]>(`/videos/?user_id=${encodeURIComponent(userId())}`);
+
+export const removeVideo = (id: string) =>
+  request<{ status: string }>(`/videos/${encodeURIComponent(id)}`, {
+    method: "DELETE",
+  });
+
+export interface RenderOptions {
+  /** In and out points on the source, in seconds. */
+  trimStart?: number | null;
+  trimEnd?: number | null;
+  /** A bed laid under the finished dub. */
+  music?: File | null;
+  musicGain?: number;
+  /** What this run should produce. Omitted means a full dub. */
+  kind?: JobKind;
+  /** What to call the project. Defaults to the file name. */
+  name?: string;
+  /** For a subtitled video: which language goes on the picture. Defaults to
+      the target; the source language skips translation entirely. */
+  subtitleLanguage?: string;
+  /** Join an existing project instead of founding a new one. */
+  projectId?: string;
+}
+
+/**
+ * Start a render. With no file, `options.projectId` must name a project
+ * whose clip is still on disk; the engine renders from that.
+ */
+export async function submitVideo(
+  file: File | null,
+  sourceLang: string,
+  targetLang: string,
+  options: RenderOptions = {}
+): Promise<{ job_id: string }> {
+  const params = new URLSearchParams({
+    original_language: sourceLang,
+    target_language: targetLang,
+    user_id: userId(),
+  });
+  if (options.trimStart != null) params.set("trim_start", String(options.trimStart));
+  if (options.trimEnd != null) params.set("trim_end", String(options.trimEnd));
+  if (options.music) params.set("music_gain", String(options.musicGain ?? -18));
+  if (options.kind && options.kind !== "dub") params.set("kind", options.kind);
+  if (options.name) params.set("name", options.name);
+  if (options.subtitleLanguage) {
+    params.set("subtitle_language", options.subtitleLanguage);
+  }
+  if (options.projectId) params.set("project_id", options.projectId);
+
+  const body = new FormData();
+  if (file) body.append("file", file);
+  if (options.music) body.append("music", options.music);
+
+  return request<{ job_id: string }>(`/process_video/?${params}`, {
+    method: "POST",
+    body,
+  });
+}
+
+/* --- revising a finished dub ---------------------------------------------- */
+
+export interface Phrase {
+  index: number;
+  start: number;
+  duration: number;
+  text: string;
+  source_text: string;
+  seed?: number | null;
+  /** Silenced by a cut. The words are kept so the cut stays readable. */
+  cleared?: boolean;
+  /** What the current take actually takes to say, in seconds. */
+  spoken?: number | null;
+}
+
+/** How a phrase sits in its slot. */
+export type Fit = "fits" | "tight" | "overruns" | "silent" | "unknown";
+
+export function fitOf(p: Phrase): Fit {
+  if (p.cleared) return "silent";
+  if (!p.spoken || !p.duration) return "unknown";
+  const ratio = p.spoken / p.duration;
+  // Under the slot is fine. A little over is absorbed by the pause that
+  // follows. Well over is what makes the pipeline compress, and compression
+  // is what reads as robotic.
+  if (ratio <= 1.0) return "fits";
+  return ratio <= 1.1 ? "tight" : "overruns";
+}
+
+export interface PhraseTimeline {
+  video_duration: number;
+  video_stale: boolean;
+  target_language: string;
+  segments: Phrase[];
+}
+
+export interface PhraseResult {
+  index: number;
+  text: string;
+  seed?: number | null;
+  spoken_seconds: number;
+  slot_seconds: number;
+  /** The phrase filled its slot and was shortened to fit. */
+  overruns: boolean;
+  track_seconds: number;
+}
+
+export const getPhrases = (id: string) =>
+  request<PhraseTimeline>(`/jobs/${encodeURIComponent(id)}/segments`);
+
+export const revisePhrase = (
+  id: string,
+  index: number,
+  body: { text?: string; seed?: number }
+) =>
+  request<PhraseResult>(`/jobs/${encodeURIComponent(id)}/segments/${index}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+
+/* --- the pipeline's knobs --------------------------------------------------- */
+
+export interface Tunable {
+  value: number | string;
+  default: number | string;
+  kind: "int" | "float" | "str";
+  label: string;
+  why: string;
+  /** False when it belongs to a model this project is not using. */
+  applies: boolean;
+  /** Fixed by an environment variable; the studio cannot change it. */
+  pinned: boolean;
+}
+
+export interface AdvancedSettings {
+  tunables: Record<string, Tunable>;
+  workdir: string;
+  workdir_bytes: number;
+  output_dir: string;
+}
+
+export const getAdvanced = () => request<AdvancedSettings>("/api/settings/advanced");
+
+export const saveAdvanced = (values: Record<string, number | string>) =>
+  request<{ tunables: Record<string, Tunable> }>("/api/settings/advanced", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(values),
+  });
+
+export const sweepNow = () =>
+  request<{ removed: number; workdir_bytes: number }>("/api/settings/sweep",
+    { method: "POST" });
+
+/* --- models on this machine ------------------------------------------------ */
+
+export interface ModelRow {
+  id: string;
+  label: string;
+  why: string;
+  size: string;
+  required: boolean;
+  kind: "hub" | "file";
+  /** A Hub repo behind a licence gate; needs HF_TOKEN to download. */
+  gated: boolean;
+  present: boolean;
+}
+
+export interface ModelSkipped {
+  id: string;
+  label: string;
+  reason: string;
+}
+
+export interface ModelProgress {
+  running: boolean;
+  label: string;
+  index: number;
+  total: number;
+  bytes: number;
+  of: number;
+  error: string | null;
+  finished: boolean;
+  /** Gated models that were skipped this run, and why. */
+  skipped: ModelSkipped[];
+}
+
+export interface ModelInventory {
+  models: ModelRow[];
+  missing: number;
+  cache: string;
+  free_gb: number;
+  progress: ModelProgress;
+}
+
+export const getModels = () => request<ModelInventory>("/api/models");
+
+/** Start fetching. Omit ids for everything missing. */
+export const downloadModels = (ids?: string[]) =>
+  request<ModelProgress>("/api/models/download", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(ids ? { ids } : {}),
+  });
+
+export const modelProgress = () => request<ModelProgress>("/api/models/progress");
+
+export const cancelModels = () =>
+  request<ModelProgress>("/api/models/cancel", { method: "POST" });
+
+/** Walk back the last phrase edit, restoring the take that was there. */
+export const undoPhrase = (id: string) =>
+  request<PhraseResult & { audio_restored: boolean }>(
+    `/jobs/${encodeURIComponent(id)}/undo`, { method: "POST" });
+
+/** Silence a phrase, keeping its slot and its words. Where Cut puts it. */
+export const clearPhrase = (id: string, index: number) =>
+  request<PhraseResult & { cleared: true }>(
+    `/jobs/${encodeURIComponent(id)}/segments/${index}`, { method: "DELETE" });
+
+/** Name an output, and optionally say which folder it should be saved to. */
+export const renameProject = (id: string, name: string, outputDir?: string) =>
+  request<{ job_id: string; name: string; filed_at?: string | null }>(
+    `/jobs/${encodeURIComponent(id)}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(outputDir ? { name, output_dir: outputDir } : { name }),
+    });
+
+/* --- everything a project has produced ------------------------------------ */
+
+export interface ProjectOutput {
+  job_id: string;
+  kind: JobKind;
+  name: string;
+  url: string | null;
+  audio: string | null;
+  filed_at: string | null;
+  target_language: string | null;
+  subtitle_language: string | null;
+  saved_at: number | null;
+}
+
+export const getProjectOutputs = (projectId: string) =>
+  request<{ project_id: string; outputs: ProjectOutput[] }>(
+    `/projects/${encodeURIComponent(projectId)}/outputs`);
+
+/** Rewrite a phrase until it fits its slot when spoken. */
+export const fitPhrase = (id: string, index: number) =>
+  request<FitResult>(`/jobs/${encodeURIComponent(id)}/segments/${index}/fit`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({}),
+  });
+
+export const phraseAudioUrl = (id: string, index: number) =>
+  `/jobs/${encodeURIComponent(id)}/segments/${index}/audio`;
+
+/** A URL the browser will save rather than play. */
+export const downloadUrl = (id: string) =>
+  `/jobs/${encodeURIComponent(id)}/video?download=1`;
+
+/** The same for an output that is audio only: a voice-over, or an audio dub. */
+export const downloadAudioUrl = (id: string) =>
+  `/jobs/${encodeURIComponent(id)}/audio/dub?download=1`;
+
+/** Show the finished file in Finder / Explorer / the desktop file manager. */
+export const revealRender = (id: string) =>
+  request<{ revealed: string }>(`/jobs/${encodeURIComponent(id)}/reveal`,
+    { method: "POST" });
+
+export const rerenderVideo = (id: string) =>
+  request<{ job_id: string; status: string }>(
+    `/jobs/${encodeURIComponent(id)}/rerender`, { method: "POST" });
+
+export interface ReferenceWindow {
+  start: number;
+  duration: number;
+  score: number;
+  text: string;
+}
+
+export const getReferenceWindows = (id: string) =>
+  request<{ current: { start?: number; duration?: number; text: string };
+            candidates: ReferenceWindow[] }>(
+    `/jobs/${encodeURIComponent(id)}/reference/candidates`);
+
+export const chooseReference = (id: string, start: number, duration: number) =>
+  request<{ job_id: string; status: string }>(
+    `/jobs/${encodeURIComponent(id)}/reference`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ start, duration }),
+    });
+
+/* --- engines -------------------------------------------------------------- */
+
+export interface EngineOption {
+  id: string;
+  label: string;
+  size: string;
+  note?: string;
+  /** A reason not to pick this, shown in place of the note. */
+  warn?: string;
+  /** False means it is not on disk yet. */
+  ready: boolean;
+  /** How it is obtained: fetched from the Hub, or placed by hand. */
+  source: "download" | "manual" | "builtin";
+  /** Where a manual file belongs, relative to engine/. */
+  local?: string;
+}
+
+export interface EngineStage {
+  label: string;
+  why: string;
+  default: string;
+  current: string;
+  /** Fixed by an environment variable; the UI cannot change it. */
+  pinned: boolean;
+  options: EngineOption[];
+}
+
+export interface EngineSettings {
+  configured: boolean;
+  stages: Record<string, EngineStage>;
+  /** Where finished videos are filed. */
+  output_dir: string;
+  default_output_dir: string;
+}
+
+export const getEngines = () => request<EngineSettings>("/api/settings/engines");
+
+export const saveEngines = (choices: Record<string, string>) =>
+  request<EngineSettings & {
+    /** Always false now: stage changes are applied to the running engine. */
+    restart_required: boolean;
+    /** Which stages were reloaded in place. */
+    applied?: string[];
+    /** A job is rendering, so the change lands on the next one. */
+    takes_effect_after_current_job?: boolean;
+  }>(
+    "/api/settings/engines", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(choices),
+    });
+
+/* --- script intelligence -------------------------------------------------- */
+
+export interface LlmProvider {
+  label: string;
+  needs_key: boolean;
+  /** Needs a base URL as well as a key: any OpenAI-compatible endpoint. */
+  needs_url?: boolean;
+  default_model: string;
+  suggested: string[];
+  note: string;
+}
+
+export interface LlmStatus {
+  enabled: boolean;
+  provider: string;
+  model: string;
+  /** True when the model runs on this machine and nothing is sent anywhere. */
+  local: boolean;
+  has_key: boolean;
+  ollama_host: string;
+  custom_url: string;
+  providers: Record<string, LlmProvider>;
+  /** Models Ollama has actually pulled. Empty for hosted providers. */
+  installed: string[];
+}
+
+export const getLlmSettings = () => request<LlmStatus>("/api/settings/llm");
+
+export const saveLlmSettings = (body: {
+  provider: string;
+  model: string;
+  /** Omit to keep the stored key; send "" to delete it. */
+  api_key?: string;
+  ollama_host?: string;
+  custom_url?: string;
+}) =>
+  request<LlmStatus>("/api/settings/llm", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+
+export const testLlmSettings = () =>
+  request<LlmStatus & { ok: boolean; reply: string }>(
+    "/api/settings/llm/test", { method: "POST" });
+
+/** Ask a running job to stop. Cooperative: it lands at the next stage report. */
+export const cancelJob = (id: string) =>
+  request<{ status: string; cancelled: boolean }>(
+    `/jobs/${encodeURIComponent(id)}/cancel`, { method: "POST" });
+
+/** Speak a typed script in the voice of an uploaded reference clip. */
+export async function submitVoiceover(
+  file: File,
+  script: string,
+  language: string,
+  name?: string,
+  projectId?: string
+): Promise<{ job_id: string }> {
+  const params = new URLSearchParams({
+    language,
+    user_id: userId(),
+  });
+  if (name) params.set("name", name);
+  if (projectId) params.set("project_id", projectId);
+  const body = new FormData();
+  body.append("file", file);
+  body.append("script", script);
+  return request<{ job_id: string }>(`/voiceover/?${params}`, {
+    method: "POST",
+    body,
+  });
+}
+
+/* --- display helpers ------------------------------------------------------ */
+const LANG_NAMES: Record<string, string> = {
+  hi: "Hindi", mr: "Marathi", ta: "Tamil", te: "Telugu", kn: "Kannada",
+  bn: "Bengali", gu: "Gujarati", ml: "Malayalam", pa: "Punjabi", or: "Odia",
+  as: "Assamese", ur: "Urdu", en: "English", es: "Spanish", fr: "French",
+  de: "German", zh: "Chinese", ja: "Japanese", ko: "Korean", ar: "Arabic",
+};
+export const langName = (code?: string) =>
+  (code && LANG_NAMES[code]) || code?.toUpperCase() || "Unknown";
+
+/** File kinds the backend can build from a finished job's stored timings. */
+export const EXPORTS = [
+  { kind: "dub.srt", label: "Subtitles (SRT)", needsTranslation: true },
+  { kind: "dub.vtt", label: "Subtitles (VTT)", needsTranslation: true },
+  { kind: "source.srt", label: "Source subtitles", needsTranslation: false },
+  { kind: "translation.txt", label: "Translated script", needsTranslation: true },
+  { kind: "transcript.txt", label: "Source transcript", needsTranslation: false },
+] as const;
+
+export const exportUrl = (jobId: string, kind: string) =>
+  `/jobs/${encodeURIComponent(jobId)}/export/${encodeURIComponent(kind)}`;
+
+/** "4 minutes ago" reads better than a date on a project you just made. */
+export function relativeTime(iso?: string): string {
+  if (!iso) return "";
+  const then = new Date(iso).getTime();
+  if (Number.isNaN(then)) return "";
+  const mins = Math.round((Date.now() - then) / 60000);
+  if (mins < 1) return "just now";
+  if (mins < 60) return `${mins} min ago`;
+  const hours = Math.round(mins / 60);
+  if (hours < 24) return `${hours} hr ago`;
+  const days = Math.round(hours / 24);
+  if (days < 30) return `${days} day${days === 1 ? "" : "s"} ago`;
+  return formatDate(iso);
+}
+
+export const formatDate = (iso?: string) => {
+  if (!iso) return "";
+  const d = new Date(iso);
+  return Number.isNaN(d.getTime())
+    ? ""
+    : d.toLocaleDateString(undefined, {
+        day: "numeric", month: "short", year: "numeric",
+      });
+};

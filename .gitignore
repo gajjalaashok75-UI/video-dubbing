@@ -1,0 +1,100 @@
+# =========================
+# Secrets
+# =========================
+.env
+.env.*
+!.env.example
+cert.pem
+key.pem
+
+# =========================
+# Python
+# =========================
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+build/
+dist/
+.eggs/
+*.bak
+
+# =========================
+# Virtual environments
+# =========================
+venv/
+.venv/
+env/
+conda-env/
+*.conda
+
+# =========================
+# Node / Rust build output
+# =========================
+node_modules/
+apps/studio/src-tauri/target/
+# The compiled SPA. app.py serves it, but it is produced by `npm run build`
+# and should not be versioned.
+# web/ is the built studio interface and IS committed. It is build output,
+# which normally would not be, but the alternative is making Node a
+# prerequisite for everyone who only wants to run the app. CI rebuilds it
+# and fails if what is committed has drifted from the source.
+
+# =========================
+# Model weights and caches
+# =========================
+.cache/
+.huggingface/
+hf_cache/
+whisper_models/
+tts_models/
+checkpoints/
+*.bin
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+# Vendored third-party model code, cloned during setup.
+engine/IndicF5/
+
+# =========================
+# Runtime working directories
+# =========================
+# Holds live projects: source clips, per-phrase caches, renders and manifests.
+temp_uploads/
+gradio_runs/
+.gradio/
+eval_runs/
+logs/
+*.log
+
+# =========================
+# Media
+# =========================
+# Test footage and renders live outside version control.
+output_videos/
+test_videos/
+*.wav
+# The four clips the voice-match floor is anchored on travel with the engine.
+!engine/assets/floor/*.wav
+*.mp3
+*.flac
+*.m4a
+*.aac
+*.mp4
+*.mov
+*.mkv
+*.avi
+# The README's demo is the one video that belongs in the repository.
+!docs/media/demo.mp4
+
+# =========================
+# Editors and OS
+# =========================
+.DS_Store
+.AppleDouble
+.LSOverride
+Thumbs.db
+.vscode/
+.idea/
+.ipynb_checkpoints/

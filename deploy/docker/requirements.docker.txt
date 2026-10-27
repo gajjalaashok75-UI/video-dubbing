@@ -1,0 +1,98 @@
+# =============================================================================
+# Multiva — Docker / Linux dependencies
+# =============================================================================
+# Mirrors requirements.txt for the image in deploy/docker/Dockerfile, with one
+# change: the torch stack is NOT here. The Dockerfile installs torch, torchaudio
+# and torchvision from the cu124 index in their own layer, so this file must not
+# name them or pip would pull the CPU-only wheels from PyPI instead.
+#
+# Build context is the repository root; this file is copied to /app/requirements.txt.
+# =============================================================================
+
+# Core
+fastapi>=0.111.0
+uvicorn[standard]>=0.30.0
+python-multipart>=0.0.31   # < 0.0.31 has advisories in the upload parser
+pydantic>=2.6.0
+
+# Audio / Video
+ffmpeg-python==0.2.0
+librosa>=0.10.0
+soundfile>=0.12.0
+numpy>=1.26.0
+scipy>=1.11.0
+opencv-python>=4.8.0
+
+# STT — faster-whisper (CTranslate2 backend, replaces openai-whisper)
+faster-whisper>=1.0.0
+ctranslate2>=4.0.0
+
+# Imported directly by the voice engine (tts_engines.py reads IndicF5's
+# safetensors by hand) and by the vendored Wav2Lip face detector. Both
+# arrive with torch/transformers today, but pinning them means a future
+# dependency change cannot remove a module the code imports by name.
+safetensors>=0.4.0
+tqdm>=4.66.0
+
+# Translation — NLLB-200 (replaces IndicTrans2)
+transformers>=4.49,<5   # <5 is not optional: transformers 5.x needs
+                        # huggingface-hub>=1.5, which contradicts the pin
+                        # below and makes the whole file uninstallable.
+sentencepiece>=0.1.99
+huggingface-hub>=0.30,<1.0  # <1.0: transformers 4.49 refuses hub 1.x
+
+# TTS / Voice Cloning — IndicF5 (ai4bharat) for Indian languages.
+# Weights come from the HF cache at runtime; nothing hits the network at
+# inference time. edge-tts is GONE: it was a round-trip to Azure, so the old
+# pipeline was never actually local.
+#
+# f5-tts is pinned to the release only so the shared deps (vocos, torchdiffeq,
+# x-transformers) resolve; IndicF5's checkpoint is NOT compatible with the
+# release's forward math. engine/vendor/f5_tts holds the fork the checkpoint was
+# trained with and engine/tts_engines.py puts it first on sys.path. See
+# _use_vendored_f5_tts there before changing this.
+f5-tts>=0.1.0
+vocos>=0.1.0
+x-transformers>=1.31.0
+torchdiffeq>=0.2.3
+num2words>=0.5.13
+accelerate>=0.30.0
+jieba>=0.42.1
+pypinyin>=0.49.0
+
+# Foreign-language cloning. XTTS speaks the 16 non-Indian languages the app
+# offers; IndicF5 covers the 12 Indian ones and needs nothing extra.
+#
+# Left out of the default install on purpose: the Coqui Public Model License
+# is NON-COMMERCIAL, and the package drags in a very large dependency tree.
+# Without it the studio marks those languages unavailable and refuses a dub
+# into one up front, so nothing fails halfway through a render. Translated
+# subtitles work in every language either way, because they never synthesize.
+#
+# To enable them:  pip install "TTS>=0.22.0"
+# TTS>=0.22.0
+
+# Cloud Storage & Database
+
+# Test harness UI (engine/gradio_app.py)
+# MUST stay on 5.x: gradio 6 requires huggingface-hub>=1.16, but transformers
+# 4.49 requires <1.0, and installing gradio 6 breaks NLLB + IndicF5 at import.
+gradio>=5,<6
+
+# Subtitles are drawn onto the picture with Pillow (ffmpeg from Homebrew has
+# no libass). fontTools reads each installed font's character map, so the
+# one that actually holds the script gets picked - Telugu in a Telugu font,
+# not boxes in a Devanagari one. Both arrive with torchvision/matplotlib
+# already; pinned here so a future dependency change cannot drop them.
+pillow>=10.0.0
+fonttools>=4.40.0
+
+# Utilities
+requests>=2.31.0
+typing-extensions>=4.12.0
+pydub>=0.25.0
+
+# Script intelligence — length-aware rewriting, run locally through Ollama.
+# No Python package required: it speaks Ollama's HTTP API with `requests`.
+#   ollama pull qwen2.5:7b
+# Optional. Every feature using it degrades cleanly when Ollama is not running.

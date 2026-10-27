@@ -1,0 +1,42 @@
+# Build context is the repository root, so this trims what the daemon sends.
+# Keep it in sync with .gitignore: what is not in the repo is usually not
+# needed in the image either, plus the multi-gigabyte caches.
+
+# --- version control ---
+.git
+.gitignore
+.gitattributes
+.github
+
+# --- python ---
+venv
+.venv
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache
+.ruff_cache
+.mypy_cache
+.env
+
+# --- node / rust build trees ---
+node_modules
+apps/studio/node_modules
+apps/studio/src-tauri/target
+
+# --- runtime output: never bake a render or a cache into the image ---
+temp_uploads
+output
+data
+models
+*.log
+
+# --- the large model weights: fetched at run time into the /data volume ---
+# Wav2Lip's checkpoints are pulled by scripts/download_models.py on start.
+engine/vendor/wav2lip/checkpoints/*.pth
+engine/vendor/wav2lip/face_detection/detection/sfd/*.pth
+
+# --- docs media: large binaries the container never reads ---
+docs/media/*.mp4
+docs/media/*.gif

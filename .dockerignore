@@ -1,0 +1,36 @@
+# Keep the Docker build context small. This is the safety net: it applies even
+# when the build is run without the Dockerfile-specific ignore file in
+# deploy/docker/. It must stay in sync with .gitignore.
+
+.git
+.gitignore
+.github
+.venv
+venv
+__pycache__
+**/__pycache__
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache
+.ruff_cache
+.mypy_cache
+.env
+
+node_modules
+**/node_modules
+apps/studio/src-tauri/target
+
+temp_uploads
+output
+data
+models
+*.log
+
+# Model weights are fetched at run time, not baked in.
+engine/vendor/wav2lip/checkpoints/*.pth
+engine/vendor/wav2lip/face_detection/detection/sfd/*.pth
+**/*.safetensors
+
+docs/media/*.mp4
+docs/media/*.gif

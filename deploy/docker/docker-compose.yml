@@ -1,0 +1,60 @@
+# Multiva — Docker Compose
+#
+# Bring the whole thing up on the GPU in one command, from the repository root:
+#
+#     docker compose -f deploy/docker/docker-compose.yml up --build
+#
+# then open http://localhost:8000/app/
+#
+# Requires the NVIDIA Container Toolkit on the host so the `deploy.reservations`
+# block below can hand the GPU to the container. Without a GPU, delete that
+# block and the render still works — on the CPU, slowly.
+services:
+  multiva:
+    build:
+      # Context is the repository root, so `COPY . /app` gets the whole tree and
+      # `deploy/docker/...` paths resolve inside the Dockerfile.
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+    image: multiva:latest
+    container_name: multiva
+    ports:
+      - "8000:8000"
+    volumes:
+      # Everything the container writes that is worth keeping: uploaded clips,
+      # finished renders, and the Hugging Face model cache. Persisted on the
+      # host so a rebuild does not re-download 7.5 GB of weights.
+      - multiva-data:/data
+      # Optional: a folder of your own to read source videos from.
+      # - ./samples:/samples:ro
+    environment:
+      # Needed only for the gated IndicF5 voice model. Put HF_TOKEN=hf_... in a
+      # .env beside this file (compose reads it automatically) or export it.
+      # Without it the 11 Indian languages are unavailable; everything else runs.
+      HF_TOKEN: "${HF_TOKEN:-}"
+      MULTIVA_UPLOAD_DIR: /data/uploads
+      MULTIVA_OUTPUT_DIR: /data/output
+      HF_HOME: /data/hf
+      # Set to 1 to skip the model pre-fetch on start (models load lazily then).
+      SKIP_MODEL_DOWNLOAD: "${SKIP_MODEL_DOWNLOAD:-0}"
+      # Pin a stage model without touching the UI, e.g. a smaller Whisper.
+      # WHISPER_MODEL: "medium"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      # Weights take a while to load on a cold start; do not call it unhealthy
+      # while it is still warming up.
+      start_period: 180s
+
+volumes:
+  multiva-data:

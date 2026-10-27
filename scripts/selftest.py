@@ -1,0 +1,849 @@
+#!/usr/bin/env python3
+"""
+End-to-end self test.
+
+Exercises the whole pipeline against a running engine: a real dub, the phrase
+editor, undo, exports, a voice-over, and cancellation. Every check is against
+observable behaviour, not internal state, so this passes only if the thing a
+user would do actually works.
+
+    python scripts/selftest.py path/to/clip.mp4
+    python scripts/selftest.py path/to/clip.mp4 --quick   # skip the renders
+
+Requires the engine to be running:
+    cd engine && ../venv/bin/python -m uvicorn app:app --port 8000
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+
+BASE = os.getenv("MULTIVA_URL", "http://127.0.0.1:8000")
+passed, failed, notes = 0, 0, []
+skipped = []
+speakable = set()
+
+
+def check(name, ok, detail=""):
+    global passed, failed
+    if ok:
+        passed += 1
+        print(f"  PASS  {name}")
+    else:
+        failed += 1
+        notes.append(name)
+        print(f"  FAIL  {name}  {detail}")
+    return ok
+
+
+def skip(name, reason):
+    """A check that cannot run because a model it needs is not installed.
+
+    The voice model is gated, so a machine without a Hugging Face token has
+    no way to speak the Indian languages. That is a configuration the docs
+    describe, not a regression, so it is reported as skipped - the same way
+    a render is skipped when no clip is given - rather than failed.
+    """
+    skipped.append(name)
+    print(f"  SKIP  {name}  {reason}")
+    return False
+
+
+def call(method, path, body=None, files=None, raw=False):
+    """Returns (status, parsed_or_bytes). Never raises on an HTTP error."""
+    url = f"{BASE}{path}"
+    data, headers = None, {}
+    if files:
+        boundary = "----multiva" + str(int(time.time() * 1000))
+        parts = []
+        for key, (fname, content) in files.items():
+            parts.append(f"--{boundary}\r\n".encode())
+            parts.append(
+                f'Content-Disposition: form-data; name="{key}"; filename="{fname}"\r\n'
+                f"Content-Type: application/octet-stream\r\n\r\n".encode())
+            parts.append(content)
+            parts.append(b"\r\n")
+        for key, value in (body or {}).items():
+            parts.append(f"--{boundary}\r\n".encode())
+            parts.append(f'Content-Disposition: form-data; name="{key}"\r\n\r\n'.encode())
+            parts.append(str(value).encode())
+            parts.append(b"\r\n")
+        parts.append(f"--{boundary}--\r\n".encode())
+        data = b"".join(parts)
+        headers["Content-Type"] = f"multipart/form-data; boundary={boundary}"
+    elif body is not None:
+        data = json.dumps(body).encode()
+        headers["Content-Type"] = "application/json"
+
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=300) as r:
+            payload = r.read()
+            if raw:
+                return r.status, payload
+            try:
+                return r.status, json.loads(payload)
+            except json.JSONDecodeError:
+                return r.status, payload
+    except urllib.error.HTTPError as e:
+        payload = e.read()
+        try:
+            return e.code, json.loads(payload)
+        except json.JSONDecodeError:
+            return e.code, payload
+    except Exception as e:                                   # noqa: BLE001
+        return 0, {"detail": str(e)}
+
+
+def tone_wav(seconds=6, rate=22050, freq=220.0):
+    """A quiet sine tone, so the music-bed path has something real to mix."""
+    import math
+    import struct
+    import wave
+    from io import BytesIO
+
+    buf = BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(b"".join(
+            struct.pack("<h", int(8000 * math.sin(2 * math.pi * freq * i / rate)))
+            for i in range(int(rate * seconds))))
+    return buf.getvalue()
+
+
+def wait_for(job, timeout=900):
+    """Block until a job leaves the processing state."""
+    end = time.time() + timeout
+    last = ""
+    while time.time() < end:
+        code, d = call("GET", f"/jobs/{job}/status")
+        if code != 200:
+            return "gone", d
+        if d["step"] != last:
+            last = d["step"]
+            print(f"        {d['status']:10} {last}")
+        if d["status"] in ("done", "failed", "cancelled"):
+            return d["status"], d
+        time.sleep(4)
+    return "timeout", {}
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("clip", nargs="?", help="a short talking-head video")
+    ap.add_argument("--quick", action="store_true", help="skip anything that renders")
+    ap.add_argument("--lang", default="hi")
+    args = ap.parse_args()
+
+    print(f"\n  Multiva self test  ->  {BASE}\n")
+
+    # ---- engine ----------------------------------------------------------
+    print("  Engine")
+    code, health = call("GET", "/api/health")
+    if code == 0:
+        # Nothing answered. Every later check would fail the same way, and
+        # a traceback out of the first one that indexes a response says
+        # less than this does.
+        print(f"  Nothing is listening at {BASE}. Start the engine first:\n"
+              f"      ./run.sh\n  or point the test at it with MULTIVA_URL.\n")
+        return 1
+    check("health responds", code == 200, str(health)[:60])
+    check("no cloud storage reported", isinstance(health, dict)
+          and "db" not in health and "r2" not in health, str(health)[:80])
+    code, boot = call("GET", "/api/boot")
+    check("models loaded", code == 200 and boot.get("ready"), str(boot)[:60])
+    if isinstance(boot, dict) and boot.get("notes"):
+        print(f"        note: {boot['notes']}")
+
+    print("\n  Settings")
+    # The app must not offer a language it cannot speak. XTTS is an optional
+    # extra, so every language says whether the engine behind it is installed
+    # rather than failing deep inside a render the user already waited for.
+    code, langs = call("GET", "/languages")
+    check("languages listed", code == 200 and isinstance(langs, list) and langs)
+    if code == 200 and isinstance(langs, list) and langs:
+        shape = all({"code", "name", "engine", "available"} <= set(l) for l in langs)
+        check("every language reports its engine and availability", shape,
+              str(langs[0])[:70])
+        speakable.update(l["code"] for l in langs if l.get("available"))
+        unavailable = [l for l in langs if not l.get("available")]
+        check("anything unavailable says how to enable it",
+              all(l.get("needs") for l in unavailable),
+              f"{len(unavailable)} unavailable without a hint")
+        print(f"        {len(langs) - len(unavailable)} of {len(langs)} "
+              f"speakable on this machine")
+
+    code, eng = call("GET", "/api/settings/engines")
+    check("engine catalogue", code == 200 and "stages" in eng)
+
+    # The stage name was validated and the value was not, so a typo was stored
+    # and became the current model. Harmless while a restart was needed; not
+    # harmless now that stage changes apply immediately.
+    code, _ = call("POST", "/api/settings/engines", {"stt": "not-a-real-model"})
+    check("a model outside the catalogue is refused", code == 400, f"got {code}")
+    _, still = call("GET", "/api/settings/engines")
+    check("and the stage kept its real model",
+          still["stages"]["stt"]["current"] != "not-a-real-model",
+          str(still["stages"]["stt"]["current"]))
+    code, mind = call("GET", "/api/settings/llm")
+    check("script model settings", code == 200 and "provider" in mind)
+
+    # Getting the models has to work from inside the app, not only from a
+    # terminal, so the endpoints behind that are part of the contract.
+    code, inv = call("GET", "/api/models")
+    check("model inventory", code == 200 and isinstance(inv.get("models"), list)
+          and len(inv["models"]) >= 5, str(inv)[:70])
+    if code == 200:
+        shape = all({"id", "label", "size", "present", "required"} <= set(m)
+                    for m in inv["models"])
+        check("every model reports size and presence", shape)
+        print(f"        {len(inv['models'])} models, {inv.get('missing')} missing, "
+              f"{inv.get('free_gb')} GB free")
+    code, prog = call("GET", "/api/models/progress")
+    check("download progress readable", code == 200 and "running" in prog,
+          str(prog)[:60])
+    code, _ = call("POST", "/api/models/download", {"ids": "not-a-list"})
+    check("a bad download request is rejected", code == 400, f"got {code}")
+
+    # Settings for a model nobody is using are noise, so each knob says
+    # whether it applies to the engines currently chosen.
+    code, adv = call("GET", "/api/settings/advanced")
+    check("pipeline settings readable",
+          code == 200 and isinstance(adv.get("tunables"), dict) and adv["tunables"],
+          str(adv)[:70])
+    if code == 200:
+        knobs = adv["tunables"]
+        check("every knob says whether it applies",
+              all("applies" in k and "value" in k for k in knobs.values()))
+        lip = [k for k, v in knobs.items() if k.startswith("W2L_")]
+        using_w2l = "wav2lip" in str(mind and "").lower() or True
+        print(f"        {sum(1 for v in knobs.values() if v['applies'])} of "
+              f"{len(knobs)} apply to the chosen engines")
+
+        was = knobs["OUTPUT_CRF"]["value"]
+        code, wrote = call("POST", "/api/settings/advanced", {"OUTPUT_CRF": 21})
+        check("a knob can be changed",
+              code == 200 and wrote["tunables"]["OUTPUT_CRF"]["value"] == 21,
+              str(wrote)[:70])
+        _, back = call("GET", "/api/settings/advanced")
+        check("the change survives a fresh read",
+              back["tunables"]["OUTPUT_CRF"]["value"] == 21,
+              "written but not read back")
+        code, _ = call("POST", "/api/settings/advanced", {"OUTPUT_CRF": "nonsense"})
+        check("an unparseable value is ignored, not stored", code == 200)
+        _, still = call("GET", "/api/settings/advanced")
+        check("the knob kept its last good value",
+              still["tunables"]["OUTPUT_CRF"]["value"] == 21)
+        call("POST", "/api/settings/advanced", {"OUTPUT_CRF": was})
+        _ = lip, using_w2l
+
+    code, swept = call("POST", "/api/settings/sweep")
+    check("abandoned runs can be cleared on request",
+          code == 200 and "removed" in swept, str(swept)[:60])
+    check("no API key ever returned", "keys" not in json.dumps(mind)
+          and "sk-" not in json.dumps(mind))
+    code, _ = call("POST", "/api/settings/llm", {"provider": "not-a-provider"})
+    check("unknown provider rejected", code == 400, f"got {code}")
+
+    # ---- subtitle fonts ---------------------------------------------------
+    # Each script needs a font that actually holds its letters. This is the
+    # one place a Telugu render turned into a row of boxes while every HTTP
+    # check stayed green, so it is checked here on the fonts of this machine.
+    print("\n  Subtitle fonts")
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..",
+                                    "engine"))
+    try:
+        import subtitles as _subs
+        for lang, sample in (
+                ("hi", "नमस्ते, मेरा नाम अशोक है"), ("bn", "আমার নাম অশোক"),
+                ("ta", "என் பெயர் அஷோக்"), ("te", "నా పేరు అశోక్ B.Tech"),
+                ("kn", "ನನ್ನ ಹೆಸರು ಅಶೋಕ್"), ("ml", "എന്റെ പേര് അശോക്"),
+                ("gu", "મારું નામ અશોક"), ("pa", "ਮੇਰਾ ਨਾਮ ਅਸ਼ੋਕ"),
+                ("or", "ମୋ ନାମ ଅଶୋକ ସ୍ପିକର"), ("ur", "میرا نام اشوک ہے"),
+                ("ar", "اسمي أشوك"), ("ja", "私の名前はアショークです"),
+                ("zh", "我叫阿肖克"), ("ru", "меня зовут Ашок"),
+                ("en", "my name is Ashok")):
+            need = {ord(c) for c in sample if c.isalpha()}
+            # Coverage is checked across every font the cue is drawn in, not
+            # just the first: a Telugu line with "B.Tech" in it needs two, and
+            # the test used to only ask the Telugu one.
+            missing = need - _subs.coverage(sample)
+            # Coverage is not enough: Oriya Sangam MN holds every Odia
+            # letter and still throws on a conjunct, so the cue is drawn.
+            drawn = False
+            try:
+                drawn = _subs._render_cue(sample, 640, 28,
+                                          os.path.join(tempfile.gettempdir(),
+                                                       f"multiva_cue_{lang}.png"))
+            except Exception as exc:                         # noqa: BLE001
+                missing = missing or {0}
+                drawn = str(exc)
+            check(f"{lang} subtitles draw in a font with every letter",
+                  not missing and drawn is True,
+                  f"{'+'.join(_subs.font_names(sample)) or 'no font'} "
+                  f"lacks {len(missing)} of {len(need)}; drawn={drawn}")
+    except ImportError as exc:
+        check("subtitle renderer imports", False, str(exc))
+
+    if args.quick or not args.clip:
+        if not args.clip:
+            print("\n  No clip given; skipping everything that renders.")
+        return report()
+
+    if not os.path.isfile(args.clip):
+        print(f"\n  No such file: {args.clip}")
+        return 1
+    clip = open(args.clip, "rb").read()
+    name = os.path.basename(args.clip)
+
+    # A dub needs the voice model. It is gated, so on a machine without a
+    # token there is no way to speak any Indian language and the render checks
+    # cannot run. Rather than fail checks that were never going to pass, say
+    # so once and prove the rest of the pipeline on the same clip: a
+    # translated subtitle render exercises transcription, translation, timing
+    # and font rendering without ever reaching a voice engine.
+    if args.lang not in speakable:
+        print("\n  Dub")
+        skip(f"a {args.lang} dub",
+             f"{args.lang} has no voice model on this machine; "
+             "see docs/GATED-MODELS.md")
+        print("\n  Subtitles (no voice model needed)")
+        code, sub = call("POST", f"/process_video/?original_language=auto"
+                                 f"&target_language={args.lang}"
+                                 f"&kind=subtitles_translated&user_id=selftest",
+                         files={"file": (name, clip)})
+        if check("a translated subtitle render is accepted",
+                 code == 200 and "job_id" in sub, str(sub)[:80]):
+            state, d = wait_for(sub["job_id"])
+            check("the subtitle render finished", state == "done",
+                  f"{state} {d.get('error')}")
+            check("it produced a translation", bool(d.get("translated_script")))
+            code, body = call("GET", f"/jobs/{sub['job_id']}/export/dub.srt",
+                              raw=True)
+            check("it exports subtitles in the target script",
+                  code == 200 and len(body) > 20, f"{code}, {len(body)}b")
+            call("DELETE", f"/videos/{sub['job_id']}")
+        return report()
+
+    # ---- a real dub ------------------------------------------------------
+    print("\n  Dub")
+    code, sub = call("POST", f"/process_video/?original_language=auto"
+                             f"&target_language={args.lang}&user_id=selftest",
+                     files={"file": (name, clip)})
+    if not check("accepted", code == 200 and "job_id" in sub, str(sub)[:80]):
+        return report()
+    job = sub["job_id"]
+    status, d = wait_for(job)
+    if not check("render completed", status == "done", d.get("error", "")):
+        return report()
+
+    check("audio and video agree", bool(d.get("sync", {}).get("ok")),
+          str(d.get("sync")))
+    check("voice match scored", d.get("voice_match") is not None)
+    if d.get("voice_match"):
+        print(f"        voice match {d['voice_match']['score']:.3f}")
+    check("render served locally", str(d.get("url", "")).startswith("/jobs/"),
+          str(d.get("url")))
+    code, _ = call("GET", f"/jobs/{job}/video", raw=True)
+    check("render downloads", code == 200, f"got {code}")
+
+    # ---- the phrase timeline --------------------------------------------
+    print("\n  Phrase timeline")
+    code, tl = call("GET", f"/jobs/{job}/segments")
+    check("timeline listed", code == 200 and tl.get("segments"))
+    phrases = tl.get("segments", [])
+    # Reported, not asserted. Coverage alone cannot tell a truncated transcript
+    # from a clip whose speech ends early: the test clip's speech stops at
+    # 13.3s of 17.2s, and the earlier assertion that it reach 85% was wrong in
+    # exactly the way that caused a hallucination. Whether a tail with speech
+    # in it gets recovered is checked where the decision is made, against VAD.
+    video_dur = tl.get("video_duration") or 0
+    covered = max((p["start"] + p["duration"] for p in phrases), default=0)
+    if video_dur:
+        print(f"        transcript covers {covered / video_dur * 100:.0f}% "
+              f"of the clip")
+
+    # A transcript that got stuck - "भाजपा के लिए" six times in a row - was
+    # translated and spoken as if it were said. Nothing should repeat like
+    # that, and no translation should come back with no letters in it.
+    from collections import Counter
+    # Several phrases can come from one source segment, so its text is
+    # deduplicated first or the segment itself reads as a loop.
+    sources = list(dict.fromkeys(p.get("source_text") or "" for p in phrases))
+    for label, texts in (("transcript", sources),
+                         ("translation", [p["text"] for p in phrases])):
+        words = " ".join(texts).split()
+        tri = Counter(tuple(words[i:i + 3]) for i in range(max(0, len(words) - 2)))
+        loops = [g for g, c in tri.items() if c >= 3]
+        check(f"no repetition loop in the {label}", not loops,
+              f"{' '.join(loops[0])!r} x{tri[loops[0]]}" if loops else "")
+    empty = [p["text"] for p in phrases
+             if sum(1 for c in p["text"] if c.isalpha()) < 2]
+    check("every phrase has words in it", not empty, str(empty[:2]))
+
+    thin = [p for p in phrases if len(p["text"].split()) < 2]
+    check("no one-word phrases", not thin, f"{[p['text'] for p in thin]}")
+    print(f"        {len(phrases)} phrases")
+
+    # What the timeline colours phrases by: the current take's length against
+    # the slot it has to land in.
+    spoken = [p.get("spoken") for p in phrases]
+    check("phrases report their spoken length",
+          all(isinstance(v, (int, float)) and v > 0 for v in spoken),
+          f"got {spoken}")
+    over = [f"{p['spoken']:.2f}/{p['duration']:.2f}" for p in phrases
+            if p.get("spoken") and p["spoken"] > p["duration"]]
+    print(f"        {len(phrases) - len(over)} of {len(phrases)} fit their slot")
+
+    original = phrases[0]["text"]
+    code, before = call("GET", f"/jobs/{job}/segments/0/audio", raw=True)
+    check("phrase audio plays", code == 200)
+
+    code, rev = call("POST", f"/jobs/{job}/segments/0", {"text": "यह एक परीक्षण है।"})
+    check("phrase rewritten", code == 200 and rev.get("text") == "यह एक परीक्षण है।",
+          str(rev)[:70])
+    check("picture marked stale", bool(rev.get("video_stale")))
+    check("undo is offered", rev.get("can_undo", 0) >= 1)
+
+    code, un = call("POST", f"/jobs/{job}/undo")
+    check("undo restores the text", code == 200 and un.get("text") == original,
+          f"got {un.get('text')!r}")
+    check("undo restores the audio", bool(un.get("audio_restored")))
+    _, after = call("GET", f"/jobs/{job}/segments/0/audio", raw=True)
+    check("restored take is the original take", before == after,
+          "a re-synthesis would differ")
+    code, _ = call("POST", f"/jobs/{job}/undo")
+    check("undo stops at the bottom", code == 409, f"got {code}")
+
+    # ---- reference windows ----------------------------------------------
+    code, refs = call("GET", f"/jobs/{job}/reference/candidates")
+    check("reference windows offered", code == 200 and "candidates" in refs)
+
+    # ---- script intelligence ---------------------------------------------
+    # The only stage that calls a language model, and the only one that can be
+    # pointed off this machine. Skipped rather than failed when no model is
+    # configured: a fresh clone with no Ollama is a supported way to run.
+    print("\n  Script intelligence")
+    code, mind = call("GET", "/api/settings/llm")
+    if code != 200 or not mind.get("enabled"):
+        print("        No script model configured; skipping the fit checks.")
+    else:
+        where = "on this machine" if mind.get("local") else "hosted"
+        print(f"        {mind['provider']} / {mind['model']} ({where})")
+
+        code, probe = call("POST", "/api/settings/llm/test", {})
+        check("script model answers", code == 200 and probe.get("ok"),
+              str(probe.get("error") or probe)[:70])
+
+        # The longest line is the one most likely to overrun its slot, which is
+        # the case the fitter exists for.
+        longest = max(phrases, key=lambda p: len(p["text"]))
+        idx = longest["index"]
+        code, fit = call("POST", f"/jobs/{job}/segments/{idx}/fit", {})
+        ok = code == 200 and {"slot_seconds", "spoken_seconds", "attempts"} <= set(fit)
+        check("fit measured against the slot", ok, f"{code} {str(fit)[:70]}")
+
+        if ok:
+            print(f"        slot {fit['slot_seconds']}s, "
+                  f"spoken {fit['spoken_seconds']}s, "
+                  f"{len(fit['attempts'])} attempt(s)")
+            if fit.get("changed"):
+                check("rewrite is shorter than the original",
+                      fit["spoken_seconds"] < fit["was_seconds"],
+                      f"{fit['spoken_seconds']} vs {fit['was_seconds']}")
+                check("rewrite changed the words",
+                      fit["text"] != longest["text"])
+                # The plan and the audio must agree afterwards, which is the
+                # thing that silently broke when a synth failed mid-edit.
+                _, tl2 = call("GET", f"/jobs/{job}/segments")
+                now = next(p["text"] for p in tl2["segments"] if p["index"] == idx)
+                check("timeline shows the fitted line", now == fit["text"],
+                      f"{now!r} != {fit['text']!r}")
+                check("picture marked stale by the fit",
+                      bool(fit.get("video_stale")))
+                call("POST", f"/jobs/{job}/undo")
+            else:
+                check("unchanged fit explains itself", bool(fit.get("detail")),
+                      str(fit)[:70])
+                print(f"        {fit.get('detail')}")
+
+        code, _ = call("POST", f"/jobs/{job}/segments/9999/fit", {})
+        check("fit rejects an unknown phrase", code == 404, f"got {code}")
+
+    # ---- re-rolling a delivery -------------------------------------------
+    # Same words, different draw. Synthesis is seeded for reproducibility, so
+    # this is the only way to get a second take of a line you are happy with.
+    print("\n  Delivery")
+    _, take1 = call("GET", f"/jobs/{job}/segments/0/audio", raw=True)
+    code, roll = call("POST", f"/jobs/{job}/segments/0", {"seed": 4242})
+    check("delivery re-rolled", code == 200 and roll.get("seed") == 4242,
+          str(roll)[:70])
+    check("re-roll left the words alone", roll.get("text") == original,
+          f"got {roll.get('text')!r}")
+    _, take2 = call("GET", f"/jobs/{job}/segments/0/audio", raw=True)
+    check("a new seed gives a different take", take1 != take2,
+          "identical audio means the seed was ignored")
+    call("POST", f"/jobs/{job}/undo")
+
+    # ---- choosing the reference window ------------------------------------
+    # Re-clones from a different few seconds of the speaker and re-speaks
+    # every phrase, because the cached units were all said in the old voice.
+    print("\n  Reference window")
+    code, _ = call("POST", f"/jobs/{job}/reference", {"start": 0.0, "duration": 0.5})
+    check("a too-short reference is rejected", code == 400, f"got {code}")
+    code, _ = call("POST", f"/jobs/{job}/reference", {"start": "x", "duration": 3})
+    check("a non-numeric window is rejected", code == 400, f"got {code}")
+
+    windows = refs.get("candidates") or []
+    if windows:
+        w = windows[-1]
+        code, _ = call("POST", f"/jobs/{job}/reference",
+                       {"start": w["start"], "duration": w["duration"]})
+        check("reference change accepted", code == 200, f"got {code}")
+        state, d = wait_for(job)
+        check("re-cloned from the new window", state == "done",
+              f"{state} {d.get('error')}")
+        _, tl3 = call("GET", f"/jobs/{job}/segments")
+        check("timeline survived the re-clone",
+              len(tl3.get("segments", [])) == len(phrases),
+              f"{len(tl3.get('segments', []))} vs {len(phrases)}")
+    else:
+        print("        No candidate windows offered; skipping the re-clone.")
+
+    # ---- re-rendering the picture ------------------------------------------
+    # Edits rewrite the audio immediately; the video is only redone on
+    # request. Until it is, the render on disk is a previous take.
+    print("\n  Re-render")
+    _, before_state = call("GET", f"/jobs/{job}/status")
+    check("picture reported stale after edits",
+          bool(before_state.get("video_stale")), str(before_state)[:70])
+    code, _ = call("POST", f"/jobs/{job}/rerender")
+    check("re-render accepted", code == 200, f"got {code}")
+    state, d = wait_for(job)
+    check("re-render finished", state == "done", f"{state} {d.get('error')}")
+    check("picture no longer stale", not d.get("video_stale"),
+          "an edit after this would be invisible in the file")
+    code, _ = call("GET", f"/jobs/{job}/video", raw=True)
+    check("re-rendered file downloads", code == 200, f"got {code}")
+
+    # ---- exports ---------------------------------------------------------
+    print("\n  Exports")
+    for kind in ("transcript.txt", "translation.txt", "source.srt",
+                 "dub.srt", "dub.vtt", "source.vtt"):
+        code, body = call("GET", f"/jobs/{job}/export/{kind}", raw=True)
+        check(f"{kind}", code == 200 and len(body) > 10, f"{code}, {len(body)}b")
+    # A subtitled video: the same cues, carried by the file itself.
+    code, sv = call("POST", "/process_video/?original_language=en"
+                            "&target_language=hi&user_id=selftest&kind=subtitled",
+                    files={"file": (name, clip)})
+    if check("subtitled video accepted", code == 200, str(sv)[:70]):
+        sjob = sv["job_id"]
+        state, sd = wait_for(sjob, timeout=600)
+        check("subtitled video rendered", state == "done",
+              f"{state} {sd.get('error')}")
+        check("it says how the subtitles were attached",
+              sd.get("subtitle_mode") in ("burned", "muxed"),
+              str(sd.get("subtitle_mode")))
+        print(f"        subtitles {sd.get('subtitle_mode')}")
+        code, _ = call("GET", f"/jobs/{sjob}/video", raw=True)
+        check("subtitled video downloads", code == 200, f"got {code}")
+        call("DELETE", f"/videos/{sjob}")
+
+    # Subtitling a clip in the language it is already spoken in skips
+    # translation entirely, and is a normal thing to want.
+    code, sv2 = call("POST", "/process_video/?original_language=en"
+                             "&target_language=hi&user_id=selftest"
+                             "&kind=subtitled&subtitle_language=en",
+                     files={"file": (name, clip)})
+    if check("a subtitle language can be chosen", code == 200, str(sv2)[:70]):
+        s2 = sv2["job_id"]
+        state, sd2 = wait_for(s2, timeout=600)
+        check("it renders in that language", state == "done",
+              f"{state} {sd2.get('error')}")
+        check("and reports which language went on",
+              sd2.get("subtitle_language") == "en",
+              str(sd2.get("subtitle_language")))
+        call("DELETE", f"/videos/{s2}")
+
+    # A project holds every output made from its clip. Coming back to one used
+    # to show the single job it was opened on, so a dub and a subtitled video
+    # of the same clip could never be seen together.
+    code, st0 = call("GET", f"/jobs/{job}/status")
+    pid = st0.get("project_id")
+    original_name = st0.get("name") or "selftest"
+    check("a job reports its project", bool(pid), str(st0.get("project_id")))
+    code, sv3 = call("POST", f"/process_video/?original_language=en"
+                             f"&target_language=hi&user_id=selftest"
+                             f"&kind=subtitles&project_id={pid}",
+                     files={"file": (name, clip)})
+    if check("an output can join an existing project", code == 200, str(sv3)[:70]):
+        s3 = sv3["job_id"]
+        state, sd3 = wait_for(s3, timeout=600)
+        check("it rendered", state == "done", f"{state} {sd3.get('error')}")
+        check("and belongs to the same project", sd3.get("project_id") == pid,
+              f"{sd3.get('project_id')} != {pid}")
+        code, outs = call("GET", f"/projects/{pid}/outputs")
+        ids = {o["job_id"] for o in outs.get("outputs", [])}
+        check("the project lists both outputs", code == 200 and {job, s3} <= ids,
+              f"listed {len(ids)}")
+        code, rows = call("GET", "/videos/")
+        mine = [r for r in rows if r.get("project_id") == pid]
+        check("and the projects page shows one row for them",
+              len(mine) == 1 and mine[0].get("outputs", 0) >= 2,
+              f"{len(mine)} rows, outputs={mine[0].get('outputs') if mine else '-'}")
+        # Naming an output can also say where it lives.
+        chosen = tempfile.mkdtemp()
+        code, rn = call("PATCH", f"/jobs/{s3}", {"name": "Named output",
+                                                  "output_dir": chosen})
+        check("an output can be named", code == 200 and rn.get("name") == "Named output",
+              str(rn)[:70])
+        # A text-only output has no file to move, so the folder is ignored
+        # for it; the refusal is checked on the dub, which has a video.
+        code, _ = call("PATCH", f"/jobs/{job}", {"name": original_name,
+                                                  "output_dir": "/nonexistent/x"})
+        check("an unwritable folder is refused", code == 400, f"got {code}")
+        call("DELETE", f"/videos/{s3}")
+
+    # A reopened project has no File in the browser, but its clip is still on
+    # the engine. Another output - in any language - renders from that, so
+    # nobody has to find the file again to add Tamil subtitles to a Telugu
+    # project. This is also where the language for a second output is
+    # checked: it is the one asked for, not the first output's.
+    check("a job says whether its clip is still on the engine",
+          st0.get("has_input") is True and st0.get("target_language") == args.lang,
+          f"has_input={st0.get('has_input')} target={st0.get('target_language')}")
+    code, sv4 = call("POST", f"/process_video/?original_language=en"
+                             f"&target_language=ta&user_id=selftest"
+                             f"&kind=subtitles_translated&project_id={pid}")
+    if check("an output renders from the project's clip with no upload",
+             code == 200, str(sv4)[:70]):
+        s4 = sv4["job_id"]
+        state, sd4 = wait_for(s4, timeout=600)
+        check("it rendered", state == "done", f"{state} {sd4.get('error')}")
+        check("in the language asked for, not the project's first",
+              sd4.get("target_language") == "ta", str(sd4.get("target_language")))
+        check("from the same project", sd4.get("project_id") == pid,
+              str(sd4.get("project_id")))
+        call("DELETE", f"/videos/{s4}")
+    code, _ = call("POST", "/process_video/?original_language=en&target_language=hi")
+    check("no clip and no project is refused", code == 400, f"got {code}")
+    code, _ = call("POST", "/process_video/?original_language=en&target_language=hi"
+                           "&project_id=no-such-project")
+    check("no clip and an unknown project is refused", code == 400, f"got {code}")
+
+    # Whatever a run produced has to be savable, not only playable.
+    for path, what in ((f"/jobs/{job}/video?download=1", "the video"),
+                       (f"/jobs/{job}/audio/dub?download=1", "the audio"),
+                       (f"/jobs/{job}/export/dub.srt", "the subtitles")):
+        code, body = call("GET", path, raw=True)
+        check(f"{what} downloads", code == 200 and len(body) > 10,
+              f"{code}, {len(body) if isinstance(body, bytes) else '?'}b")
+
+    code, _ = call("GET", f"/jobs/{job}/export/nope.xyz", raw=True)
+    check("unknown export rejected", code == 404, f"got {code}")
+
+    # ---- naming a project --------------------------------------------------
+    print("\n  Project name")
+    code, named = call("PATCH", f"/jobs/{job}", {"name": "Selftest rename"})
+    check("project renamed", code == 200 and named.get("name") == "Selftest rename",
+          f"{code} {str(named)[:60]}")
+    _, st = call("GET", f"/jobs/{job}/status")
+    check("name comes back on status", st.get("name") == "Selftest rename",
+          f"got {st.get('name')!r}")
+    code, _ = call("PATCH", f"/jobs/{job}", {"name": "   "})
+    check("an empty name is rejected", code == 400, f"got {code}")
+    code, _ = call("PATCH", "/jobs/nosuchjob", {"name": "x"})
+    check("renaming an unknown job is rejected", code == 404, f"got {code}")
+
+    # ---- clearing a phrase -------------------------------------------------
+    # Where Cut puts the audio: the slot and the words stay, the sound goes.
+    print("\n  Clear a phrase")
+    _, had = call("GET", f"/jobs/{job}/segments/1/audio", raw=True)
+    code, cleared = call("DELETE", f"/jobs/{job}/segments/1")
+    check("phrase cleared", code == 200 and cleared.get("cleared"),
+          f"{code} {str(cleared)[:60]}")
+    check("clearing keeps the words", bool(cleared.get("text")),
+          "the text is what makes the cut readable")
+    _, tlc = call("GET", f"/jobs/{job}/segments")
+    check("timeline reports it silent",
+          tlc["segments"][1].get("cleared") is True)
+    code, _ = call("DELETE", f"/jobs/{job}/segments/1")
+    check("clearing twice is refused", code == 409, f"got {code}")
+    code, _ = call("DELETE", f"/jobs/{job}/segments/9999")
+    check("clearing an unknown phrase is refused", code == 404, f"got {code}")
+
+    code, un2 = call("POST", f"/jobs/{job}/undo")
+    check("undo brings the phrase back", code == 200 and un2.get("audio_restored"))
+    _, tlu = call("GET", f"/jobs/{job}/segments")
+    check("undo clears the silent flag too",
+          not tlu["segments"][1].get("cleared"),
+          "the timeline would say silent while the audio is not")
+    _, back = call("GET", f"/jobs/{job}/segments/1/audio", raw=True)
+    check("the restored take is the original", had == back)
+
+    # ---- standalone outputs ------------------------------------------------
+    # Each stops where its work is done instead of paying for the whole
+    # pipeline. Subtitles in particular used to cost a full dub.
+    print("\n  Standalone outputs")
+    for kind, label, wants_translation in (
+        ("subtitles", "Subtitles", False),
+        ("subtitles_translated", "Translated subtitles", True),
+        ("audio", "Audio dub", True),
+    ):
+        began = time.time()
+        code, started = call(
+            "POST",
+            f"/process_video/?original_language=en&target_language=hi"
+            f"&user_id=selftest&kind={kind}&name={label.replace(' ', '%20')}",
+            files={"file": (name, clip)})
+        sub_job = started.get("job_id")
+        if not check(f"{label} accepted", code == 200 and sub_job, f"{code}"):
+            continue
+        state, d = wait_for(sub_job)
+        took = time.time() - began
+        check(f"{label} finished", state == "done", f"{state} {d.get('error')}")
+        print(f"        {took:.0f}s")
+        check(f"{label} kept its name", d.get("name") == label,
+              f"got {d.get('name')!r}")
+
+        code, body = call("GET", f"/jobs/{sub_job}/export/source.srt", raw=True)
+        check(f"{label} exports source subtitles", code == 200 and len(body) > 20,
+              f"{code}, {len(body)}b")
+        code, body = call("GET", f"/jobs/{sub_job}/export/dub.srt", raw=True)
+        if wants_translation:
+            check(f"{label} exports translated subtitles",
+                  code == 200 and len(body) > 20, f"{code}, {len(body)}b")
+        else:
+            check("a subtitle-only job refuses a translated export",
+                  code == 409, f"got {code}")
+        if kind == "audio":
+            check("the audio dub is playable", bool(d.get("dub_audio")),
+                  "no audio was exposed")
+        call("DELETE", f"/videos/{sub_job}")
+
+    code, _ = call("POST",
+                   "/process_video/?original_language=en&target_language=hi&kind=nonsense",
+                   files={"file": (name, clip)})
+    check("an unknown output is rejected", code == 400, f"got {code}")
+
+    # ---- trim and the music bed -------------------------------------------
+    # Both are set at upload time, so they need a job of their own. Trimming
+    # also keeps this one short, which is most of why it is affordable.
+    print("\n  Trim and music bed")
+    music = tone_wav(seconds=6)
+    code, started = call(
+        "POST",
+        "/process_video/?original_language=en&target_language=hi"
+        "&user_id=selftest&trim_start=2.0&trim_end=9.0&music_gain=-20",
+        files={"file": (name, clip), "music": ("bed.wav", music)})
+    trimmed = started.get("job_id")
+    check("trimmed job with a music bed accepted", code == 200 and trimmed,
+          f"{code} {str(started)[:70]}")
+
+    if trimmed:
+        state, d = wait_for(trimmed)
+        check("trimmed render completed", state == "done",
+              f"{state} {d.get('error')}")
+        # 2.0 to 9.0 is seven seconds, whatever the source was.
+        got = d.get("video_duration") or 0
+        check("trim applied to the render", 6.0 <= got <= 8.0,
+              f"video_duration {got}, expected about 7")
+        code, body = call("GET", f"/jobs/{trimmed}/video", raw=True)
+        check("trimmed render downloads", code == 200 and len(body) > 1000,
+              f"{code}, {len(body)}b")
+        call("DELETE", f"/videos/{trimmed}")
+
+    # A trim that selects nothing is a mistake worth catching at the door.
+    code, _ = call("POST",
+                   "/process_video/?original_language=en&target_language=hi"
+                   "&trim_start=9.0&trim_end=2.0",
+                   files={"file": (name, clip)})
+    check("an inverted trim is rejected", code == 400, f"got {code}")
+
+    # ---- projects --------------------------------------------------------
+    print("\n  Projects")
+    code, rows = call("GET", "/videos/?user_id=selftest")
+    check("project listed", code == 200 and any(r["job_id"] == job for r in rows))
+    check("listed as openable", any(r["job_id"] == job and r["openable"] for r in rows))
+
+    # ---- voice-over ------------------------------------------------------
+    print("\n  Voice-over")
+    code, vo = call("POST", f"/voiceover/?language={args.lang}&user_id=selftest",
+                    body={"script": "यह आवाज़ का परीक्षण है।"},
+                    files={"file": (name, clip)})
+    if check("accepted", code == 200 and "job_id" in vo, str(vo)[:70]):
+        status, vd = wait_for(vo["job_id"])
+        check("voice-over rendered", status == "done", vd.get("error", ""))
+        check("reported as a voice-over", vd.get("kind") == "voiceover")
+        code, _ = call("GET", f"/jobs/{vo['job_id']}/audio/dub", raw=True)
+        check("voice-over audio plays", code == 200)
+
+    # ---- cancellation ----------------------------------------------------
+    print("\n  Cancellation")
+    code, c = call("POST", f"/process_video/?original_language=auto"
+                           f"&target_language={args.lang}&user_id=selftest",
+                   files={"file": (name, clip)})
+    if check("second job accepted", code == 200):
+        cjob = c["job_id"]
+        for _ in range(60):
+            _, st = call("GET", f"/jobs/{cjob}/status")
+            if st.get("step", "").startswith(("transcribing", "synthesizing")):
+                break
+            time.sleep(2)
+        # Deleting a job that is still rendering used to report success,
+        # leave the pipeline running, file a finished video into the output
+        # folder for a project the user had deleted, and crash on the save.
+        code, why = call("DELETE", f"/videos/{cjob}")
+        check("a rendering project cannot be deleted", code == 409, f"got {code}")
+        check("and it says to cancel first",
+              "cancel" in str(why.get("detail", "")).lower(), str(why)[:70])
+
+        code, res = call("POST", f"/jobs/{cjob}/cancel")
+        check("cancel accepted", code == 200 and res.get("cancelled"))
+        status, _ = wait_for(cjob, timeout=180)
+        check("job stopped", status == "cancelled", f"ended as {status}")
+
+        code, _ = call("DELETE", f"/videos/{cjob}")
+        check("a cancelled project deletes cleanly", code == 200, f"got {code}")
+        code, _ = call("GET", f"/jobs/{cjob}/status")
+        check("and is gone afterwards", code == 404, f"got {code}")
+
+    # ---- cleanup ---------------------------------------------------------
+    print("\n  Cleanup")
+    code, _ = call("DELETE", f"/videos/{job}")
+    check("project deleted", code == 200, f"got {code}")
+    code, _ = call("GET", f"/jobs/{job}/status")
+    check("deleted project is gone", code == 404, f"got {code}")
+    if "job_id" in vo:
+        call("DELETE", f"/videos/{vo['job_id']}")
+
+    return report()
+
+
+def report() -> int:
+    print(f"\n  {'=' * 52}")
+    line = f"  {passed} passed, {failed} failed"
+    if skipped:
+        line += f", {len(skipped)} skipped"
+    print(line)
+    if skipped:
+        for s in skipped:
+            print(f"    ~ {s}")
+    if notes:
+        for n in notes:
+            print(f"    - {n}")
+    print()
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
