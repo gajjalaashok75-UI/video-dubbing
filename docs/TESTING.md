@@ -1,4 +1,24 @@
-# Testing VideoTrans end to end
+# Testing VideoTrans
+
+## Unit tests (seconds)
+
+No GPU, no models and no network: these are the regression tests for bugs that
+only showed up on a hosted run.
+
+```bash
+./venv/bin/python -m unittest discover -s tests -v
+```
+
+| File | Pins down |
+| --- | --- |
+| `test_requirements_pins.py` | PyAV stays below 19, so `faster-whisper` can keep passing `metadata_errors` to `av.open()` |
+| `test_log_follow.py` | The notebook's log follower cannot append its own output back into `server.log` |
+| `test_platform_layout.py` | The checkout and the runtime tree pick the same platform, and the committed notebooks match the generator |
+| `test_vendor_f5_tts.py` | The vendoring script verifies the same marker the voice engine's guard checks |
+
+---
+
+# The end-to-end walkthrough
 
 A walkthrough from first launch to a finished dub, in a sandbox that cannot
 touch your real settings or your existing projects.

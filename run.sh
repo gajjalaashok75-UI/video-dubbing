@@ -116,6 +116,20 @@ install. The output above says which. Nothing else was changed."
     say "Environment ready."
 fi
 
+# --- IndicF5's f5_tts fork ------------------------------------------------
+# The pip `f5-tts` release loads the IndicF5 checkpoint without complaint and
+# generates the wrong words, so the voice engine refuses to synthesize unless
+# IndicF5's own fork of f5_tts is the one that got imported. It is not on PyPI
+# and not committed here, so it is fetched once, next to the checkout (~2 MB).
+if ! "$PY" scripts/vendor_f5_tts.py --check -q >/dev/null 2>&1; then
+    say ""
+    say "Fetching IndicF5's f5_tts fork (about 2 MB, once)..."
+    if ! "$PY" scripts/vendor_f5_tts.py; then
+        say "Could not fetch it. Everything except the Indian-language voice"
+        say "still works. Retry with: $PY scripts/vendor_f5_tts.py"
+    fi
+fi
+
 # --- the models -----------------------------------------------------------
 # Roughly 7.5 GB, verified by checksum, resumable. Without them the first
 # render fails several minutes in, which is a bad way to find out.

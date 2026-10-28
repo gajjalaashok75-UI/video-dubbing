@@ -26,6 +26,14 @@ opencv-python>=4.8.0
 # STT — faster-whisper (CTranslate2 backend, replaces openai-whisper)
 faster-whisper>=1.0.0
 ctranslate2>=4.0.0
+# PyAV is faster-whisper's audio decoder and its one unpinned dependency: it
+# declares `av>=11` with no ceiling, so a fresh install takes the newest. PyAV
+# 19.0.0 (2026-09-29) REMOVED the `metadata_errors` argument to av.open() that
+# faster-whisper 1.2.1 still passes, and every transcription then dies in
+# decode_audio with "TypeError: open() got an unexpected keyword argument
+# 'metadata_errors'" before a single frame is decoded. Held below 19 until
+# faster-whisper stops passing it. Keep in step with requirements.txt.
+av>=11,<19
 
 # Imported directly by the voice engine (tts_engines.py reads IndicF5's
 # safetensors by hand) and by the vendored Wav2Lip face detector. Both

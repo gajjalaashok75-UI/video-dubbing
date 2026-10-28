@@ -30,6 +30,7 @@ variable names; the layout mirrors the shape a hosted deployment always needs.
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import os
 import shutil
@@ -47,10 +48,13 @@ __all__ = [
     "default_runtime_root",
     "detect_platform",
     "ensure_ffmpeg",
+    "follow_log",
     "hardware_report",
     "is_notebook",
+    "mirror_suspended",
     "notebook_public_url",
     "public_url",
+    "repo_dir",
     "runtime_dirs",
     "server_log_path",
     "start_server",
@@ -73,6 +77,17 @@ _PLATFORM_ROOTS = {
 # layout covers every hosted platform. `logs` holds the server log, so a
 # notebook can hand the user a file to read after something has gone wrong.
 _SUBDIRS = ("uploads", "output", "hf", "logs")
+
+# Where the notebook checkout lives, per platform. It has to be chosen with the
+# SAME test `detect_platform` uses, in the same order: a Colab instance that
+# also has a /kaggle directory otherwise put the checkout under
+# /kaggle/working/video-dubbing while the runtime tree - and the server log the
+# user is told to read - landed under /content/videotrans-runtime, splitting one
+# session across two volumes.
+_REPO_DIRS = {
+    "colab": "/content/video-dubbing",
+    "kaggle": "/kaggle/working/video-dubbing",
+}
 
 
 def detect_platform() -> str:
@@ -121,6 +136,22 @@ def default_runtime_root(platform: str | None = None) -> Path:
         return Path(override).expanduser()
     platform = platform or detect_platform()
     return Path(_PLATFORM_ROOTS.get(platform, "/tmp/videotrans-runtime"))
+
+
+def repo_dir(platform: str | None = None) -> Path:
+    """
+    The checkout directory a notebook should clone into on this platform.
+
+    `build_notebooks.py` inlines the same rule as a self-contained expression,
+    because the cells that clone and `chdir` run before the checkout is on
+    `sys.path` and so cannot import this module yet. `tests/test_platform_layout.py`
+    asserts that the two agree on every platform.
+
+    The repo and the runtime tree always share a parent, so one session never
+    spans two volumes.
+    """
+    platform = platform or detect_platform()
+    return Path(_REPO_DIRS.get(platform, Path.cwd()))
 
 
 def runtime_dirs(root: str | Path | None = None) -> dict[str, Path]:
@@ -394,6 +425,28 @@ class ServerHandle:
         self.stop()
 
 
+# Set while a thread must not have its writes mirrored into the log file.
+# Thread-local on purpose: suspending the mirror for one thread must not drop a
+# render worker's line that happens to be written at the same moment.
+_mirror_state = threading.local()
+
+
+@contextlib.contextmanager
+def mirror_suspended():
+    """
+    Stop mirroring *this thread's* stdout/stderr into the log file.
+
+    Needed by `follow_log`, whose output would otherwise be appended to the very
+    file it is reading. Re-entrant, so nested use is safe.
+    """
+    depth = getattr(_mirror_state, "depth", 0)
+    _mirror_state.depth = depth + 1
+    try:
+        yield
+    finally:
+        _mirror_state.depth = depth
+
+
 class _Tee:
     """
     Mirror a stream to a second one, so output is both shown and filed.
@@ -411,11 +464,12 @@ class _Tee:
 
     def write(self, text: str) -> int:
         with self._lock:
-            try:
-                self._mirror.write(text)
-                self._mirror.flush()
-            except Exception:  # noqa: BLE001 - logging must never break a render
-                pass
+            if not getattr(_mirror_state, "depth", 0):
+                try:
+                    self._mirror.write(text)
+                    self._mirror.flush()
+                except Exception:  # noqa: BLE001 - logging must never break a render
+                    pass
             return self._original.write(text)
 
     def flush(self) -> None:
@@ -472,6 +526,38 @@ def _install_log_tee(path: Path):
         _log_state["path"] = path
         _log_state["handle"] = handle
     return _log_state["handle"]
+
+
+def follow_log(path: str | Path | None = None, poll: float = 0.5,
+               *, stop_at_eof: bool = False) -> None:
+    """
+    Print a log from the top and then follow it as it grows.
+
+    Used by the notebook's "watch the server log" cell. It MUST go through this
+    function rather than a plain `print()` loop: `_install_log_tee` mirrors
+    stdout into the same file this reads, so printing a line that was just read
+    appends a copy of it to the log, which the next `readline()` reads and
+    prints again. That is an unbounded feedback loop - one session grew
+    `server.log` to 548 MB and 9.1M lines, of which only 86 lines were real.
+    Every write this function makes is done with the mirror suspended, so the
+    loop cannot form; other threads keep logging normally.
+
+    Returns only if `stop_at_eof` is set, or on KeyboardInterrupt from the
+    caller's cell.
+    """
+    target = Path(path) if path is not None else server_log_path()
+    with open(target, encoding="utf-8", errors="replace") as fh:
+        with mirror_suspended():
+            print(fh.read(), end="")
+        while True:
+            line = fh.readline()
+            if line:
+                with mirror_suspended():
+                    print(line, end="")
+                continue
+            if stop_at_eof:
+                return
+            time.sleep(poll)
 
 
 def start_server(host: str = "0.0.0.0", port: int = 8000,

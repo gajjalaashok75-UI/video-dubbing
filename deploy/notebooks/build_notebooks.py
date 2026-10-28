@@ -22,10 +22,20 @@ REPO_URL = "https://github.com/gajjalaashok75-UI/video-dubbing"
 
 # Colab mounts /content; Kaggle mounts /kaggle/working. Both are writable for
 # the life of the session, which is all a runtime tree needs. Written as one
-# parenthesised expression so it can be pasted into a cell as `REPO_DIR = ...`.
+# parenthesised expression so it can be pasted into a cell as `REPO_DIR = ...`,
+# and self-contained because the clone cell runs before the checkout it is
+# creating can be imported.
+#
+# The tests are in the SAME ORDER as `deploy_helpers.detect_platform`, and that
+# is not cosmetic: that function returns "colab" on any machine with /content,
+# so testing /kaggle first put the checkout at /kaggle/working/video-dubbing
+# while the runtime tree (and the server log the user is told to read) went to
+# /content/videotrans-runtime - one session split across two volumes.
+# `tests/test_platform_layout.py` keeps this expression and `repo_dir()` equal.
 REPO_DIR_EXPR = ('(\n'
-                 '    "/kaggle/working/video-dubbing" if os.path.isdir("/kaggle")\n'
-                 '    else "/content/video-dubbing"\n'
+                 '    "/content/video-dubbing" if os.path.isdir("/content")\n'
+                 '    else "/kaggle/working/video-dubbing" if os.path.isdir("/kaggle")\n'
+                 '    else os.getcwd()\n'
                  ')')
 
 
@@ -192,8 +202,23 @@ TOKEN = code("""
 import os
 
 # Prefer the platform secret (Colab: the key icon in the left sidebar;
-# Kaggle: Add-ons -> Secrets). Uncomment the next line only if you must
-# hardcode it.
+# Kaggle: Add-ons -> Secrets). Both inject a secret into os.environ at kernel
+# START, so one added after the runtime came up is only reachable through
+# their SDK. Read it here too and export it: the download and the server both
+# look at the environment, and without this the cell reported "No HF_TOKEN"
+# while the secret was sitting right there in the panel.
+if not os.environ.get("HF_TOKEN"):
+    try:
+        from google.colab import userdata  # Colab
+        os.environ["HF_TOKEN"] = userdata.get("HF_TOKEN")
+    except Exception:
+        try:
+            from kaggle_secrets import UserSecretsClient  # Kaggle
+            os.environ["HF_TOKEN"] = UserSecretsClient().get_secret("HF_TOKEN")
+        except Exception:
+            pass
+
+# Uncomment the next line only if you must hardcode it.
 # os.environ["HF_TOKEN"] = "hf_..."
 
 if os.environ.get("HF_TOKEN"):
@@ -254,6 +279,14 @@ if proc.returncode != 0:
     print("INSTALL FAILED. The real cause is in the pip output above.")
     print("=" * 62)
     raise SystemExit("The install failed; see the pip output above this line.")
+
+# IndicF5's own f5_tts fork. pip installed an `f5_tts` above too, but the
+# checkpoint was trained with this fork and the release generates the wrong
+# words, so the voice engine refuses to run against it. Not on PyPI, so it is
+# fetched here once (~2 MB).
+print()
+print("Fetching IndicF5's f5_tts fork...")
+subprocess.run([sys.executable, "scripts/vendor_f5_tts.py"], check=False)
 
 print("\\nInstall complete.")
 """)
@@ -373,25 +406,18 @@ keeps running.
 """)
 
 LOG = code("""
-import time
-
 if server.log_file is None:
     print("No log file (logging was off when the server started).")
 else:
-    path = server.log_file
-    print("Following", path, "- press the stop button to end this cell.\\n")
-    with open(path, encoding="utf-8", errors="replace") as fh:
-        # Start at the top of the current log, then follow the tail.
-        print(fh.read(), end="")
-        try:
-            while True:
-                line = fh.readline()
-                if line:
-                    print(line, end="")
-                else:
-                    time.sleep(0.5)
-        except KeyboardInterrupt:
-            print("\\nStopped following. The server is still running.")
+    print("Following", server.log_file, "- press the stop button to end this cell.\\n")
+    try:
+        # NOT a plain print loop: `start_server` mirrors stdout into this same
+        # file, so printing a line it just read appends a copy that the next
+        # read picks up, forever. `follow_log` suspends the mirror for its own
+        # writes; that loop once grew server.log to 548 MB.
+        runtime.follow_log(server.log_file)
+    except KeyboardInterrupt:
+        print("\\nStopped following. The server is still running.")
 """)
 
 USE_MD = md("""

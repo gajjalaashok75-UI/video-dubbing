@@ -151,7 +151,9 @@ def _use_vendored_f5_tts():
             "f5_tts resolved to the pip release, not IndicF5's vendored fork "
             f"({_dit.__file__}). The release loads the checkpoint without error "
             "but generates the wrong words. Expected engine/vendor/f5_tts to be "
-            "first on sys.path.")
+            "first on sys.path. Fetch it with 'python scripts/vendor_f5_tts.py' "
+            "from the repo root, then restart the app; run.sh and the "
+            "notebooks do this in their setup step.")
 
 
 def _build_indicf5_container(device: str = "cpu"):

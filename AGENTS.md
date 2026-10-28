@@ -56,6 +56,11 @@
   Do not "clean up" the vendored copy or replace it with the pip package.
   Note the fork's `infer_batch_process` returns `(wave, sr, spec)` directly,
   while the release returns a generator.
+- That fork is NOT committed and NOT on PyPI, so it is fetched at setup time by
+  `scripts/vendor_f5_tts.py` (idempotent; `--check` reports, changes nothing).
+  `run.sh` and both notebooks call it. Without it every fresh clone lost the
+  voice stage to the guard above. It verifies `AdaLayerNormZero_Final`, the same
+  marker the guard tests, so setup cannot pass while synthesis still refuses.
 
 ## Lint and test
 
@@ -64,6 +69,11 @@
   pre-existing style findings; do not treat those as regressions.
 - Frontend: `npx tsc -b && vite build` from `apps/studio`; `npx oxlint src`
   for warnings.
+- Unit tests: `./venv/bin/python -m unittest discover -s tests -v`. Seconds,
+  no GPU, no models, no network. They pin the things that broke a hosted run:
+  the PyAV ceiling that keeps `metadata_errors` available, the log follower not
+  feeding its own output back into `server.log`, the checkout and runtime tree
+  agreeing on the platform, and the vendored f5_tts fork.
 - End-to-end: `VIDEOTRANS_URL=http://127.0.0.1:12000 ./venv/bin/python
   scripts/selftest.py [clip.mp4]`. With no clip it runs 38 checks; with a clip
   it adds the render, editor, export and voice-over checks.
