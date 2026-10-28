@@ -16,6 +16,11 @@ three behaviours from the stock script that broke this pipeline:
   * output went through cv2's mp4v writer and was then re-encoded by ffmpeg —
     two lossy generations before the pipeline's other three. We pipe raw frames
     straight into a single ffmpeg encode.
+  * every decoded frame was held in a list for the whole run. A 60-second
+    1080x1920 clip is 1,799 frames, 10.4 GiB, before lip sync could start —
+    more than a hosted runtime has, so the render died and took the session
+    with it. Frames are now read twice (once to count them and find the face,
+    once to render) and only one batch is ever held.
 
 Detection runs on downscaled frames and composites onto the full-resolution
 original, so quality stays HD while the expensive part sees far fewer pixels.
@@ -61,6 +66,11 @@ DETECT_EVERY = 3
 # Temporal smoothing window for face boxes (stock Wav2Lip uses 5).
 SMOOTH_WINDOW = 5
 
+# How much raw picture may be in flight at once. `W2L_BATCH` (64) is a speed
+# setting, not a memory one: 64 frames of 1080x1920 is 380 MB, and of 4K is
+# 1.5 GB, so the batch is trimmed to fit this budget whatever the resolution.
+FRAME_BUDGET = 512 * 1024 * 1024
+
 
 def _load_module(name: str, path: str):
     """Import a Wav2Lip file under a private name so it can't clash."""
@@ -85,6 +95,36 @@ def _pick_device() -> str:
 
 class LipSyncError(RuntimeError):
     pass
+
+
+def _out_of_memory() -> LipSyncError:
+    """One message for both numpy's MemoryError and torch's OOM RuntimeError."""
+    return LipSyncError(
+        "Ran out of memory while syncing lips. The picture is read one batch "
+        "at a time, so this means the machine itself is full: close other "
+        "projects, or render a shorter clip.")
+
+
+def _read_frames(cap, count: int, start: int, total: int, size: tuple) -> list:
+    """
+    Decode the next `count` frames.
+
+    The count came from a first pass over the same file, so a short read means
+    the file changed underneath us — say so rather than encoding a picture
+    that stops early while the dub runs on.
+    """
+    h, w = size
+    frames = []
+    for k in range(count):
+        ok, frame = cap.read()
+        if not ok:
+            raise LipSyncError(
+                f"The video ended after {start + k} of {total} frames. It may "
+                f"have been changed while the render was running.")
+        if frame.shape[:2] != (h, w):
+            frame = cv2.resize(frame, (w, h))
+        frames.append(frame)
+    return frames
 
 
 class Wav2LipRunner:
@@ -147,39 +187,88 @@ class Wav2LipRunner:
             print(f"[Wav2Lip] Ready (generator={self.device}, detector={det_device})")
 
     # -- face detection -----------------------------------------------------
-    def _detect_faces(self, frames: list, pads: tuple, batch_size: int,
-                      detect_every: int = DETECT_EVERY) -> list:
+    def _detect_batch(self, frames: list, batch_size: int) -> list:
+        """Run s3fd over one batch, retrying frame by frame if it cannot
+        allocate the batch."""
+        batch = np.array(frames[:batch_size])
+        try:
+            return list(self._detector.get_detections_for_batch(batch))
+        except RuntimeError as e:
+            if len(frames) <= 1:
+                raise LipSyncError(f"Face detection failed: {e}") from e
+            raw = []
+            for f in frames[:batch_size]:
+                raw.extend(self._detector.get_detections_for_batch(np.array([f])))
+            return raw
+
+    def _scan_and_detect(self, video_path: str, pads: tuple, batch_size: int,
+                         detect_every: int = DETECT_EVERY):
+        """
+        One decode pass: count the frames, and find the face in every
+        `detect_every`-th one.
+
+        Nothing but the boxes survives this pass — four integers per sampled
+        frame. Decoding the whole clip into a list first is what made a
+        minute of portrait video cost more memory than the runtime has.
+
+        Returns (n_frames, (h, w), scale, cv2_fps, sampled_idx, raw_rects).
+        """
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            raise LipSyncError(f"Could not open {video_path}")
+        cv_fps = cap.get(cv2.CAP_PROP_FPS)
+        step = max(1, int(detect_every))
+
+        size, scale = None, 1.0
+        sampled_idx, raw = [], []
+        pending, last_small, n = [], None, 0
+        try:
+            while True:
+                ok, frame = cap.read()
+                if not ok:
+                    break
+                if size is None:
+                    h, w = frame.shape[:2]
+                    size = (h, w)
+                    scale = min(1.0, DETECT_HEIGHT / float(h))
+                small = (cv2.resize(frame, (int(size[1] * scale),
+                                            int(size[0] * scale)))
+                         if scale < 1.0 else frame)
+                last_small = small
+                if n % step == 0:
+                    sampled_idx.append(n)
+                    pending.append(small)
+                    if len(pending) >= batch_size:
+                        raw.extend(self._detect_batch(pending, batch_size))
+                        pending = []
+                n += 1
+
+            # The final frame always gets a sample of its own, so a shot that
+            # ends on a cutaway still has a box to place the mouth in.
+            if n and sampled_idx[-1] != n - 1:
+                sampled_idx.append(n - 1)
+                pending.append(last_small)
+            if pending:
+                raw.extend(self._detect_batch(pending, batch_size))
+        finally:
+            cap.release()
+
+        if not n:
+            raise LipSyncError(f"No frames decoded from {video_path}")
+        return n, size, scale, cv_fps, sampled_idx, raw
+
+    def _boxes_from_detections(self, raw: list, sampled_idx: list,
+                               n_frames: int, size: tuple, scale: float,
+                               pads: tuple) -> list:
         """
         Return one (y1, y2, x1, x2) box per frame, smoothed over time, with
         undetected frames inheriting the last good box.
 
-        Only every `detect_every`-th frame actually goes through s3fd; the rest
+        Only every `detect_every`-th frame actually went through s3fd; the rest
         are linearly interpolated. A face does not travel far in three frames,
         and the result is temporally smoothed afterwards regardless.
         """
-        h, w = frames[0].shape[:2]
-        scale = min(1.0, DETECT_HEIGHT / float(h))
-
-        step = max(1, int(detect_every))
-        sampled_idx = list(range(0, len(frames), step))
-        if sampled_idx[-1] != len(frames) - 1:
-            sampled_idx.append(len(frames) - 1)
-
-        small = [cv2.resize(frames[i], (int(w * scale), int(h * scale)))
-                 if scale < 1.0 else frames[i] for i in sampled_idx]
-
-        raw = []
-        for i in range(0, len(small), batch_size):
-            batch = np.array(small[i:i + batch_size])
-            try:
-                raw.extend(self._detector.get_detections_for_batch(batch))
-            except RuntimeError as e:
-                if batch_size == 1:
-                    raise LipSyncError(f"Face detection failed: {e}") from e
-                # Out of memory — retry this batch one frame at a time.
-                for f in small[i:i + batch_size]:
-                    raw.extend(self._detector.get_detections_for_batch(np.array([f])))
-
+        h, w = size
         pt, pb, pl, pr = pads
         sparse, last = [], None
         missing = 0
@@ -210,8 +299,8 @@ class Wav2LipRunner:
             print(f"[Wav2Lip] {missing}/{len(sparse)} sampled frames had no "
                   f"detection; carried the neighbouring box forward")
 
-        boxes = self._interpolate(sampled_idx, sparse, len(frames))
-        print(f"[Wav2Lip] Detected on {len(sampled_idx)}/{len(frames)} frames "
+        boxes = self._interpolate(sampled_idx, sparse, n_frames)
+        print(f"[Wav2Lip] Detected on {len(sampled_idx)}/{n_frames} frames "
               f"at {int(h * scale)}p")
         return self._smooth(boxes, SMOOTH_WINDOW)
 
@@ -269,43 +358,68 @@ class Wav2LipRunner:
             face_det_batch_size: int = 16, detect_every: int = DETECT_EVERY,
             crf: int = 18, preset: str = "medium", feather: int = 10,
             progress=None) -> str:
+        """
+        Sync a clip's lips to `audio_path` and write `out_path`.
+
+        The clip is decoded twice and never held whole: once to count the
+        frames and find faces, once to render a batch at a time. A 60-second
+        1080x1920 clip is 1,799 frames, and holding them all cost 10.4 GiB.
+        """
+        self.load()
+        try:
+            return self._render(video_path, audio_path, out_path, pads,
+                                wav2lip_batch_size, face_det_batch_size,
+                                detect_every, crf, preset, feather, progress)
+        except MemoryError as e:
+            raise _out_of_memory() from e
+        except LipSyncError:
+            raise
+        except RuntimeError as e:
+            # torch reports its own out-of-memory as a plain RuntimeError.
+            if "out of memory" in str(e).lower():
+                raise _out_of_memory() from e
+            raise
+
+    def _render(self, video_path: str, audio_path: str, out_path: str,
+                pads, wav2lip_batch_size: int, face_det_batch_size: int,
+                detect_every: int, crf: int, preset: str, feather: int,
+                progress) -> str:
         import torch
 
-        self.load()
+        n_frames, (h, w), scale, cv_fps, sampled_idx, raw = \
+            self._scan_and_detect(video_path, pads, face_det_batch_size,
+                                  detect_every)
 
-        cap = cv2.VideoCapture(video_path)
-        if not cap.isOpened():
-            raise LipSyncError(f"Could not open {video_path}")
-        cv_fps = cap.get(cv2.CAP_PROP_FPS)
-        frames = []
-        while True:
-            ok, frame = cap.read()
-            if not ok:
-                break
-            frames.append(frame)
-        cap.release()
+        fps = _resolve_fps(video_path, n_frames, cv_fps)
+        print(f"[Wav2Lip] {n_frames} frames @ {fps:.3f}fps ({w}x{h})")
 
-        if not frames:
-            raise LipSyncError(f"No frames decoded from {video_path}")
+        mel_chunks = self._mel_chunks(audio_path, n_frames, fps)
+        boxes = self._boxes_from_detections(raw, sampled_idx, n_frames,
+                                            (h, w), scale, pads)
+        del raw, sampled_idx
 
-        fps = _resolve_fps(video_path, len(frames), cv_fps)
-
-        h, w = frames[0].shape[:2]
-        print(f"[Wav2Lip] {len(frames)} frames @ {fps:.3f}fps ({w}x{h})")
-
-        mel_chunks = self._mel_chunks(audio_path, len(frames), fps)
-        boxes = self._detect_faces(frames, pads, face_det_batch_size,
-                                   detect_every=detect_every)
+        # `W2L_BATCH` is a throughput setting; the batch also has to fit the
+        # memory budget, or 4K footage would undo the very fix that is here
+        # to stop frames piling up.
+        batch = max(1, min(int(wav2lip_batch_size),
+                           FRAME_BUDGET // max(1, w * h * 3)))
+        if batch < int(wav2lip_batch_size):
+            print(f"[Wav2Lip] Reading {batch} frames at a time ({w}x{h}) to "
+                  f"stay inside the memory budget")
 
         proc = _open_writer(out_path, w, h, fps, audio_path, crf, preset)
         blend = _edge_mask(IMG_SIZE, feather)
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            proc.kill()
+            raise LipSyncError(f"Could not open {video_path}")
 
         try:
-            for i in range(0, len(frames), wav2lip_batch_size):
-                sl = slice(i, i + wav2lip_batch_size)
-                batch_frames = frames[sl]
-                batch_boxes = boxes[sl]
-                batch_mels = mel_chunks[sl]
+            for i in range(0, n_frames, batch):
+                count = min(batch, n_frames - i)
+                batch_frames = _read_frames(cap, count, i, n_frames, (h, w))
+                batch_boxes = boxes[i:i + count]
+                batch_mels = mel_chunks[i:i + count]
 
                 faces = []
                 # strict: one box per frame. Fewer boxes than frames used to
@@ -325,6 +439,7 @@ class Wav2LipRunner:
 
                 t_img = torch.FloatTensor(np.transpose(net_in, (0, 3, 1, 2))).to(self.device)
                 t_mel = torch.FloatTensor(np.transpose(mel_in, (0, 3, 1, 2))).to(self.device)
+                del net_in, masked
 
                 with torch.no_grad():
                     pred = self._model(t_mel, t_img)
@@ -345,14 +460,19 @@ class Wav2LipRunner:
                     ).astype(np.uint8)
                     proc.stdin.write(frame.tobytes())
 
+                # Nothing from this batch outlives it: the next one is
+                # decoded only after these frames have been written.
+                del batch_frames, faces, img_batch, t_img, t_mel, mel_in
                 if progress:
-                    progress(min(i + wav2lip_batch_size, len(frames)), len(frames))
+                    progress(min(i + count, n_frames), n_frames)
 
+            cap.release()
             proc.stdin.close()
             if proc.wait() != 0:
                 err = proc.stderr.read().decode("utf-8", "replace")[-800:]
                 raise LipSyncError(f"ffmpeg encode failed:\n{err}")
         finally:
+            cap.release()
             if proc.poll() is None:
                 proc.kill()
 

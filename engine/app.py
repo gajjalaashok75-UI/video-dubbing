@@ -9,7 +9,6 @@ import time
 import traceback
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
 from pathlib import Path
 
 # Ensure engine/ and the repository root are in sys.path
@@ -859,6 +858,9 @@ async def process_video(
         # Several outputs from one clip are one project. A job that names no
         # project founds its own, so a lone render behaves as it always did.
         "project_id": _project_for(project_id, job_id),
+        # Wall-clock start, so a project that is still rendering can be listed
+        # and sorted while it has no manifest to date it.
+        "started_at": time.time(),
         "original_language": original_language,
         "target_language": target_language,
         "subtitle_language": (subtitle_language or "").strip() or None,
@@ -1954,6 +1956,9 @@ async def create_voiceover(
         # Several outputs from one clip are one project. A job that names no
         # project founds its own, so a lone render behaves as it always did.
         "project_id": _project_for(project_id, job_id),
+        # Wall-clock start, so a project that is still rendering can be listed
+        # and sorted while it has no manifest to date it.
+        "started_at": time.time(),
         "user_id": user_id,
         "created_at": asyncio.get_event_loop().time(),
     }
@@ -2421,10 +2426,13 @@ async def project_outputs(project_id: str):
 @app.get("/videos/")
 async def get_videos(user_id: str = "anonymous"):
     """
-    Every finished project on this machine.
+    Every project on this machine, including the one being rendered right now.
 
     The manifest is the only record. There is no remote index to fall out of
-    sync with, and no outage that can hide someone's work.
+    sync with, and no outage that can hide someone's work. A run in progress
+    has no manifest yet, so it is listed from the live job registry instead —
+    a project used to disappear from this list the moment you started working
+    on it, and never came back if the runtime died mid-render.
 
     `user_id` is recorded on each project but deliberately not filtered on.
     It is a leftover from the hosted version, where accounts existed; here
@@ -2435,38 +2443,9 @@ async def get_videos(user_id: str = "anonymous"):
     older clients keep working.
     """
     # One row per project, not per output. Opening the row opens the job that
-    # founded the project; the studio then lists every output it holds.
-    by_project: dict = {}
-    for job_id, job in jobs.items():
-        if job.get("status") != "done":
-            continue
-        pid = job.get("project_id", job_id)
-        group = by_project.setdefault(pid, [])
-        group.append((job.get("saved_at") or 0, job_id, job))
-
-    rows = []
-    for pid, group in by_project.items():
-        group.sort()
-        _, job_id, job = group[0]
-        created = job.get("saved_at")
-        rows.append({
-            "id": pid,
-            "job_id": job_id,
-            "project_id": pid,
-            "outputs": len(group),
-            "openable": True,
-            "title": _project_name(job, job_id),
-            "name": _project_name(job, job_id),
-            "original_language": job.get("source_language"),
-            "target_language": job.get("target_language"),
-            "duration": job.get("duration"),
-            "processing_status": "done",
-            "dubbed_url": job.get("url"),
-            "created_at": (datetime.fromtimestamp(created, timezone.utc).isoformat()
-                           if created else None),
-        })
-    rows.sort(key=lambda r: r.get("created_at") or "", reverse=True)
-    return JSONResponse(rows)
+    # founded the project, or the one running now; the studio then lists every
+    # output the project holds and follows the live one to completion.
+    return JSONResponse(project.video_rows(jobs, _project_name))
 
 
 @app.delete("/videos/{job_id}")

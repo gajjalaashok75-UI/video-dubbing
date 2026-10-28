@@ -17,6 +17,7 @@ import glob
 import json
 import os
 import time
+from datetime import datetime, timezone
 
 MANIFEST = "project.json"
 VERSION = 1
@@ -136,3 +137,68 @@ def scan(root: str) -> dict:
             continue
         found[job_id] = data
     return found
+
+
+def video_rows(jobs: dict, name_of=None) -> list:
+    """
+    One row per project, for the project list.
+
+    A project used to appear only once it had a finished render, so a run in
+    progress was invisible: start a long dub, go back to the list, and the
+    work you just started is not there — and if the runtime dies there is
+    nothing left to say it ever existed. Every project is listed now, with
+    the status it is actually in.
+
+    `name_of(job, job_id)` names a row; the caller supplies it because naming
+    falls back to the source file, which is the app's concern, not this
+    module's.
+    """
+    name_of = name_of or (lambda job, job_id: job.get("title") or job_id)
+
+    by_project: dict = {}
+    for job_id, job in jobs.items():
+        if job.get("status") not in ("queued", "processing", "done", "failed"):
+            continue
+        pid = job.get("project_id", job_id)
+        by_project.setdefault(pid, []).append((job_id, job))
+
+    rows = []
+    for pid, group in by_project.items():
+        done = [(jid, j) for jid, j in group if j.get("status") == "done"]
+        live = [(jid, j) for jid, j in group
+                if j.get("status") in ("queued", "processing")]
+        done.sort(key=lambda pair: pair[1].get("saved_at") or 0)
+        if live:
+            # While something is running, that is what the row is about,
+            # even when the project already holds finished outputs.
+            live.sort(key=lambda pair: pair[1].get("started_at") or 0,
+                      reverse=True)
+            job_id, job = live[0]
+        elif done:
+            job_id, job = done[0]
+        else:
+            job_id, job = group[0]
+
+        status = job.get("status")
+        created = job.get("saved_at") or job.get("started_at")
+        rows.append({
+            "id": pid,
+            "job_id": job_id,
+            "project_id": pid,
+            "outputs": len(done),
+            "openable": True,
+            "title": name_of(job, job_id),
+            "name": name_of(job, job_id),
+            "original_language": (job.get("source_language")
+                                 or job.get("original_language")),
+            "target_language": job.get("target_language"),
+            "duration": job.get("duration"),
+            "processing_status": status,
+            "dubbed_url": job.get("url"),
+            "error_message": job.get("error") if status == "failed" else None,
+            "created_at": (datetime.fromtimestamp(created, timezone.utc).isoformat()
+                          if created else None),
+        })
+
+    rows.sort(key=lambda r: r.get("created_at") or "", reverse=True)
+    return rows

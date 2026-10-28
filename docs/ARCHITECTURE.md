@@ -69,8 +69,10 @@ is the part that costs minutes.
 
 `project.py` writes a `project.json` beside the files a job already keeps, and
 the server scans for manifests at startup. Without it, restarting turned every
-finished dub back into a download link. `/videos/` reads the manifests and
-nothing else: one row per project, however many outputs it holds.
+finished dub back into a download link. `/videos/` builds one row per project,
+however many outputs it holds, from the manifests **and** the live job
+registry: a run that has not finished has no manifest yet, and listing only
+finished work made a project disappear the moment you started rendering it.
 
 ## Cancellation
 

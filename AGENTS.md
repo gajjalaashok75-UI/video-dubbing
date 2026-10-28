@@ -5,6 +5,10 @@
 - `engine/` — FastAPI app and pipeline. `app.py` holds the API and the boot
   warmup; `models.py` owns the model catalogue and the Hugging Face cache
   checks; `subtitles.py` burns captions; `tts_engines.py` wraps the voices.
+  `lip_sync.py` must never hold the whole clip: it reads the file twice (count
+  and detect, then render) and keeps one batch. Decoding a 60-second
+  1080x1920 clip into a list is 1,799 frames, 10.4 GiB — more than a hosted
+  runtime has, so the render is killed and takes the session with it.
 - `apps/studio/` — React + Tauri desktop studio. `src/` is the UI; the built
   output is committed to `web/` and served by the engine.
 - `scripts/` — `selftest.py` (end-to-end), `download_models.py`, `fit_bench.py`.
@@ -73,7 +77,9 @@
   no GPU, no models, no network. They pin the things that broke a hosted run:
   the PyAV ceiling that keeps `metadata_errors` available, the log follower not
   feeding its own output back into `server.log`, the checkout and runtime tree
-  agreeing on the platform, and the vendored f5_tts fork.
+  agreeing on the platform, the vendored f5_tts fork, lip sync streaming (a
+  fake model and detector render a synthetic clip and the bytes are compared
+  with the old in-memory algorithm), and `/videos/` listing a run in progress.
 - End-to-end: `VIDEOTRANS_URL=http://127.0.0.1:12000 ./venv/bin/python
   scripts/selftest.py [clip.mp4]`. With no clip it runs 38 checks; with a clip
   it adds the render, editor, export and voice-over checks.

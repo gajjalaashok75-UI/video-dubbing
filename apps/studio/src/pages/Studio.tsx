@@ -216,12 +216,26 @@ export default function Studio() {
             ? s.subtitle_language : "");
         setOpened({ name: s.job_id });
         setStale(Boolean(s.video_stale));
-        setView(s.status === "done" ? "done" : "idle");
+        // The project list shows runs that are still going, so opening one
+        // has to follow it. Presenting it as idle left a render running with
+        // nothing on screen saying so.
+        const running = s.status === "processing" || s.status === "queued";
+        if (s.status === "failed") {
+          setError(s.error ?? "The run failed without reporting a reason.");
+        }
+        setView(running ? "working"
+          : s.status === "done" ? "done"
+            : s.status === "failed" ? "failed" : "idle");
         setTab(s.url || s.dub_audio ? "dub" : "source");
         if (s.status === "done") setPage("deliver");
         const pid = s.project_id ?? id;
         setProjectId(pid);
         getProjectOutputs(pid).then((r) => live && setOutputs(r.outputs)).catch(() => {});
+        if (running) {
+          setElapsed(0);
+          clock.current = window.setInterval(() => setElapsed((n) => n + 1), 1000);
+          watch(id);
+        }
         if (s.editable) {
           getPhrases(id).then((t) => live && setPhrases(t.segments)).catch(() => {});
           getReferenceWindows(id).then((r) => live && setWindows(r.candidates)).catch(() => {});
@@ -325,6 +339,12 @@ export default function Studio() {
     setOpened(null);
     setTrimIn(null); setTrimOut(null); setMusic(null); setPhraseNote("");
     setPage("media"); setRestarting(false);
+    // A new draft, not a cleared project: the engine keeps this project's
+    // clip and outputs, and the next render founds a new project. Dropping
+    // the typed name too means it cannot come back as a second project with
+    // the same title, which is what made a fresh render look like the old
+    // one reappearing.
+    setName("");
     setProjectId(null); setOutputs([]); setNaming(null);
     setPreview((old) => { if (old) URL.revokeObjectURL(old); return ""; });
   }
@@ -813,8 +833,17 @@ export default function Studio() {
               {file && <Stat k="Type" v={file.type || "unknown"} />}
 
               <div className="p-2">
-                <Tool icon={<Trash size={12} />} onClick={reset} className="w-full">
-                  Clear
+                {/* Labelled for what it does. "Clear" read as "empty this
+                    project", but nothing on the engine is touched: it keeps
+                    its clip and outputs, and the next render starts a new
+                    project. */}
+                <Tool
+                  icon={<Trash size={12} />}
+                  onClick={reset}
+                  className="w-full"
+                  title="Start a new project. This one keeps its clip and outputs."
+                >
+                  Start over
                 </Tool>
               </div>
 

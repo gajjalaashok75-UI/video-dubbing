@@ -237,6 +237,11 @@ export default function Home() {
                 {rows.map((r) => {
                   const id = idOf(r);
                   const failed = r.processing_status === "failed";
+                  // A run still going belongs in the list, but deleting it
+                  // would only earn a 409 from the engine.
+                  const running =
+                    r.processing_status === "processing" ||
+                    r.processing_status === "queued";
                   return (
                     <li
                       key={id}
@@ -299,13 +304,15 @@ export default function Home() {
                               <DownloadSimple size={11} /> Download
                             </a>
                           ) : null}
-                          <Tool
-                            icon={<Trash size={11} />}
-                            onClick={() => setConfirming(id)}
-                            title="Delete project"
-                            aria-label={`Delete ${r.title || "project"}`}
-                            className="border border-c-rule"
-                          />
+                          {!running && (
+                            <Tool
+                              icon={<Trash size={11} />}
+                              onClick={() => setConfirming(id)}
+                              title="Delete project"
+                              aria-label={`Delete ${r.title || "project"}`}
+                              className="border border-c-rule"
+                            />
+                          )}
                         </div>
                       )}
                     </li>
