@@ -9,7 +9,6 @@ Drop-in replacement for translation.py with:
 
 import os
 import torch
-from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -17,6 +16,25 @@ from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 import engines
 
 MODEL_NAME = engines.get("mt") or "facebook/nllb-200-distilled-600M"
+
+# Lazy import of transformers — importing AutoModelForSeq2SeqLM at module
+# level triggers a chain (transformers -> torch.distributed.tensor._ops
+# -> torch._utils._maybe_view_chunk_cat) that can fail on Python 3.13 with
+# certain torch builds (e.g. Colab CUDA 12 torch 2.6). Importing here,
+# inside _load_model, keeps app.py importable even when transformers' import
+# chain is broken in the host environment.
+_AUTO_MODEL = None
+_AUTO_TOKENIZER = None
+
+
+def _get_transformers_classes():
+    """Return (AutoModelForSeq2SeqLM, AutoTokenizer), importing on first call."""
+    global _AUTO_MODEL, _AUTO_TOKENIZER
+    if _AUTO_MODEL is None:
+        from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+        _AUTO_MODEL = AutoModelForSeq2SeqLM
+        _AUTO_TOKENIZER = AutoTokenizer
+    return _AUTO_MODEL, _AUTO_TOKENIZER
 
 
 def _get_device():
@@ -128,8 +146,18 @@ def _load_model():
     print(f"[Translation-v2] Loading NLLB model: {MODEL_NAME} on {DEVICE}")
 
     try:
+        AutoModelForSeq2SeqLM, AutoTokenizer = _get_transformers_classes()
         _tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-        _model = AutoModelForSeq2SeqLM.from_pretrained(MODEL_NAME).to(DEVICE)
+        # NLLB-200 models use M2M100 architecture. In transformers 4.49+,
+        # AutoModelForSeq2SeqLM should resolve M2M100ForConditionalGeneration
+        # from the config's model_type. If it fails, fall back to the explicit
+        # class so a version drift in the auto-mapping does not break the load.
+        try:
+            _model = AutoModelForSeq2SeqLM.from_pretrained(MODEL_NAME).to(DEVICE)
+        except (ValueError, ImportError) as auto_err:
+            # Explicit import as a fallback when the auto mapper fails.
+            from transformers.models.m2m_100 import M2M100ForConditionalGeneration
+            _model = M2M100ForConditionalGeneration.from_pretrained(MODEL_NAME).to(DEVICE)
 
         # FP16 on CUDA for speed
         if DEVICE == "cuda":
