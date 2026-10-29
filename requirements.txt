@@ -72,7 +72,7 @@ pypinyin>=0.49.0
 # subtitles work in every language either way, because they never synthesize.
 #
 # To enable them:  pip install "TTS>=0.22.0"
-# TTS>=0.22.0
+TTS>=0.22.0
 
 # Cloud Storage & Database
 
@@ -100,7 +100,7 @@ fonttools>=4.40.0
 #
 # Kept out of the default install because it is a heavy optional extra and most
 # videos are one speaker. To enable:  pip install "pyannote.audio>=3.3.2"
-# pyannote.audio>=3.3.2
+pyannote.audio>=3.3.2
 
 # Background preservation. Demucs splits the original soundtrack into speech and
 # everything else, so the film's music, sound effects and ambience survive under
@@ -112,7 +112,7 @@ fonttools>=4.40.0
 # stays bounded on a full-length film.
 #
 # To enable:  pip install "demucs>=4.0.0"
-# demucs>=4.0.0
+demucs>=4.0.0
 
 # Utilities
 requests>=2.31.0
