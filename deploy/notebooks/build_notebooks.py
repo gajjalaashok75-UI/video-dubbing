@@ -284,13 +284,19 @@ TORCH_INDEX = "https://download.pytorch.org/whl/cu124"
 
 
 def _cuda12_torch():
-    # Is the torch that is importable right now a CUDA 12 build on a GPU?
-    try:
-        import torch
-    except Exception:
-        return False
-    return bool(torch.cuda.is_available()
-                and (torch.version.cuda or "").startswith("12"))
+    # Is a CUDA 12 torch importable? Probe in a subprocess: never import
+    # torch in this process first, because deleting it from sys.modules and
+    # re-importing it (Python 3.13) raises
+    #   RuntimeError: function '_has_torch_function' already has a docstring
+    # PyTorch's C-extensions cannot be safely reloaded in the same session.
+    probe = subprocess.run(
+        [sys.executable, "-c",
+         "import torch, sys;"
+         "sys.exit(0 if (torch.cuda.is_available()"
+         " and (torch.version.cuda or '').startswith('12')) else 1)"],
+        capture_output=True,
+    )
+    return probe.returncode == 0
 
 
 if _cuda12_torch():
@@ -302,15 +308,10 @@ else:
         check=True,
     )
 
-# The CUDA build must have won, or every render falls back to the CPU - and a
-# CUDA 13 build does not fall back, it raises inside ctranslate2.
-#
-# `_cuda12_torch()` imported torch a moment ago, so it must be dropped before
-# this import: a module already in sys.modules is returned as-is, and this
-# would then report the CUDA major of the build that was just replaced.
-for _name in [m for m in list(sys.modules)
-              if m == "torch" or m.startswith("torch.")]:
-    del sys.modules[_name]
+# Import torch for the version check below. torch was never imported in this
+# process before now (the CUDA check ran in a subprocess), so there is nothing
+# to unload and no reload conflict - which matters on Python 3.13, where
+# re-importing PyTorch's C-extensions raises a docstring error.
 import torch  # noqa: E402
 print("torch", torch.__version__, "| CUDA available:", torch.cuda.is_available())
 if not (torch.version.cuda or "").startswith("12"):
