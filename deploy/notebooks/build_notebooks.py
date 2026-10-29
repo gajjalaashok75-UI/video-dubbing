@@ -418,10 +418,12 @@ except Exception as exc:
 #                "Numba needs NumPy 2.2 or less. Got NumPy 2.5."
 #   transformers - 5.x cannot be installed next to the hub pin below, and the
 #            symptom is "cannot import name 'GenerationMixin'".
-PROBE = ("import numpy, numba, transformers, sys;"
+PROBE = ("import numpy, numba, transformers, huggingface_hub, sys;"
          "print(numpy.__version__);"
-         "sys.exit(0 if transformers.__version__.startswith('4.') else 1)")
-REPAIR = ["numpy>=1.26.0,<2.3", "transformers>=4.49,<5"]
+         "sys.exit(0 if transformers.__version__.startswith('4.')"
+         " and huggingface_hub.__version__.startswith('0.') else 1)")
+REPAIR = ["numpy>=1.26.0,<2.3", "transformers>=4.49,<5",
+          "huggingface-hub>=0.30,<1.0"]
 
 probe = subprocess.run([sys.executable, "-c", PROBE],
                        capture_output=True, text=True)
