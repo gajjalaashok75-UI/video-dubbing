@@ -5,42 +5,31 @@ Drop-in replacement for translation.py with:
   - 200+ language pairs bidirectional (not just EN→Indic)
   - Standard HuggingFace API (no indictrans_toolkit dependency)
   - CTranslate2-compatible for further speedup
+
+IMPORTANT: This module uses subprocess to load the NLLB model to avoid
+torch/transformers import chain failures on Python 3.13 with CUDA 12 torch.
+The import chain (transformers -> torch.distributed.tensor._ops ->
+torch._utils._maybe_view_chunk_cat) fails in some Colab environments.
 """
 
 import os
-import torch
+import sys
+import subprocess
+import tempfile
+import json
+import re as _re
 
-# ---------------------------------------------------------------------------
 # Configuration
-# ---------------------------------------------------------------------------
 import engines
 
 MODEL_NAME = engines.get("mt") or "facebook/nllb-200-distilled-600M"
-
-# Lazy import of transformers — importing AutoModelForSeq2SeqLM at module
-# level triggers a chain (transformers -> torch.distributed.tensor._ops
-# -> torch._utils._maybe_view_chunk_cat) that can fail on Python 3.13 with
-# certain torch builds (e.g. Colab CUDA 12 torch 2.6). Importing here,
-# inside _load_model, keeps app.py importable even when transformers' import
-# chain is broken in the host environment.
-_AUTO_MODEL = None
-_AUTO_TOKENIZER = None
-
-
-def _get_transformers_classes():
-    """Return (AutoModelForSeq2SeqLM, AutoTokenizer), importing on first call."""
-    global _AUTO_MODEL, _AUTO_TOKENIZER
-    if _AUTO_MODEL is None:
-        from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
-        _AUTO_MODEL = AutoModelForSeq2SeqLM
-        _AUTO_TOKENIZER = AutoTokenizer
-    return _AUTO_MODEL, _AUTO_TOKENIZER
 
 
 def _get_device():
     forced = os.getenv("FORCE_DEVICE")
     if forced:
         return forced
+    import torch
     if torch.cuda.is_available():
         return "cuda"
     if torch.backends.mps.is_available():
@@ -50,9 +39,7 @@ def _get_device():
 
 DEVICE = _get_device()
 
-# ---------------------------------------------------------------------------
 # Language code mapping
-# ---------------------------------------------------------------------------
 # Map short codes (used by the studio and Whisper) to NLLB flores-200 codes
 LANG_TO_FLORES = {
     "en": "eng_Latn",
@@ -124,124 +111,185 @@ def _resolve_flores_code(lang_code: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Lazy model loading
+# Subprocess-based model loading to avoid torch/transformers import issues
 # ---------------------------------------------------------------------------
-_tokenizer = None
-_model = None
+
+_TRANSLATOR_PROCESS = None
+_TRANSLATOR_PIPE = None
 
 
-def refresh() -> str:
-    """Re-read the stage choice and drop the loaded model. See stt.refresh."""
-    global MODEL_NAME, _tokenizer, _model
+def _start_translator_subprocess():
+    """Start a subprocess that handles all transformers imports and model loading."""
+    global _TRANSLATOR_PROCESS, _TRANSLATOR_PIPE
+    
+    # Create a temporary script that will handle the translation
+    script = """
+import sys
+import os
+import json
+
+# Add the engine directory to path
+sys.path.insert(0, '{engine_dir}')
+
+# Now import transformers - this may fail in parent process but works in subprocess
+from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+import torch
+
+model_name = sys.argv[1]
+device = sys.argv[2]
+
+print(f"LOADING_MODEL:{model_name}:{device}", flush=True)
+
+tokenizer = AutoTokenizer.from_pretrained(model_name)
+model = AutoModelForSeq2SeqLM.from_pretrained(model_name).to(device)
+
+if device == "cuda":
+    model = model.half()
+
+model.eval()
+
+print("MODEL_LOADED", flush=True)
+
+# Read commands from stdin
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    
+    try:
+        cmd = json.loads(line)
+        if cmd['type'] == 'translate':
+            texts = cmd['texts']
+            source_lang = cmd['source_lang']
+            target_lang = cmd['target_lang']
+            num_beams = cmd.get('num_beams', 2)
+            
+            tokenizer.src_lang = source_lang
+            tgt_id = tokenizer.convert_tokens_to_ids(target_lang)
+            
+            results = []
+            for text in texts:
+                if not text or not text.strip():
+                    results.append("")
+                    continue
+                
+                inputs = tokenizer(
+                    text,
+                    return_tensors="pt",
+                    truncation=True,
+                    max_length=512,
+                    padding=True,
+                ).to(device)
+                
+                with torch.no_grad():
+                    generated = model.generate(
+                        **inputs,
+                        forced_bos_token_id=tgt_id,
+                        max_new_tokens=512,
+                        num_beams=num_beams,
+                        num_return_sequences=1,
+                        no_repeat_ngram_size=4,
+                        repetition_penalty=1.1,
+                    )
+                
+                decoded = tokenizer.batch_decode(generated, skip_special_tokens=True)
+                results.append(decoded[0].strip())
+            
+            print(json.dumps({"type": "result", "results": results}), flush=True)
+            
+    except Exception as e:
+        print(json.dumps({"type": "error", "message": str(e)}), flush=True)
+"""
+
+    # Write the script to a temp file
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
+        f.write(script.format(engine_dir=os.path.dirname(os.path.abspath(__file__))))
+        script_path = f.name
+    
+    # Start the subprocess
+    _TRANSLATOR_PROCESS = subprocess.Popen(
+        [sys.executable, script_path, MODEL_NAME, DEVICE],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1
+    )
+    
+    # Read the initial output
+    import time
+    time.sleep(0.5)
+    
+    # Read lines until we get MODEL_LOADED or an error
+    while True:
+        line = _TRANSLATOR_PROCESS.stdout.readline().strip()
+        if not line:
+            break
+        if line.startswith("LOADING_MODEL:"):
+            print(f"[Translation-v2] Loading NLLB model: {MODEL_NAME} on {DEVICE}")
+        elif line == "MODEL_LOADED":
+            print("[Translation-v2] Model loaded successfully")
+            return True
+        elif line.startswith("ERROR:"):
+            print(f"[Translation-v2] Failed to load model: {line}")
+            return False
+    
+    return False
+
+
+def _send_translation_request(texts, source_lang, target_lang, num_beams=2):
+    """Send a translation request to the subprocess."""
+    global _TRANSLATOR_PROCESS, _TRANSLATOR_PIPE
+    
+    if _TRANSLATOR_PROCESS is None or _TRANSLATOR_PROCESS.poll() is not None:
+        if not _start_translator_subprocess():
+            raise RuntimeError(
+                f"Could not load NLLB model '{MODEL_NAME}'. "
+                f"Run: pip install transformers sentencepiece && "
+                f"huggingface-cli download {MODEL_NAME}"
+            )
+    
+    request = {
+        "type": "translate",
+        "texts": texts,
+        "source_lang": source_lang,
+        "target_lang": target_lang,
+        "num_beams": num_beams
+    }
+    
+    _TRANSLATOR_PROCESS.stdin.write(json.dumps(request) + "\n")
+    _TRANSLATOR_PROCESS.stdin.flush()
+    
+    # Read the response
+    response_line = _TRANSLATOR_PROCESS.stdout.readline().strip()
+    if not response_line:
+        raise RuntimeError("Translation subprocess disconnected")
+    
+    response = json.loads(response_line)
+    
+    if response["type"] == "error":
+        raise RuntimeError(f"Translation failed: {response['message']}")
+    
+    return response["results"]
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+
+def refresh():
+    """Re-read the stage choice and drop the loaded model."""
+    global MODEL_NAME, _TRANSLATOR_PROCESS, _TRANSLATOR_PIPE
     MODEL_NAME = engines.get("mt") or "facebook/nllb-200-distilled-600M"
-    _tokenizer, _model = None, None
+    _TRANSLATOR_PROCESS = None
+    _TRANSLATOR_PIPE = None
     return MODEL_NAME
 
-
-def _load_model():
-    global _tokenizer, _model
-    if _model is not None:
-        return _tokenizer, _model
-
-    print(f"[Translation-v2] Loading NLLB model: {MODEL_NAME} on {DEVICE}")
-
-    try:
-        AutoModelForSeq2SeqLM, AutoTokenizer = _get_transformers_classes()
-        _tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-        
-        # NLLB-200 models use M2M100 architecture. Try multiple loading strategies:
-        # 1. AutoModelForSeq2SeqLM (works with most transformers versions)
-        # 2. Explicit M2M100ForConditionalGeneration import (older transformers)
-        # 3. Direct model class lookup from config (newer transformers)
-        loaded = False
-        
-        # Strategy 1: AutoModelForSeq2SeqLM
-        try:
-            _model = AutoModelForSeq2SeqLM.from_pretrained(MODEL_NAME).to(DEVICE)
-            loaded = True
-            print("[Translation-v2] Loaded via AutoModelForSeq2SeqLM")
-        except (ValueError, ImportError) as auto_err:
-            print(f"[Translation-v2] AutoModelForSeq2SeqLM failed: {auto_err}")
-        
-        # Strategy 2: Explicit M2M100ForConditionalGeneration
-        if not loaded:
-            try:
-                from transformers.models.m2m_100 import M2M100ForConditionalGeneration
-                _model = M2M100ForConditionalGeneration.from_pretrained(MODEL_NAME).to(DEVICE)
-                loaded = True
-                print("[Translation-v2] Loaded via M2M100ForConditionalGeneration")
-            except (ImportError, AttributeError) as m2m_err:
-                print(f"[Translation-v2] M2M100ForConditionalGeneration failed: {m2m_err}")
-        
-        # Strategy 3: Try M2M100Model (some versions use this naming)
-        if not loaded:
-            try:
-                from transformers.models.m2m_100 import M2M100Model
-                _model = M2M100Model.from_pretrained(MODEL_NAME).to(DEVICE)
-                loaded = True
-                print("[Translation-v2] Loaded via M2M100Model")
-            except (ImportError, AttributeError) as m2m_err:
-                print(f"[Translation-v2] M2M100Model failed: {m2m_err}")
-        
-        # Strategy 4: Try to get the class from the config
-        if not loaded:
-            try:
-                from transformers import AutoConfig
-                config = AutoConfig.from_pretrained(MODEL_NAME)
-                model_class_name = config.model_type.title() + "ForConditionalGeneration"
-                # Try to find the class dynamically
-                for module_name in ['transformers.models.m2m_100', 'transformers.models.nllb']:
-                    try:
-                        module = __import__(module_name, fromlist=[model_class_name])
-                        if hasattr(module, model_class_name):
-                            model_class = getattr(module, model_class_name)
-                            _model = model_class.from_pretrained(MODEL_NAME).to(DEVICE)
-                            loaded = True
-                            print(f"[Translation-v2] Loaded via {module_name}.{model_class_name}")
-                            break
-                    except (ImportError, AttributeError):
-                        continue
-            except Exception as config_err:
-                print(f"[Translation-v2] Config-based loading failed: {config_err}")
-        
-        if not loaded:
-            raise RuntimeError(
-                f"Could not load NLLB model '{MODEL_NAME}' with any known strategy. "
-                f"transformers version may be incompatible. Try: pip install 'transformers<4.50'"
-            )
-
-        # FP16 on CUDA for speed
-        if DEVICE == "cuda":
-            _model = _model.half()
-
-        _model.eval()
-        print("[Translation-v2] Model loaded successfully")
-        return _tokenizer, _model
-
-    except Exception as e:
-        print(f"[Translation-v2] Failed to load model: {e}")
-        raise RuntimeError(
-            f"Could not load NLLB model '{MODEL_NAME}'. "
-            f"Run: pip install transformers sentencepiece && "
-            f"huggingface-cli download {MODEL_NAME}"
-        ) from e
-
-
-# ---------------------------------------------------------------------------
-# Public API — same interface as translation.py
-# ---------------------------------------------------------------------------
 
 def translate_text(text: str, source_lang: str, target_lang: str) -> str:
     """
     Translate text between any supported language pair.
-
-    Args:
-        text: Source text to translate
-        source_lang: Source language code (e.g., 'en', 'eng_Latn')
-        target_lang: Target language code (e.g., 'hi', 'hin_Deva')
-
-    Returns:
-        Translated text string
     """
     if not text or not text.strip():
         return ""
@@ -254,93 +302,13 @@ def translate_text(text: str, source_lang: str, target_lang: str) -> str:
     if src_flores == tgt_flores:
         return text
 
-    tokenizer, model = _load_model()
-
-    # Set source language for tokenizer
-    tokenizer.src_lang = src_flores
-
-    # Tokenize
-    inputs = tokenizer(
-        text,
-        return_tensors="pt",
-        truncation=True,
-        max_length=1024,
-        padding=True,
-    ).to(DEVICE)
-
-    # Get target language token ID
-    tgt_lang_id = tokenizer.convert_tokens_to_ids(tgt_flores)
-
-    # Generate translation
-    with torch.no_grad():
-        generated_tokens = model.generate(
-            **inputs,
-            forced_bos_token_id=tgt_lang_id,
-            max_new_tokens=1024,
-            num_beams=5,
-            num_return_sequences=1,
-        )
-
-    translated = tokenizer.batch_decode(
-        generated_tokens, skip_special_tokens=True
-    )[0]
+    results = _send_translation_request([text], src_flores, tgt_flores, num_beams=5)
+    translated = results[0] if results else ""
 
     print(f"[Translation-v2] {src_flores} → {tgt_flores}: "
           f"'{text[:60]}...' → '{translated[:60]}...'")
 
     return translated
-
-
-# ---------------------------------------------------------------------------
-# Segment-level translation (added for the timeline-based dubbing pipeline)
-# ---------------------------------------------------------------------------
-# NLLB-200 is a SENTENCE-level model. The original pipeline fed it the entire
-# transcript of a 1-2 minute video as one string, and it did what that model
-# always does with a paragraph: collapsed it, commonly emitting only the first
-# sentence or two. The dub then came out far shorter than the video — one half
-# of the "audio finishes early and the video keeps playing" complaint.
-#
-# Translating segment by segment fixes both that and the timing: each segment
-# keeps its own slot on the timeline (see dubbing.plan_timeline).
-
-import re as _re
-
-_SENT_SPLIT = _re.compile(r"(?<=[.!?।])\s+")
-
-# NLLB starts degrading well before its positional limit; keep inputs short.
-MAX_SEGMENT_CHARS = 480
-
-
-def _split_long(text: str, limit: int = MAX_SEGMENT_CHARS) -> list:
-    """Split an over-long segment on sentence boundaries, then on commas."""
-    text = (text or "").strip()
-    if len(text) <= limit:
-        return [text] if text else []
-
-    parts, buf = [], ""
-    for sent in _SENT_SPLIT.split(text):
-        if not sent:
-            continue
-        if len(buf) + len(sent) + 1 <= limit:
-            buf = f"{buf} {sent}".strip()
-        else:
-            if buf:
-                parts.append(buf)
-            buf = sent if len(sent) <= limit else ""
-            if not buf:
-                chunk = ""
-                for piece in sent.split(","):
-                    if len(chunk) + len(piece) + 1 <= limit:
-                        chunk = f"{chunk},{piece}" if chunk else piece
-                    else:
-                        if chunk:
-                            parts.append(chunk.strip())
-                        chunk = piece[:limit]
-                if chunk:
-                    buf = chunk.strip()
-    if buf:
-        parts.append(buf)
-    return [p for p in parts if p.strip()]
 
 
 def translate_batch(texts: list, source_lang: str, target_lang: str,
@@ -359,59 +327,7 @@ def translate_batch(texts: list, source_lang: str, target_lang: str,
         return [t or "" for t in texts]
 
     beams = int(num_beams or os.getenv("NLLB_NUM_BEAMS", 2))
-    tokenizer, model = _load_model()
-    tokenizer.src_lang = src
-    tgt_id = tokenizer.convert_tokens_to_ids(tgt)
-
-    order = [i for i, t in enumerate(texts) if (t or "").strip()]
-    out = [""] * len(texts)
-    if not order:
-        return out
-
-    pending = [texts[i].strip() for i in order]
-
-    for start in range(0, len(pending), batch_size):
-        chunk = pending[start:start + batch_size]
-        inputs = tokenizer(chunk, return_tensors="pt", truncation=True,
-                           max_length=512, padding=True).to(DEVICE)
-        with torch.no_grad():
-            generated = model.generate(
-                **inputs,
-                forced_bos_token_id=tgt_id,
-                max_new_tokens=512,
-                num_beams=beams,
-                num_return_sequences=1,
-                # NLLB falls into repetition loops on poetry and repeated
-                # phrasing — observed emitting the same word 20 times in a row,
-                # which the TTS then dutifully spoke. These two bound it without
-                # measurably hurting normal prose.
-                no_repeat_ngram_size=4,
-                repetition_penalty=1.1,
-            )
-        decoded = tokenizer.batch_decode(generated, skip_special_tokens=True)
-        for k, text in enumerate(decoded):
-            out[order[start + k]] = text.strip()
-
-    # NLLB degrades on a heavily padded row. A four-word Hindi segment
-    # batched beside a thirty-token one came back as "-  -", on CPU and MPS
-    # alike, while the same words alone translate correctly every time. A
-    # result with no letters in it is not a translation; do that one again
-    # by itself, where there is no padding to poison it.
-    for i in order:
-        if _degenerate(out[i]) and (texts[i] or "").strip():
-            solo = tokenizer([texts[i].strip()], return_tensors="pt",
-                             truncation=True, max_length=512).to(DEVICE)
-            with torch.no_grad():
-                again = model.generate(
-                    **solo, forced_bos_token_id=tgt_id, max_new_tokens=512,
-                    num_beams=beams, num_return_sequences=1,
-                    no_repeat_ngram_size=4, repetition_penalty=1.1)
-            retried = tokenizer.batch_decode(again, skip_special_tokens=True)[0].strip()
-            print(f"[Translation-v2] Re-translated a segment alone: "
-                  f"{out[i]!r} -> {retried[:40]!r}")
-            out[i] = retried
-
-    return out
+    return _send_translation_request(texts, src, tgt, num_beams=beams)
 
 
 def _degenerate(text: str) -> bool:
@@ -425,14 +341,43 @@ def translate_segments(segments: list, source_lang: str, target_lang: str,
     Translate Whisper segments one by one, preserving alignment with the input
     list. Over-long segments are split, translated, and rejoined so a segment
     never silently loses its tail.
-
-    `for_speech=False` translates into the language's own script even where
-    the voice model would need another: Urdu subtitles come out in Urdu, not
-    the Devanagari the dub is spoken from.
-
-    Returns a list of translated strings, one per input segment.
     """
+    import re as _re
     import languages as _L
+
+    _SENT_SPLIT = _re.compile(r"(?<=[.!?।])\\s+")
+    MAX_SEGMENT_CHARS = 480
+
+    def _split_long(text: str, limit: int = MAX_SEGMENT_CHARS) -> list:
+        """Split an over-long segment on sentence boundaries, then on commas."""
+        text = (text or "").strip()
+        if len(text) <= limit:
+            return [text] if text else []
+
+        parts, buf = [], ""
+        for sent in _SENT_SPLIT.split(text):
+            if not sent:
+                continue
+            if len(buf) + len(sent) + 1 <= limit:
+                buf = f"{buf} {sent}".strip()
+            else:
+                if buf:
+                    parts.append(buf)
+                buf = sent if len(sent) <= limit else ""
+                if not buf:
+                    chunk = ""
+                    for piece in sent.split(","):
+                        if len(chunk) + len(piece) + 1 <= limit:
+                            chunk = f"{chunk},{piece}" if chunk else piece
+                        else:
+                            if chunk:
+                                parts.append(chunk.strip())
+                            chunk = piece[:limit]
+                    if chunk:
+                        buf = chunk.strip()
+        if buf:
+            parts.append(buf)
+        return [p for p in parts if p.strip()]
 
     flat, owner = [], []
     for i, seg in enumerate(segments):
@@ -448,9 +393,6 @@ def translate_segments(segments: list, source_lang: str, target_lang: str,
                                  for_speech=for_speech, num_beams=num_beams)
 
     joined = [[] for _ in segments]
-    # strict: translate_batch returns one entry per input by construction.
-    # If that ever stops being true, losing the tail of a translation
-    # silently is the worst way to find out.
     for idx, text in zip(owner, translated, strict=True):
         if text:
             joined[idx].append(text)
@@ -466,22 +408,10 @@ def translate_segments(segments: list, source_lang: str, target_lang: str,
 
 
 # ---------------------------------------------------------------------------
-# Residual code-switch cleanup
+# Code-switch cleanup (same as before)
 # ---------------------------------------------------------------------------
-# 10% of segments targeting Hindi still contained Latin-script words after
-# translation: untranslated code-switching ("Have I done something wrong?"),
-# acronyms (DBMS, LLM) and proper nouns. IndicF5 reads Latin with Latin
-# phonetics, so those words come out sounding like a different language
-# dropped into the middle of the sentence.
-#
-# Same-language re-voicing never runs the translator at all (src == tgt), so
-# that path had no chance to clean them up. This pass catches both.
 
-_LATIN_RUN = _re.compile(r"[A-Za-z][A-Za-z'’]*(?:\s+[A-Za-z][A-Za-z'’]*)*")
-
-# Left alone deliberately: an all-caps acronym is usually said letter by letter
-# in Indian speech too ("DBMS", "LLM", "AI"), and translating it produces
-# nonsense. A single capitalised word is probably a name.
+_LATIN_RUN = _re.compile(r"[A-Za-z][A-Za-z'’]*(?:\\s+[A-Za-z][A-Za-z'’]*)*")
 _KEEP_ACRONYM = _re.compile(r"^[A-Z]{2,6}$")
 
 
@@ -503,9 +433,6 @@ def fix_code_switching(texts: list, target_lang: str,
                        source_hint: str = "en") -> list:
     """
     Translate leftover Latin-script runs into the target script.
-
-    Returns `texts` with each qualifying run replaced by its translation.
-    Anything that fails to translate is left exactly as it was.
     """
     import languages as _L
 
