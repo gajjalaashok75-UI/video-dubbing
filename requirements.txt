@@ -66,6 +66,12 @@ huggingface-hub>=0.30,<1.0  # <1.0: transformers 4.49 refuses hub 1.x
 # release's forward math. engine/vendor/f5_tts holds the fork the checkpoint was
 # trained with and engine/tts_engines.py puts it first on sys.path. See
 # _use_vendored_f5_tts there before changing this.
+#
+# torchcodec MUST be pinned to cu124 variant before f5-tts, because f5-tts>=0.1.0
+# pulls torchcodec>=0.11.0 which only publishes cu130 (PyTorch 2.7+) wheels.
+# torch 2.6.0+cu124 is the last CUDA 12 release; torchcodec 0.10.0+cu124 is the
+# last cu124 build and works with it.
+torchcodec==0.10.0+cu124
 f5-tts>=0.1.0
 vocos>=0.1.0
 x-transformers>=1.31.0
