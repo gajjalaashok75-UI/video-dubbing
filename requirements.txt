@@ -72,7 +72,7 @@ pypinyin>=0.49.0
 # subtitles work in every language either way, because they never synthesize.
 #
 # To enable them:  pip install "TTS>=0.22.0"
-TTS>=0.22.0
+#TTS>=0.22.0
 
 # Cloud Storage & Database
 
