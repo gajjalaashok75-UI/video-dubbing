@@ -332,7 +332,12 @@ else:
             "but this kernel still holds the older build. Restart the runtime "
             "and re-run this cell."
         )
-    import torch  # noqa: E402
+
+# Make sure torch is bound before printing its version. If a CUDA 12 build
+# was detected by the subprocess probe, torch was never imported in this
+# kernel, so import it now. `import` is a no-op when the module is already
+# loaded, so this is safe in every branch.
+import torch  # noqa: E402
 
 print("torch", torch.__version__, "| CUDA available:", torch.cuda.is_available())
 if not (torch.version.cuda or "").startswith("12"):
