@@ -542,6 +542,11 @@ def process_video_task(job_id: str, input_path: str, original_language: str,
             segments = result.get("segments") or []
             original_text = result.get("text", "")
             _set(job_id, original_text=original_text)
+            # A GPU that could not be used leaves the stage on the CPU. Record
+            # it so the summary says why the render was slow, instead of the
+            # speed-up coming back unexplained next time.
+            if speech_to_text_v2.fallback_reason():
+                _set(job_id, stt_fallback=speech_to_text_v2.fallback_reason())
 
         if not segments:
             raise RuntimeError(
@@ -857,6 +862,18 @@ def process_video_task(job_id: str, input_path: str, original_language: str,
             except lip_sync.NoFaceDetected as e:
                 # Not a failure: there is nothing in this picture to move. Keep
                 # the finished dub and deliver it on the original video.
+                _set(job_id, step="lip_sync_skipped")
+                lip_sync_note = _deliver_without_lip_sync(
+                    input_path, audio_for_video, output_video_path, str(e),
+                    no_face=True)
+            except lip_sync.LipSyncError as e:
+                # Any other lip-sync failure - a missing checkpoint, an audio
+                # decoder the environment broke (a NumPy too new for Numba
+                # did exactly that), an ffmpeg error - must not throw away a
+                # finished dub either. The lips are a picture detail; the
+                # soundtrack is the product. Reported as a fallback, with its
+                # reason, so a broken install is still visible.
+                print(f"[Wav2Lip] Lip sync failed, delivering without it: {e}")
                 _set(job_id, step="lip_sync_skipped")
                 lip_sync_note = _deliver_without_lip_sync(
                     input_path, audio_for_video, output_video_path, str(e))
@@ -1725,7 +1742,8 @@ def _mix_audio(job_id: str, workdir: str, stem: str, dub_path: str,
 
 
 def _deliver_without_lip_sync(input_path: str, audio_path: str,
-                              out_path: str, reason: str) -> dict:
+                              out_path: str, reason: str,
+                              no_face: bool = False) -> dict:
     """
     Attach the dub to the untouched picture when there is no face to sync.
 
@@ -1744,7 +1762,7 @@ def _deliver_without_lip_sync(input_path: str, audio_path: str,
     """
     av_sync.mux(input_path, audio_path, out_path)
     print(f"[Wav2Lip] Lip sync skipped — {reason}")
-    return {"skipped": True, "reason": reason}
+    return {"skipped": True, "reason": reason, "no_face": no_face}
 
 
 def _assign_implicit_speaker(segments: list, label: str = None) -> list:
@@ -2210,6 +2228,14 @@ def rerender_task(job_id: str):
                 # Same rule as the first render: a clip with no face in it has
                 # nothing to sync, so the edited audio is muxed onto it instead
                 # of the re-render failing.
+                _set(job_id, step="lip_sync_skipped")
+                note = _deliver_without_lip_sync(
+                    job["input_path"], job["dub_path"], job["output_path"],
+                    str(e), no_face=True)
+            except lip_sync.LipSyncError as e:
+                # And the same rule for any other lip-sync failure: an edit must
+                # not be lost to a stage that only moves mouths.
+                print(f"[Wav2Lip] Lip sync failed, delivering without it: {e}")
                 _set(job_id, step="lip_sync_skipped")
                 note = _deliver_without_lip_sync(
                     job["input_path"], job["dub_path"], job["output_path"],

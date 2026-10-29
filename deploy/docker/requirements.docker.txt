@@ -4,7 +4,9 @@
 # Mirrors requirements.txt for the image in deploy/docker/Dockerfile, with one
 # change: the torch stack is NOT here. The Dockerfile installs torch, torchaudio
 # and torchvision from the cu124 index in their own layer, so this file must not
-# name them or pip would pull the CPU-only wheels from PyPI instead.
+# name them or pip would pull the CPU-only wheels from PyPI instead. That layer
+# pins 2.6.0: it is the last cu124 build, and CTranslate2 needs libcublas.so.12
+# (CUDA 12), which the CUDA 13 wheels that torch >= 2.7 ships do not provide.
 #
 # Build context is the repository root; this file is copied to /app/requirements.txt.
 # =============================================================================
@@ -19,7 +21,10 @@ pydantic>=2.6.0
 ffmpeg-python==0.2.0
 librosa>=0.10.0
 soundfile>=0.12.0
-numpy>=1.26.0
+# Numba refuses NumPy newer than 2.2 ("Numba needs NumPy 2.2 or less"), and
+# numba arrives through librosa, which the voice engine and Wav2Lip both load
+# audio with. Keep in step with requirements.txt.
+numpy>=1.26.0,<2.3
 scipy>=1.11.0
 opencv-python>=4.8.0
 

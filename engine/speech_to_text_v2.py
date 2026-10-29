@@ -42,6 +42,69 @@ DEVICE = _get_device()
 COMPUTE_TYPE = _get_compute_type()
 
 # ---------------------------------------------------------------------------
+# When the GPU cannot be used at all
+# ---------------------------------------------------------------------------
+# CTranslate2 carries its own CUDA kernels and loads the CUDA runtime on the
+# first encode, not when the model is constructed. If the wheels and the
+# installed torch disagree about the CUDA major - a CUDA 13 torch next to a
+# CTranslate2 built for CUDA 12 is the case that actually happened - the
+# failure lands several seconds into an accepted render:
+#
+#     RuntimeError: Library libcublas.so.12 is not found or cannot be loaded
+#
+# No decode setting and no smaller model can fix a missing shared library, and
+# letting it escape fails a job that had already transcribed nothing. The stage
+# runs on the CPU instead: slower, correct, and reported through
+# `fallback_reason()` so the slowdown is never a mystery.
+_CUDA_RUNTIME_MARKERS = (
+    "libcublas", "libcudnn", "libcudart", "libcuda.so",
+    "libnvrtc", "cannot be loaded",
+    "no kernel image is available",
+    "cuda driver version is insufficient",
+    "cuda error",
+)
+
+_FALLBACK_REASON = None
+
+
+def _cuda_runtime_error(exc: BaseException) -> bool:
+    """Is this the "the GPU cannot be used at all" class of failure?"""
+    text = f"{type(exc).__name__}: {exc}".lower()
+    if "out of memory" in text or "oom" in text:
+        return False
+    return any(marker in text for marker in _CUDA_RUNTIME_MARKERS)
+
+
+def _demote_to_cpu(exc: BaseException) -> bool:
+    """
+    Move this stage to the CPU. True if anything changed.
+
+    Returns False when the failure had nothing to do with the GPU, so callers
+    can keep their normal error handling for real model problems.
+    """
+    global DEVICE, COMPUTE_TYPE, _model, _FALLBACK_REASON
+    if DEVICE != "cuda" or not _cuda_runtime_error(exc):
+        return False
+    _FALLBACK_REASON = (
+        f"faster-whisper could not use the GPU ({type(exc).__name__}: {exc}). "
+        f"Transcription ran on the CPU instead, which is much slower."
+    )
+    DEVICE = "cpu"
+    COMPUTE_TYPE = "int8"
+    _model = None
+    print(f"[STT-v2] GPU unusable: {exc}")
+    print("[STT-v2] Retrying on the CPU (int8). A render will be slower, not "
+          "broken. A CUDA 12 torch build fixes this for good - see "
+          "requirements.txt.")
+    return True
+
+
+def fallback_reason() -> str | None:
+    """Why this stage is on the CPU, or None when it is on the GPU."""
+    return _FALLBACK_REASON
+
+
+# ---------------------------------------------------------------------------
 # Lazy model loading (avoids import-time downloads)
 # ---------------------------------------------------------------------------
 _model = None
@@ -69,10 +132,12 @@ def _load_model():
 
     from faster_whisper import WhisperModel
 
-    model_size = MODEL_SIZE
-    attempts = [model_size, "medium", "base"]
+    attempts = [MODEL_SIZE, "medium", "base"]
+    index = 0
+    last_error = None
 
-    for attempt in attempts:
+    while index < len(attempts):
+        attempt = attempts[index]
         try:
             print(f"[STT-v2] Loading faster-whisper model: {attempt} "
                   f"(device={DEVICE}, compute={COMPUTE_TYPE})")
@@ -84,12 +149,20 @@ def _load_model():
             print(f"[STT-v2] Model '{attempt}' loaded successfully")
             return _model
         except Exception as e:
+            last_error = e
+            if _demote_to_cpu(e):
+                # The GPU cannot be used at all. A smaller model cannot fix
+                # that, so retry the chosen one on the CPU - slower, correct.
+                index = 0
+                continue
             print(f"[STT-v2] Failed to load '{attempt}': {e}")
-            if attempt == attempts[-1]:
-                raise RuntimeError(
-                    f"Could not load any Whisper model. Last error: {e}"
-                ) from e
-            print("[STT-v2] Falling back to next model...")
+            index += 1
+            if index < len(attempts):
+                print("[STT-v2] Falling back to next model...")
+
+    raise RuntimeError(
+        f"Could not load any Whisper model. Last error: {last_error}"
+    ) from last_error
 
 
 # A gap smaller than this at the end of a file is trailing silence, not
@@ -286,28 +359,47 @@ def transcribe_audio(audio_path: str, language: str = None) -> dict:
     model = _load_model()
 
     def _pass(clip=None):
-        """One decode over the file, or over a range of it."""
+        """
+        One decode over the file, or over a range of it.
+
+        The language is pinned because it matters when re-transcribing a dub
+        for evaluation: Hindi and Urdu are the same spoken language, so Whisper
+        will happily return Nastaliq for Hindi audio and the character error
+        rate then reads 1.00 on a perfectly good dub purely from a script
+        mismatch. It is None for normal transcription (auto-detect).
+        """
         return model.transcribe(
             audio_path,
             **(dict(_DECODE, language=language, clip_timestamps=clip)
                if clip else dict(_DECODE, language=language)))
 
-    segments_iter, info = model.transcribe(
-        audio_path,
-        # Pinning the language matters when re-transcribing a dub for
-        # evaluation: Hindi and Urdu are the same spoken language, so Whisper
-        # will happily return Nastaliq for Hindi audio. Character error rate
-        # then reads 1.00 on a perfectly good dub purely from a script
-        # mismatch. Leave as None for normal transcription (auto-detect).
-        language=language,
-        **_DECODE,
-    )
+    def _decode(fn):
+        """
+        Run a transcribe call, drained, retrying on the CPU if the GPU fails.
+
+        `transcribe` returns a generator and CTranslate2 only touches the GPU
+        when a segment is pulled, so the iterator is drained here. Otherwise a
+        CUDA failure would surface later, in `for segment in ...`, where there
+        is no model left to retry on.
+        """
+        nonlocal model
+        try:
+            segments_iter, info = fn()
+            return list(segments_iter), info
+        except Exception as e:
+            if not _demote_to_cpu(e):
+                raise
+            model = _load_model()
+            segments_iter, info = fn()
+            return list(segments_iter), info
+
+    segments, info = _decode(_pass)
 
     # Collect segments and full text
     segments_list = []
     all_text_parts = []
 
-    for segment in segments_iter:
+    for segment in segments:
         all_text_parts.append(segment.text)
 
         text = segment.text.strip()
@@ -354,9 +446,10 @@ def transcribe_audio(audio_path: str, language: str = None) -> dict:
         print(f"[STT-v2] {gap:.1f}s after {covered:.1f}s was never transcribed "
               f"({speech:.1f}s of speech in it); going back for it")
         try:
-            more_iter, _ = _pass(clip=[covered, info.duration])
+            more_segments, _ = _decode(
+                lambda: _pass(clip=[covered, info.duration]))
             found = 0
-            for segment in more_iter:
+            for segment in more_segments:
                 if segment.end <= covered + 0.05 or not segment.text.strip():
                     continue
                 if segment.end - segment.start < MIN_RECOVERED_SEGMENT:

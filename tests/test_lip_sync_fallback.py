@@ -185,10 +185,32 @@ class ReportingTests(unittest.TestCase):
         self.assertEqual(row["state"], "done")
 
     def test_the_skip_is_warned_about_in_word(self):
-        job = _job(lip_sync={"skipped": True,
+        job = _job(lip_sync={"skipped": True, "no_face": True,
                              "reason": "No face detected anywhere in the video."})
         joined = " ".join(RS.warnings(job))
         self.assertIn("No face was found", joined)
+
+    def test_a_broken_lip_sync_is_a_fallback_with_its_own_reason(self):
+        # A failure that is NOT "no face" - a missing checkpoint, an audio
+        # decoder the environment broke - delays nothing that matters: the dub
+        # is finished. It must still be reported as a fallback, and reported
+        # with the real reason rather than "no face was found".
+        job = _job(lip_sync={"skipped": True, "no_face": False,
+                             "reason": "LipSyncError: Numba needs NumPy 2.2"})
+        row = next(r for r in RS.stage_rows(job) if r["key"] == "lip_syncing")
+        self.assertEqual(row["state"], "fallback")
+        joined = " ".join(RS.warnings(job))
+        self.assertIn("Lip sync did not run", joined)
+        self.assertIn("Numba", joined)
+        self.assertNotIn("No face was found", joined)
+
+    def test_the_delivery_helper_defaults_to_not_a_no_face_skip(self):
+        fake = types.SimpleNamespace(mux=lambda *a: None)
+        module = _app_functions({"_deliver_without_lip_sync"}, av_sync=fake)
+        note = module._deliver_without_lip_sync("/v.mp4", "/d.wav", "/o.mp4",
+                                                "ffmpeg encode failed")
+        self.assertFalse(note["no_face"])
+        self.assertEqual(note["reason"], "ffmpeg encode failed")
 
     def test_the_summary_carries_the_note_for_the_manifest(self):
         job = _job(lip_sync={"skipped": True, "reason": "no face"})

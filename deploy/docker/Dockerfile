@@ -44,8 +44,20 @@ RUN python3 -m pip install --upgrade pip setuptools wheel
 # Installed before the rest so pip does not drag in the CPU-only wheel from
 # PyPI when it resolves the ML stack below.
 RUN python3 -m pip install \
-        "torch>=2.2.0" "torchaudio>=2.2.0" "torchvision>=0.17.0" \
+        "torch==2.6.0+cu124" "torchaudio==2.6.0+cu124" "torchvision==0.21.0+cu124" \
         --index-url https://download.pytorch.org/whl/cu124
+
+# Pinned, not ranged: 2.6.0 is the last cu124 build, and CTranslate2
+# (faster-whisper's backend) dlopens libcublas.so.12 at the first encode. A CUDA
+# 13 build installs libcublas.so.13 instead, so a newer torch means every
+# transcription dies with "Library libcublas.so.12 is not found or cannot be
+# loaded" - after the job was accepted and the model loaded. Keep in step with
+# the torch ceiling in requirements.txt and the install cell in
+# deploy/notebooks/build_notebooks.py.
+RUN python3 -c "import torch, sys; \
+        v = torch.version.cuda or ''; \
+        print('torch', torch.__version__, '| CUDA', v); \
+        sys.exit(0 if v.startswith('12') else 1)"
 
 # --- everything else, from the pinned manifest -------------------------------
 # requirements.docker.txt is requirements.txt with the CUDA-specific comments
@@ -53,6 +65,14 @@ RUN python3 -m pip install \
 # edit does not invalidate the dependency layer.
 COPY deploy/docker/requirements.docker.txt /app/requirements.txt
 RUN python3 -m pip install -r /app/requirements.txt
+
+# The manifest does not name the torch stack, so a transitive dependency that
+# wants a newer torch can upgrade it here and silently put a CUDA 13 build back
+# in the image. Verify again, after everything is installed.
+RUN python3 -c "import torch, sys; \
+        v = torch.version.cuda or ''; \
+        print('torch', torch.__version__, '| CUDA', v); \
+        sys.exit(0 if v.startswith('12') else 1)"
 
 # --- the application ---------------------------------------------------------
 COPY . /app

@@ -4,16 +4,29 @@ uvicorn[standard]>=0.30.0
 python-multipart>=0.0.31   # < 0.0.31 has advisories in the upload parser
 pydantic>=2.6.0
 
-# Torch stack
-torch>=2.2.0
-torchaudio>=2.2.0
-torchvision>=0.17.0
+# Torch stack. The CUDA-12 code line is required, not cosmetic: CTranslate2
+# (faster-whisper's backend) is built against CUDA 12 and dlopens
+# libcublas.so.12 at the FIRST encode. torch >= 2.7 ships CUDA 13 wheels whose
+# cuBLAS is libcublas.so.13, so a hosted image that already had torch 2.11+cu130
+# satisfied `torch>=2.2.0` and every render then died ~6s in with
+# "RuntimeError: Library libcublas.so.12 is not found or cannot be loaded" -
+# after the model had loaded and the job had been accepted.
+# 2.6.0 is the last release published for cu124; see the install cell in
+# deploy/notebooks/build_notebooks.py, which force-installs that build.
+torch>=2.2.0,<2.7
+torchaudio>=2.2.0,<2.7
+torchvision>=0.17.0,<0.22
 
 # Audio / Video
 ffmpeg-python==0.2.0
 librosa>=0.10.0
 soundfile>=0.12.0
-numpy>=1.26.0
+# Numba (through librosa, which the voice engine and Wav2Lip both load audio
+# with) refuses NumPy newer than 2.2:
+#     "Numba needs NumPy 2.2 or less. Got NumPy 2.5."
+# IndicF5 then fails at boot and lip sync's warmup fails with it, so the dub
+# never gets a voice. Unpinned, a fresh install takes the newest NumPy.
+numpy>=1.26.0,<2.3
 scipy>=1.11.0
 opencv-python>=4.8.0
 

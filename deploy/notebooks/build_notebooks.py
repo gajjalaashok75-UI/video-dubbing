@@ -267,16 +267,60 @@ import subprocess
 import sys
 
 print("Installing the CUDA PyTorch build (the slow part)...")
-subprocess.run(
-    [sys.executable, "-m", "pip", "install", "-q",
-     "torch>=2.2.0", "torchaudio>=2.2.0", "torchvision>=0.17.0",
-     "--index-url", "https://download.pytorch.org/whl/cu124"],
-    check=True,
-)
 
-# The CUDA build must have won, or every render falls back to the CPU.
+# A CUDA build is not enough - it has to be a CUDA 12 one. CTranslate2
+# (faster-whisper's backend) dlopens libcublas.so.12 on the FIRST encode, and
+# torch >= 2.7 ships CUDA 13 wheels whose cuBLAS is libcublas.so.13. A hosted
+# image that already has a newer torch satisfies a bare `torch>=2.2.0`, so pip
+# leaves it in place and every render dies ~6s in with
+#
+#   RuntimeError: Library libcublas.so.12 is not found or cannot be loaded
+#
+# That is why this asks for the exact cu124 build and forces it over whatever
+# is already installed. 2.6.0 is the last release published for cu124.
+TORCH_PIN = ["torch==2.6.0+cu124", "torchaudio==2.6.0+cu124",
+             "torchvision==0.21.0+cu124"]
+TORCH_INDEX = "https://download.pytorch.org/whl/cu124"
+
+
+def _cuda12_torch():
+    # Is the torch that is importable right now a CUDA 12 build on a GPU?
+    try:
+        import torch
+    except Exception:
+        return False
+    return bool(torch.cuda.is_available()
+                and (torch.version.cuda or "").startswith("12"))
+
+
+if _cuda12_torch():
+    print("A CUDA 12 torch is already installed; skipping the reinstall")
+else:
+    subprocess.run(
+        [sys.executable, "-m", "pip", "install", "-q", *TORCH_PIN,
+         "--index-url", TORCH_INDEX, "--force-reinstall"],
+        check=True,
+    )
+
+# The CUDA build must have won, or every render falls back to the CPU - and a
+# CUDA 13 build does not fall back, it raises inside ctranslate2.
+#
+# `_cuda12_torch()` imported torch a moment ago, so it must be dropped before
+# this import: a module already in sys.modules is returned as-is, and this
+# would then report the CUDA major of the build that was just replaced.
+for _name in [m for m in list(sys.modules)
+              if m == "torch" or m.startswith("torch.")]:
+    del sys.modules[_name]
 import torch  # noqa: E402
 print("torch", torch.__version__, "| CUDA available:", torch.cuda.is_available())
+if not (torch.version.cuda or "").startswith("12"):
+    raise SystemExit(
+        f"torch {{torch.__version__}} is a CUDA {{torch.version.cuda}} build. "
+        "CTranslate2 needs CUDA 12 (libcublas.so.12), so transcription would "
+        "fail a few seconds into every render. Re-run this cell; if it keeps "
+        "happening, install " + " ".join(TORCH_PIN) + f" from {{TORCH_INDEX}} "
+        "by hand and read the pip output above."
+    )
 
 cmd = [sys.executable, "-m", "pip", "install", "-r", "requirements.txt"]
 print("Installing:", " ".join(cmd))
@@ -338,6 +382,30 @@ try:
     print("  demucs importable")
 except Exception as exc:
     print(f"  demucs not importable ({{exc}}); background preservation is off")
+
+# Re-assert the two pins a manual `pip install -U` breaks. Both are silent
+# until boot, where the voice model or NLLB simply fails to import:
+#
+#   NumPy  - numba (librosa's audio loader, used by the voice engine AND by
+#            Wav2Lip) refuses anything newer than 2.2:
+#                "Numba needs NumPy 2.2 or less. Got NumPy 2.5."
+#   transformers - 5.x cannot be installed next to the hub pin below, and the
+#            symptom is "cannot import name 'GenerationMixin'".
+PROBE = ("import numpy, numba, transformers, sys;"
+         "print(numpy.__version__);"
+         "sys.exit(0 if transformers.__version__.startswith('4.') else 1)")
+REPAIR = ["numpy>=1.26.0,<2.3", "transformers>=4.49,<5"]
+
+probe = subprocess.run([sys.executable, "-c", PROBE],
+                       capture_output=True, text=True)
+if probe.returncode != 0:
+    print("  NumPy or transformers is out of range; restoring the pins...")
+    subprocess.run([sys.executable, "-m", "pip", "install", "-q", *REPAIR],
+                   check=False)
+    probe = subprocess.run([sys.executable, "-c", PROBE],
+                           capture_output=True, text=True)
+print("  numpy", (probe.stdout or "?").strip(),
+      "(the voice model needs it at 2.2 or less)")
 
 print()
 print("Install complete. Run the Verify cell next.")
@@ -681,6 +749,9 @@ TROUBLE = md("""
 |---|---|
 | `The server did not become ready ...` | Re-run the install cell; a partial install is the usual cause. Read `server.log` (path printed by the server cell), or run the log cell. |
 | `ModuleNotFoundError: No module named 'torch'` | The CUDA install cell did not finish. Re-run it and read its output. |
+| `Library libcublas.so.12 is not found or cannot be loaded` | torch is a CUDA 13 build. CTranslate2 (faster-whisper) needs CUDA 12. Re-run the install cell: it force-installs `torch==2.6.0+cu124` whenever the torch it finds is not a CUDA 12 one. |
+| `Numba needs NumPy 2.2 or less. Got NumPy 2.5.` | Something installed a newer NumPy after the install cell (a manual `pip install -U transformers` does it). Re-run the install cell; it restores the `numpy<2.3` pin. |
+| `cannot import name 'GenerationMixin'` | transformers 5.x was installed over the pinned 4.x. Re-run the install cell; it restores the `transformers<5` pin. Do not `pip install -U transformers` in this runtime. |
 | `GPU: none - renders run on CPU` | The runtime is not a GPU one. Change it (see the top) and re-run from cell 1. |
 | `Still missing N required model(s)` | The model cell did not finish. Re-run it; it is resumable. Check the disk-space line it prints. |
 | A model says MISSING after it downloaded | The download was interrupted. Re-run the model cell. |

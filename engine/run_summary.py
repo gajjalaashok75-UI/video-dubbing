@@ -303,8 +303,16 @@ def warnings(job: dict) -> list:
 
     note = job.get("lip_sync") or {}
     if note.get("skipped"):
-        out.append("No face was found in the video, so the lips were not "
-                   "re-synced; the dub plays over the original picture.")
+        if note.get("no_face"):
+            out.append("No face was found in the video, so the lips were not "
+                       "re-synced; the dub plays over the original picture.")
+        else:
+            out.append("Lip sync did not run "
+                       f"({note.get('reason') or 'no reason recorded'}); the "
+                       "dub plays over the original picture.")
+
+    if job.get("stt_fallback"):
+        out.append(job["stt_fallback"])
 
     missing = [m for m in (job.get("missing_units") or [])]
     if missing:

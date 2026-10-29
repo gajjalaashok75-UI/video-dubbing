@@ -41,6 +41,22 @@ def av_spec(text: str) -> str | None:
     return match.group(1) if match else None
 
 
+def _bare_line(text: str, package: str) -> str | None:
+    """The uncommented line for `package`, with or without a version spec."""
+    pattern = re.compile(rf"^\s*{re.escape(package)}\s*([<>=!].*)?$",
+                         re.MULTILINE)
+    match = pattern.search(text)
+    return match.group(0) if match else None
+
+
+def spec_for(text: str, package: str) -> str | None:
+    """The version specifier on an uncommented `package` line, if any."""
+    pattern = re.compile(rf"^\s*{re.escape(package)}\s*([<>=!][^#\s]*)",
+                         re.MULTILINE)
+    match = pattern.search(text)
+    return match.group(1) if match else None
+
+
 def _version(text: str) -> tuple[int, ...]:
     return tuple(int(part) for part in text.split("."))
 
@@ -188,6 +204,140 @@ class AvPinTests(unittest.TestCase):
                 self.fail(f"PyAV {av.__version__} rejects metadata_errors: {e}")
             except Exception:  # noqa: BLE001 - accepted the kwarg, then failed on the file
                 pass
+
+
+class NumpyPinTests(unittest.TestCase):
+    """
+    Numba's NumPy ceiling, which no code path can catch.
+
+    A hosted run (Colab, 2026-10-29) had NumPy 2.5 alongside numba 0.61, which
+    librosa pulls in for audio loading. The voice model then failed to LOAD:
+
+        [BOOT] Loading voice model failed: Numba needs NumPy 2.2 or less.
+        Got NumPy 2.5.
+
+    and Wav2Lip's warmup failed with the same message. The package that has to
+    be held back is NumPy itself, so the ceiling is what is asserted.
+    """
+
+    FIRST_BAD = "2.3"
+    LAST_GOOD = "2.2.6"
+
+    def test_both_files_cap_numpy(self):
+        for path in (REQUIREMENTS, DOCKER_REQUIREMENTS):
+            with self.subTest(path=path.name):
+                spec = spec_for(path.read_text(encoding="utf-8"), "numpy")
+                self.assertIsNotNone(
+                    spec, f"{path} does not pin numpy; a fresh install takes "
+                          "the newest release and numba refuses it")
+
+    def test_the_cap_excludes_the_numpy_that_broke_the_voice_model(self):
+        for path in (REQUIREMENTS, DOCKER_REQUIREMENTS):
+            with self.subTest(path=path.name):
+                spec = spec_for(path.read_text(encoding="utf-8"), "numpy")
+                self.assertFalse(satisfies(self.FIRST_BAD, spec),
+                                 f"numpy spec {spec!r} allows 2.3+, which "
+                                 "numba refuses")
+
+    def test_the_cap_still_allows_a_numpy_numba_accepts(self):
+        for path in (REQUIREMENTS, DOCKER_REQUIREMENTS):
+            with self.subTest(path=path.name):
+                spec = spec_for(path.read_text(encoding="utf-8"), "numpy")
+                self.assertTrue(satisfies(self.LAST_GOOD, spec),
+                                f"numpy spec {spec!r} rejects {self.LAST_GOOD}")
+
+    def test_the_two_files_agree(self):
+        self.assertEqual(
+            spec_for(REQUIREMENTS.read_text(encoding="utf-8"), "numpy"),
+            spec_for(DOCKER_REQUIREMENTS.read_text(encoding="utf-8"), "numpy"),
+            "the numpy pin drifted between requirements.txt and the Docker copy")
+
+
+class TorchPinTests(unittest.TestCase):
+    """
+    The CUDA-12 torch line, which CTranslate2's libcublas.so.12 depends on.
+
+    A hosted run had torch 2.11.0+cu130 installed, which satisfies a bare
+    `torch>=2.2.0`, so the cu124 install cell left it alone. CTranslate2 then
+    died on the first encode with "Library libcublas.so.12 is not found or
+    cannot be loaded" and every render failed ~6 seconds in.
+    """
+
+    FIRST_BAD = "2.7"
+    LAST_GOOD = "2.6.0"
+
+    def test_numpy_is_not_mentioned_before_its_pin(self):
+        # Guard against a stray extra `numpy` line that would re-open the range.
+        for path in (REQUIREMENTS, DOCKER_REQUIREMENTS):
+            with self.subTest(path=path.name):
+                lines = [ln for ln in path.read_text(encoding="utf-8").splitlines()
+                         if ln.strip().startswith("numpy")]
+                self.assertEqual(len(lines), 1, f"{path} names numpy {len(lines)} "
+                                 "times; one pin only")
+
+    def test_the_torch_cap_excludes_the_cuda_13_wheels(self):
+        spec = spec_for(REQUIREMENTS.read_text(encoding="utf-8"), "torch")
+        self.assertIsNotNone(spec)
+        self.assertFalse(satisfies(self.FIRST_BAD, spec),
+                         f"torch spec {spec!r} allows 2.7+, whose CUDA 13 "
+                         "cuBLAS is libcublas.so.13")
+
+    def test_the_torch_cap_allows_the_last_cu124_release(self):
+        spec = spec_for(REQUIREMENTS.read_text(encoding="utf-8"), "torch")
+        self.assertTrue(satisfies(self.LAST_GOOD, spec),
+                        f"torch spec {spec!r} rejects {self.LAST_GOOD}, the "
+                        "last build published for cu124")
+
+    def test_the_companion_packages_share_the_cap(self):
+        # torchaudio/torchvision are versioned with torch; a mismatch here is
+        # its own pip error at install time.
+        text = REQUIREMENTS.read_text(encoding="utf-8")
+        for package in ("torchaudio", "torchvision"):
+            with self.subTest(package=package):
+                self.assertIsNotNone(spec_for(text, package),
+                                     f"{package} needs a ceiling too")
+
+    def test_the_docker_file_keeps_torch_out(self):
+        # The Dockerfile installs torch from the cu124 index in its own layer;
+        # naming it here would pull the wrong wheels from PyPI.
+        text = DOCKER_REQUIREMENTS.read_text(encoding="utf-8")
+        for package in ("torch", "torchaudio", "torchvision"):
+            with self.subTest(package=package):
+                self.assertIsNone(
+                    _bare_line(text, package),
+                    f"requirements.docker.txt must not install {package}; "
+                    "the Dockerfile does it from the cu124 index")
+
+    def test_the_dockerfile_pins_the_cu124_build(self):
+        dockerfile = (ROOT / "deploy" / "docker" / "Dockerfile").read_text(
+            encoding="utf-8")
+        self.assertIn("torch==2.6.0+cu124", dockerfile,
+                      "the Dockerfile must pin the CUDA 12 build, not a range")
+        self.assertIn("torch.version.cuda", dockerfile,
+                      "the build should assert the CUDA major it got")
+
+
+class NotebookTorchTests(unittest.TestCase):
+    """The Colab/Kaggle install cell must force the CUDA 12 build."""
+
+    def setUp(self):
+        self.generator = (ROOT / "deploy" / "notebooks" /
+                          "build_notebooks.py").read_text(encoding="utf-8")
+
+    def test_the_install_cell_pins_the_cu124_build(self):
+        self.assertIn("torch==2.6.0+cu124", self.generator)
+
+    def test_the_install_cell_forces_the_install(self):
+        # A hosted image already has a newer torch; a plain `pip install`
+        # considers the requirement satisfied and leaves the wrong CUDA level
+        # in place, which is exactly how the broken run happened.
+        self.assertIn("--force-reinstall", self.generator)
+
+    def test_the_install_cell_checks_the_cuda_major(self):
+        self.assertIn("torch.version.cuda", self.generator)
+
+    def test_the_install_cell_re_asserts_the_numpy_cap(self):
+        self.assertIn("numpy>=1.26.0,<2.3", self.generator)
 
 
 if __name__ == "__main__":

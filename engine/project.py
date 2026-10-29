@@ -44,10 +44,14 @@ PERSISTED = (
     "stems",
     # Phase 6: display names, and the per-speaker voice scores.
     "speaker_aliases", "speaker_voice_match",
-    # `{skipped, reason}` when the clip had no face to sync. Persisted so a
+    # `{skipped, reason, no_face}` when lip sync did not run. Persisted so a
     # reopened project does not claim its lips were re-synced, and so the run
     # summary keeps saying why the picture is unchanged.
     "lip_sync",
+    # Why transcription fell back to the CPU (a GPU that cannot be used at
+    # all). Persisted so the "this render was slow and here is why" warning
+    # survives a reload instead of disappearing with the job dict.
+    "stt_fallback",
 )
 
 

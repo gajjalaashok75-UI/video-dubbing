@@ -310,6 +310,30 @@
 - In the notebooks and the Dockerfile the CUDA PyTorch wheels are installed
   FIRST, from the cu124 index. Installing `requirements.txt` alone pulls the
   CPU-only wheels and every render silently falls back to the CPU.
+- It must be a **CUDA 12** torch, not just a CUDA one. CTranslate2
+  (faster-whisper) dlopens `libcublas.so.12` on the first encode; torch >= 2.7
+  ships CUDA 13 wheels whose cuBLAS is `libcublas.so.13`. A hosted image that
+  already had torch 2.11+cu130 satisfied the old `torch>=2.2.0`, so the cu124
+  install did nothing and every render died ~6s in (`Library libcublas.so.12 is
+  not found or cannot be loaded`). `requirements.txt` caps the torch stack at
+  `<2.7`, the Dockerfile pins `2.6.0+cu124` and asserts `torch.version.cuda`,
+  and the notebook cell force-installs that build whenever the torch it finds
+  is not CUDA 12. Keep the three in step.
+- `speech_to_text_v2` retries on the CPU when the GPU cannot be used at all
+  (`_demote_to_cpu`, `fallback_reason()`). A missing CUDA library is not
+  fixable by a smaller model or a decode setting, and ctranslate2 only touches
+  the GPU when the first segment is pulled - hence `_decode` drains the
+  generator inside the retry. Do not let a CUDA failure fail a job: the render
+  is slower, not broken, and the summary says why via `stt_fallback`.
+- NumPy is capped at `<2.3` because numba (through librosa, which the voice
+  engine and Wav2Lip both load audio with) refuses anything newer: "Numba needs
+  NumPy 2.2 or less". Unpinned, IndicF5 fails to load at boot and Wav2Lip's
+  warmup fails with it. The notebook re-asserts the pin after the optional
+  extras, since `pip install -U transformers` can pull a newer NumPy in.
+- Lip sync is non-fatal in both render paths: `NoFaceDetected` and any other
+  `LipSyncError` mux the dub onto the untouched picture via
+  `_deliver_without_lip_sync`. `no_face` in the job's `lip_sync` note is what
+  makes the run summary say "no face" rather than "lip sync did not run".
 - `deploy/docker/entrypoint.sh` subcommands take their own name out of `$@`
   (`"${@:2}"`); a bare `"$@"` forwards `models` as a flag and the script rejects it.
 - Docker build context is the repo root. `.dockerignore` (root) and
