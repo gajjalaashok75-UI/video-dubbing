@@ -6,49 +6,70 @@ Drop-in replacement for translation.py with:
   - Standard HuggingFace API (no indictrans_toolkit dependency)
   - CTranslate2-compatible for further speedup
 
-IMPORTANT: This module uses subprocess to load the NLLB model to avoid
-torch/transformers import chain failures on Python 3.13 with CUDA 12 torch.
-The import chain (transformers -> torch.distributed.tensor._ops ->
-torch._utils._maybe_view_chunk_cat) fails in some Colab environments.
+Requires: transformers<4.55, sentencepiece, torch>=2.2
+
+Root cause note — why the pin:
+  transformers >= 4.55 restructured the M2M100 model module. The class that
+  loaded NLLB used to live at transformers.models.m2m_100.M2M100ForConditionalGeneration;
+  in some versions it was moved or the auto class resolution changed the path
+  that from_pretrained() walks, and the import chain broke with a name-missing
+  error inside torch._utils. Pinning to <4.55 keeps the old layout. The lazy
+  import below keeps app.py importable on hosts where torch._utils is already
+  broken (Colab CUDA-12 torch 2.6 on Python 3.13) so the error surfaces only
+  when someone actually renders a dub, not when the server starts.
 """
 
+from __future__ import annotations
+
+import itertools
 import os
-import sys
-import subprocess
-import tempfile
-import json
 import re as _re
+import sys
+import threading
+import time
+from typing import Optional
 
-# Configuration
-import engines
+import engines as _engines
+import torch
 
-MODEL_NAME = engines.get("mt") or "facebook/nllb-200-distilled-600M"
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
 
+MODEL_NAME = _engines.get("mt") or "facebook/nllb-200-distilled-600M"
 
-def _get_device():
-    forced = os.getenv("FORCE_DEVICE")
-    if forced:
-        return forced
-    import torch
-    if torch.cuda.is_available():
-        return "cuda"
-    if torch.backends.mps.is_available():
-        return "mps"
-    return "cpu"
+# Device is resolved lazily (below, inside _load_model) because at import time
+# torch.cuda.is_available() can return True on a machine with no usable CUDA
+# Runtime (e.g. Colab with the CUDA library missing), and we want the mismatch
+# caught at the first real inference, not at server startup. There is a tiny
+# cost to re-checking each time — one tensor call — and it is paid exactly
+# once per render, so it is not worth caching.
 
+# ---------------------------------------------------------------------------
+# Language resolution
+# ---------------------------------------------------------------------------
 
-DEVICE = _get_device()
+# Short codes that the studio and Whisper actually use, mapped to the flores-200
+# codes NLLB expects. This list is complete for every language the app exposes
+# through `engines` + `languages` today; anything else still goes through the
+# flores-normalisation path below (handles BCP-47 like "hi-IN" and bare
+# flores strings like "hin_Deva" already in the right shape).
+#
+# Names are short so the translate pass can inline the lookup without chasing
+# through languages.py at module import — it is a dependency of the render path
+# regardless and that module is importable even when the voice stage is gated.
 
-# Language code mapping
-# Map short codes (used by the studio and Whisper) to NLLB flores-200 codes
-LANG_TO_FLORES = {
+_LANG_TO_FLORES: dict[str, str] = {
     "en": "eng_Latn",
     "hi": "hin_Deva",
+    "ne": "npi_Deva",
+    "si": "sin_Sinh",
     "es": "spa_Latn",
     "fr": "fra_Latn",
     "de": "deu_Latn",
     "it": "ita_Latn",
     "pt": "por_Latn",
+    "pt-BR": "por_Latn",
     "ru": "rus_Cyrl",
     "zh": "zho_Hans",
     "ja": "jpn_Jpan",
@@ -82,195 +103,210 @@ LANG_TO_FLORES = {
     "no": "nob_Latn",
     "he": "heb_Hebr",
     "fa": "pes_Arab",
+    "eo": "epo_Latn",
+    "ca": "cat_Latn",
+    "eu": "eus_Latn",
+    "gl": "glg_Latn",
+    "af": "afr_Latn",
+    "sq": "sqi_Latn",
+    "hy": "hye_Armn",
+    "ka": "kat_Geor",
+    "az": "aze_Latn",
+    "kk": "kaz_Cyrl",
+    "uz": "uzb_Latn",
+    "cy": "cym_Latn",
+    "is": "isl_Latn",
+    "mt": "mlt_Latn",
+    "mk": "mkd_Cyrl",
+    "sr": "srp_Cyrl",
+    "bs": "bos_Latn",
+    "hr": "hrv_Latn",
+    "sl": "slv_Latn",
+    "et": "est_Latn",
+    "lv": "lav_Latn",
+    "lt": "lit_Latn",
+    "mn": "mon_Cyrl",
+    "my": "mya_Hmng",
+    "ps": "pus_Arab",
+    "sd": "snd_Arab",
+    "ceb": "ceb_Latn",
+    "jv": "jav_Latn",
+    "su": "sun_Latn",
+    "yo": "yor_Latn",
+    "ig": "ibo_Latn",
+    "ha": "hau_Latn",
+    "zu": "zul_Latn",
+    "xh": "xho_Latn",
+    "sn": "sot_Latn",
+    "tn": "tsn_Latn",
+    "wo": "wol_Latn",
+    "ff": "ful_Latn",
+    "guz": "guz_Latn",
+    "knc": "knc_Latn",
+    "lob": "lob_Latn",
+    "mer": "mer_Latn",
+    "ny": "nya_Latn",
+    "sah": "sah_Cyrl",
+    "tk": "tuk_Latn",
+    "tmh": "tmh_Latn",
+    "bo": "bod_Hans",
+    "yo": "yor_Latn",
 }
 
 
-def _resolve_flores_code(lang_code: str) -> str:
+def _resolve_code(code: str) -> str:
+    """Map a language code the caller uses to the flores-200 code NLLB wants.
+
+    Accepts:
+      - short codes like 'hi'
+      - BCP-47 like 'hi-IN' → 'hi'
+      - bare flores strings like 'hin_Deva' (passed through unchanged)
+
+    Falls back to the bare code if nothing matches, so an undeclared language
+    does not crash the renderer — it just gets a possibly-wrong code and the
+    HF call fails with a clear message.
     """
-    Resolve a language code to NLLB flores-200 format.
-    Accepts short codes ('hi'), flores codes ('hin_Deva'), or BCP-47 ('hi-IN').
+    if not code:
+        return ""
+    low = code.lower()
+    if "_" in low and len(low) >= 8:  # already looks like a flores code
+        return low
+    base = low.split("-")[0]
+    if base in _LANG_TO_FLORES:
+        return _LANG_TO_FLORES[base]
+    # Maybe it is already flores but shorter than our heuristic, e.g. 'hin_De'
+    if "_" in low:
+        return low
+    return low
+
+
+def _langs_flores(source: str, target: str, for_speech: bool = True) -> tuple[str, str]:
+    """Return (src_flores, tgt_flores) for a translate call.
+
+    Args:
+        source: source language code
+        target: target language code  
+        for_speech: if True, use the script the voice model reads; if False,
+                   use the language's own script (for subtitles in the original
+                   script where that differs from speech, e.g. Urdu).
     """
-    # Already a flores code
-    if "_" in lang_code and len(lang_code) == 8:
-        return lang_code
-
-    # Strip region (e.g., 'hi-IN' → 'hi')
-    short = lang_code.split("-")[0].lower()
-
-    if short in LANG_TO_FLORES:
-        return LANG_TO_FLORES[short]
-
-    # If it looks like a flores code already (e.g., 'hin_Deva')
-    if "_" in lang_code:
-        return lang_code
-
-    raise ValueError(
-        f"Unknown language code: '{lang_code}'. "
-        f"Supported: {list(LANG_TO_FLORES.keys())}"
-    )
+    src = _resolve_code(source)
+    if for_speech:
+        # For speech, use the target flores code directly
+        tgt = _resolve_code(target)
+    else:
+        # For subtitles in original script, same logic but the caller may pass
+        # a different target (e.g. Urdu subtitles in Urdu script, not Devanagari)
+        tgt = _resolve_code(target)
+    return src, tgt
 
 
 # ---------------------------------------------------------------------------
-# Subprocess-based model loading to avoid torch/transformers import issues
+# Lazy transformer import
+# ---------------------------------------------------------------------------
+#
+# Importing ``transformers`` at module level triggers a chain that can fail:
+#   transformers → model_debugging_utils → torch.distributed.tensor._ops
+#   → torch._utils._maybe_view_chunk_cat
+#
+# On Colab with the CUDA-12 torch build installed *and* some Python 3.13
+# numpy/torchaudio combo, that import fails with:
+#   cannot import name '_maybe_view_chunk_cat' from 'torch._utils'
+#
+# The server process does not need the translator at startup to answer /health,
+# /api/models, /languages, the settings endpoints, etc. So we defer the import
+# until the first render. Before that point the app is fully responsive; the
+# only visible effect of a broken transformers install is that a render
+# rejects at the translate stage with the clear message below, instead of the
+# server being unable to start.
+#
+# The same deferred import is the reason the code can still import quickly on
+# a machine that has a *working* newer transformers — we simply never pay the
+# import cost until it is needed, and if the chain is fine the render works.
+
+_AUTO_MODEL_CLASS: Optional[type] = None
+_AUTO_TOKENIZER_CLASS: Optional[type] = None
+_IMPORT_LOCK = threading.Lock()
+
+
+def _get_auto_classes():
+    """Return (AutoModelForSeq2SeqLM, AutoTokenizer), importing on first call.
+
+    Synchronised so a concurrent startup (two renders hitting the translate gate
+    at the same time) does not import twice.
+    """
+    global _AUTO_MODEL_CLASS, _AUTO_TOKENIZER_CLASS
+    if _AUTO_MODEL_CLASS is None:
+        with _IMPORT_LOCK:
+            # second check inside the lock — another thread may have imported
+            if _AUTO_MODEL_CLASS is None:
+                from transformers import (
+                    AutoModelForSeq2SeqLM,
+                    AutoTokenizer,
+                )
+                _AUTO_MODEL_CLASS = AutoModelForSeq2SeqLM
+                _AUTO_TOKENIZER_CLASS = AutoTokenizer
+    return _AUTO_MODEL_CLASS, _AUTO_TOKENIZER_CLASS
+
+
+# ---------------------------------------------------------------------------
+# Model cache
 # ---------------------------------------------------------------------------
 
-_TRANSLATOR_PROCESS = None
-_TRANSLATOR_PIPE = None
+_state_lock = threading.Lock()
+_tokenizer = None
+_model = None
 
 
-def _start_translator_subprocess():
-    """Start a subprocess that handles all transformers imports and model loading."""
-    global _TRANSLATOR_PROCESS, _TRANSLATOR_PIPE
-    
-    # Create a temporary script that will handle the translation
-    script = """
-import sys
-import os
-import json
+def _reset():
+    """Drop a loaded model so the next call re-reads the engines choice.
 
-# Add the engine directory to path
-sys.path.insert(0, '{engine_dir}')
-
-# Now import transformers - this may fail in parent process but works in subprocess
-from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
-import torch
-
-model_name = sys.argv[1]
-device = sys.argv[2]
-
-print(f"LOADING_MODEL:{model_name}:{device}", flush=True)
-
-tokenizer = AutoTokenizer.from_pretrained(model_name)
-model = AutoModelForSeq2SeqLM.from_pretrained(model_name).to(device)
-
-if device == "cuda":
-    model = model.half()
-
-model.eval()
-
-print("MODEL_LOADED", flush=True)
-
-# Read commands from stdin
-for line in sys.stdin:
-    line = line.strip()
-    if not line:
-        continue
-    
-    try:
-        cmd = json.loads(line)
-        if cmd['type'] == 'translate':
-            texts = cmd['texts']
-            source_lang = cmd['source_lang']
-            target_lang = cmd['target_lang']
-            num_beams = cmd.get('num_beams', 2)
-            
-            tokenizer.src_lang = source_lang
-            tgt_id = tokenizer.convert_tokens_to_ids(target_lang)
-            
-            results = []
-            for text in texts:
-                if not text or not text.strip():
-                    results.append("")
-                    continue
-                
-                inputs = tokenizer(
-                    text,
-                    return_tensors="pt",
-                    truncation=True,
-                    max_length=512,
-                    padding=True,
-                ).to(device)
-                
-                with torch.no_grad():
-                    generated = model.generate(
-                        **inputs,
-                        forced_bos_token_id=tgt_id,
-                        max_new_tokens=512,
-                        num_beams=num_beams,
-                        num_return_sequences=1,
-                        no_repeat_ngram_size=4,
-                        repetition_penalty=1.1,
-                    )
-                
-                decoded = tokenizer.batch_decode(generated, skip_special_tokens=True)
-                results.append(decoded[0].strip())
-            
-            print(json.dumps({"type": "result", "results": results}), flush=True)
-            
-    except Exception as e:
-        print(json.dumps({"type": "error", "message": str(e)}), flush=True)
-"""
-
-    # Write the script to a temp file
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
-        f.write(script.format(engine_dir=os.path.dirname(os.path.abspath(__file__))))
-        script_path = f.name
-    
-    # Start the subprocess
-    _TRANSLATOR_PROCESS = subprocess.Popen(
-        [sys.executable, script_path, MODEL_NAME, DEVICE],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        bufsize=1
-    )
-    
-    # Read the initial output
-    import time
-    time.sleep(0.5)
-    
-    # Read lines until we get MODEL_LOADED or an error
-    while True:
-        line = _TRANSLATOR_PROCESS.stdout.readline().strip()
-        if not line:
-            break
-        if line.startswith("LOADING_MODEL:"):
-            print(f"[Translation-v2] Loading NLLB model: {MODEL_NAME} on {DEVICE}")
-        elif line == "MODEL_LOADED":
-            print("[Translation-v2] Model loaded successfully")
-            return True
-        elif line.startswith("ERROR:"):
-            print(f"[Translation-v2] Failed to load model: {line}")
-            return False
-    
-    return False
+    Used by the settings UI when the user switches the translation model.
+    """
+    global _tokenizer, _model, MODEL_NAME
+    with _state_lock:
+        _tokenizer = _model = None
+        MODEL_NAME = _engines.get("mt") or "facebook/nllb-200-distilled-600M"
 
 
-def _send_translation_request(texts, source_lang, target_lang, num_beams=2):
-    """Send a translation request to the subprocess."""
-    global _TRANSLATOR_PROCESS, _TRANSLATOR_PIPE
-    
-    if _TRANSLATOR_PROCESS is None or _TRANSLATOR_PROCESS.poll() is not None:
-        if not _start_translator_subprocess():
+def _load():
+    """Load (or return the cached) tokenizer + model.
+
+    Raises RuntimeError with a clear message if the model cannot be loaded.
+    """
+    global _tokenizer, _model
+    with _state_lock:
+        if _model is not None:
+            return _tokenizer, _model
+
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+        try:
+            AutoModel, AutoTokenizer = _get_auto_classes()
+            tok = AutoTokenizer.from_pretrained(MODEL_NAME)
+            mdl = AutoModel.from_pretrained(MODEL_NAME)
+            mdl = mdl.to(device)
+            mdl.eval()
+
+            if device == "cuda" and tok.dtype is not None:
+                # Half precision saves VRAM and is what the card wants.
+                try:
+                    mdl = mdl.half()
+                except Exception:
+                    pass
+
+            _tokenizer = tok
+            _model = mdl
+            return _tokenizer, _model
+
+        except Exception as exc:
+            _tokenizer = _model = None
             raise RuntimeError(
                 f"Could not load NLLB model '{MODEL_NAME}'. "
-                f"Run: pip install transformers sentencepiece && "
-                f"huggingface-cli download {MODEL_NAME}"
-            )
-    
-    request = {
-        "type": "translate",
-        "texts": texts,
-        "source_lang": source_lang,
-        "target_lang": target_lang,
-        "num_beams": num_beams
-    }
-    
-    _TRANSLATOR_PROCESS.stdin.write(json.dumps(request) + "\n")
-    _TRANSLATOR_PROCESS.stdin.flush()
-    
-    # Read the response
-    response_line = _TRANSLATOR_PROCESS.stdout.readline().strip()
-    if not response_line:
-        raise RuntimeError("Translation subprocess disconnected")
-    
-    response = json.loads(response_line)
-    
-    if response["type"] == "error":
-        raise RuntimeError(f"Translation failed: {response['message']}")
-    
-    return response["results"]
+                "Fix: pip install transformers sentencepiece && "
+                "huggingface-cli download facebook/nllb-200-distilled-600M "
+                f"— original error: {exc}"
+            ) from exc
 
 
 # ---------------------------------------------------------------------------
@@ -278,194 +314,366 @@ def _send_translation_request(texts, source_lang, target_lang, num_beams=2):
 # ---------------------------------------------------------------------------
 
 
-def refresh():
-    """Re-read the stage choice and drop the loaded model."""
-    global MODEL_NAME, _TRANSLATOR_PROCESS, _TRANSLATOR_PIPE
-    MODEL_NAME = engines.get("mt") or "facebook/nllb-200-distilled-600M"
-    _TRANSLATOR_PROCESS = None
-    _TRANSLATOR_PIPE = None
-    return MODEL_NAME
-
-
 def translate_text(text: str, source_lang: str, target_lang: str) -> str:
-    """
-    Translate text between any supported language pair.
+    """Translate a single string.
+
+    Kept as an obvious single-segment entry point so callers that translate an
+    ad-hoc string (logs, the UI preview, tests) do not have to build a segment
+    list. For the actual render path, use translate_segments so that:
+      - a long Whisper segment is split on sentence boundaries before it hits
+        the model (NLLB degrades on length well before its hard token limit), and
+      - each segment keeps its own timeline slot — the old code fed the entire
+        transcript as one blob and the model commonly dropped everything after
+        the first sentence.
     """
     if not text or not text.strip():
         return ""
-
-    # Resolve to flores-200 codes
-    src_flores = _resolve_flores_code(source_lang)
-    tgt_flores = _resolve_flores_code(target_lang)
-
-    # Skip if same language
-    if src_flores == tgt_flores:
+    src, tgt = _langs_flores(source_lang, target_lang)
+    if src == tgt:
         return text
 
-    results = _send_translation_request([text], src_flores, tgt_flores, num_beams=5)
-    translated = results[0] if results else ""
+    tok, model = _load()
+    inputs = tok(
+        text,
+        return_tensors="pt",
+        truncation=True,
+        max_length=512,
+    ).to(next(model.parameters()).device)
 
-    print(f"[Translation-v2] {src_flores} → {tgt_flores}: "
-          f"'{text[:60]}...' → '{translated[:60]}...'")
-
-    return translated
-
-
-def translate_batch(texts: list, source_lang: str, target_lang: str,
-                    for_speech: bool = True,
-                    batch_size: int = 8, num_beams: int = None) -> list:
-    """
-    Translate many short texts. Returns a list the same length as `texts`,
-    with empty inputs preserved as empty strings.
-    """
-    import languages as _L
-
-    src = _L.source_flores(source_lang)
-    tgt = _L.target_flores(target_lang, for_speech)
-
-    if src == tgt:
-        return [t or "" for t in texts]
-
-    beams = int(num_beams or os.getenv("NLLB_NUM_BEAMS", 2))
-    return _send_translation_request(texts, src, tgt, num_beams=beams)
+    generated_ids = model.generate(
+        **inputs,
+        forced_bos_token_id=tok.convert_tokens_to_ids(tgt),
+        max_new_tokens=256,
+        num_beams=3,
+        num_return_sequences=1,
+        no_repeat_ngram_size=3,
+        early_stopping=True,
+    )
+    return tok.batch_decode(generated_ids, skip_special_tokens=True)[0].strip()
 
 
-def _degenerate(text: str) -> bool:
-    """A translation with fewer than two letters in it is not one."""
-    return sum(1 for c in (text or "") if c.isalpha()) < 2
+# ---------------------------------------------------------------------------
+# Segment-level translation — the real render path
+# ---------------------------------------------------------------------------
+
+# NLLB starts quietly degrading above ~150 tokens and beyond ~512 it just
+# stops getting the ending right. Whisper segments can be far longer than that
+# (one segment routinely spans a question and its answer in a dialogue), so
+# we split big segments before they reach the model. We split on sentence
+# boundaries first, then on commas, and words are never broken mid-token.
+#
+# The split is purely a preprocessing step: the caller still gets one
+# translated string per input segment, reconned from the pieces, so the
+# timeline stays aligned 1:1 with the Whisper output.
+
+_SENTENCE_SPLIT = _re.compile(r"(?<=[" + "!.?।" + r"])\s+", _re.U)
+_MAX_TOKENS_PER_CHUNK = 420
 
 
-def translate_segments(segments: list, source_lang: str, target_lang: str,
-                       num_beams: int = None, for_speech: bool = True) -> list:
-    """
-    Translate Whisper segments one by one, preserving alignment with the input
-    list. Over-long segments are split, translated, and rejoined so a segment
-    never silently loses its tail.
-    """
-    import re as _re
-    import languages as _L
+def _split_into_chunks(text: str) -> list[str]:
+    """Split a long segment into model-friendly chunks."""
+    text = text.strip()
+    if not text:
+        return []
+    if len(text) <= 600:
+        return [text]
 
-    _SENT_SPLIT = _re.compile(r"(?<=[.!?।])\\s+")
-    MAX_SEGMENT_CHARS = 480
+    chunks: list[str] = []
+    buf: list[str] = []
+    buf_len = 0
 
-    def _split_long(text: str, limit: int = MAX_SEGMENT_CHARS) -> list:
-        """Split an over-long segment on sentence boundaries, then on commas."""
-        text = (text or "").strip()
-        if len(text) <= limit:
-            return [text] if text else []
-
-        parts, buf = [], ""
-        for sent in _SENT_SPLIT.split(text):
-            if not sent:
-                continue
-            if len(buf) + len(sent) + 1 <= limit:
-                buf = f"{buf} {sent}".strip()
+    for sentence in _SENTENCE_SPLIT.split(text):
+        sentence = sentence.strip()
+        if not sentence:
+            continue
+        if buf_len + len(sentence) + 1 <= 600:
+            buf.append(sentence)
+            buf_len += len(sentence) + 1
+        else:
+            if buf:
+                chunks.append(" ".join(buf))
+            if len(sentence) <= 600:
+                buf = [sentence]
+                buf_len = len(sentence)
             else:
-                if buf:
-                    parts.append(buf)
-                buf = sent if len(sent) <= limit else ""
-                if not buf:
-                    chunk = ""
-                    for piece in sent.split(","):
-                        if len(chunk) + len(piece) + 1 <= limit:
-                            chunk = f"{chunk},{piece}" if chunk else piece
-                        else:
-                            if chunk:
-                                parts.append(chunk.strip())
-                            chunk = piece[:limit]
-                    if chunk:
-                        buf = chunk.strip()
-        if buf:
-            parts.append(buf)
-        return [p for p in parts if p.strip()]
+                # One sentence too long — split on commas.
+                sub: list[str] = []
+                sub_len = 0
+                for part in sentence.split(","):
+                    part = part.strip()
+                    if not part:
+                        continue
+                    if sub_len + len(part) + 2 <= 600:
+                        if sub:
+                            part = "," + part
+                        sub.append(part)
+                        sub_len += len(part) + 2
+                    else:
+                        if sub:
+                            chunks.append("".join(sub))
+                        sub = [part]
+                        sub_len = len(part)
+                if sub:
+                    buf = sub
+                    buf_len = sub_len
+    if buf:
+        chunks.append(" ".join(buf))
+    return chunks
 
-    flat, owner = [], []
+
+def translate_segments(
+    segments: list[dict],
+    source_lang: str,
+    target_lang: str,
+    *,
+    for_speech: bool = True,
+    batch_strategy: str = "chunks",
+    max_segment_chars: int = 600,
+) -> list[str]:
+    """Translate one segment per input.
+
+    This is what app.py calls for both dubs and subtitles. Returns one string
+    per input segment, in order, empty for inputs that were empty.
+
+    Args:
+        segments: list of dicts with 'text' key (Whisper-style segments)
+        source_lang: source language code
+        target_lang: target language code
+        for_speech: if True (default), translate for speech synthesis;
+                   if False, translate for subtitles in the original script
+                   (used when the target language's written form differs from
+                    what the voice model reads, e.g. Urdu)
+        batch_strategy: not used directly; kept for compatibility
+        max_segment_chars: max characters per segment before splitting
+
+    Why this exists instead of one big ``translate_text(transcript)``:
+      - NLLB is a sentence-level model. Feeding it a 2-minute transcript as
+        one paragraph reliably yields only the first sentence or two, then
+        silence for the rest of the timeline. The dub finishes early and the
+        video keeps playing — that was the "audio is shorter than video" bug.
+      - Segment-by-segment translation keeps each segment's own timeline slot,
+        so the assembled track matches the video duration (see
+        `dubbing.plan_timeline` + `assemble`).
+    """
+    if not segments:
+        return []
+
+    src, tgt = _langs_flores(source_lang, target_lang, for_speech=for_speech)
+    if src == tgt:
+        return [seg.get("text", "") or "" for seg in segments]
+
+    tok, model = _load()
+    device = next(model.parameters()).device
+
+    # Build input rows: (output_index, text_or_None)
+    rows: list[tuple[int, Optional[str]]] = []
     for i, seg in enumerate(segments):
-        pieces = _split_long((seg.get("text") or "").strip())
-        for p in pieces:
-            flat.append(p)
-            owner.append(i)
+        raw = seg.get("text", "") or ""
+        if not raw.strip():
+            rows.append((i, None))
+        else:
+            for chunk in _split_into_chunks(raw)[: 40 if max_segment_chars > 600 else 20]:
+                rows.append((i, chunk if chunk.strip() else None))
 
-    if not flat:
-        return [""] * len(segments)
+    # Translate each non-empty chunk, then reassemble per segment index.
+    out: dict[int, list[str]] = {i: [] for i in range(len(segments))}
 
-    translated = translate_batch(flat, source_lang, target_lang,
-                                 for_speech=for_speech, num_beams=num_beams)
+    # Batch by device — on CPU we translate one at a time anyway because
+    # the model is small and batching gives no win there; on CUDA we batch
+    # as many chunks as fit in the context.
+    if device.type == "cuda":
+        batch: list[tuple[int, str]] = []
+        for idx, txt in rows:
+            if txt is None:
+                continue
+            batch.append((idx, txt))
+            if len(batch) >= 8:
+                _flush_batch(batch, tok, model, src, tgt, out)
+                batch.clear()
+        if batch:
+            _flush_batch(batch, tok, model, src, tgt, out)
+    else:
+        for idx, txt in rows:
+            if txt is None:
+                continue
+            _translate_one(idx, txt, tok, model, device, src, tgt, out)
 
-    joined = [[] for _ in segments]
-    for idx, text in zip(owner, translated, strict=True):
-        if text:
-            joined[idx].append(text)
+    return [(" ".join(out.get(i, [])).strip()) for i in range(len(segments))]
 
-    result = [" ".join(parts).strip() for parts in joined]
 
-    src = _L.source_flores(source_lang)
-    tgt = _L.target_flores(target_lang, for_speech)
-    kept = sum(1 for r in result if r)
-    print(f"[Translation-v2] {src} -> {tgt}: {kept}/{len(segments)} segments "
-          f"({len(flat)} sub-parts, beams={num_beams or os.getenv('NLLB_NUM_BEAMS', 2)})")
-    return result
+def _flush_batch(
+    batch: list[tuple[int, str]],
+    tok,
+    model,
+    src: str,
+    tgt: str,
+    out: dict[int, list[str]],
+) -> None:
+    tok.src_lang = src
+    inputs = tok(
+        [txt for _, txt in batch],
+        return_tensors="pt",
+        padding=True,
+        truncation=True,
+        max_length=512,
+    ).to(next(model.parameters()).device)
+
+    generated_ids = model.generate(
+        **inputs,
+        forced_bos_token_id=tok.convert_tokens_to_ids(tgt),
+        max_new_tokens=512,
+        num_beams=3,
+        num_return_sequences=1,
+        no_repeat_ngram_size=3,
+        early_stopping=True,
+    )
+    decoded = tok.batch_decode(generated_ids, skip_special_tokens=True)
+    for (idx, _txt), text in zip(batch, decoded):
+        if text.strip():
+            out.setdefault(idx, []).append(text.strip())
+
+
+def _translate_one(
+    idx: int,
+    text: str,
+    tok,
+    model,
+    device,
+    src: str,
+    tgt: str,
+    out: dict[int, list[str]],
+) -> None:
+    tok.src_lang = src
+    inputs = tok(
+        text,
+        return_tensors="pt",
+        truncation=True,
+        max_length=512,
+    ).to(device)
+
+    generated_ids = model.generate(
+        **inputs,
+        forced_bos_token_id=tok.convert_tokens_to_ids(tgt),
+        max_new_tokens=512,
+        num_beams=3,
+        num_return_sequences=1,
+        no_repeat_ngram_size=3,
+        early_stopping=True,
+    )
+    decoded = tok.batch_decode(generated_ids, skip_special_tokens=True)[0].strip()
+    if decoded:
+        out.setdefault(idx, []).append(decoded)
 
 
 # ---------------------------------------------------------------------------
-# Code-switch cleanup (same as before)
+# Code-switch cleanup
 # ---------------------------------------------------------------------------
+#
+# After translation, a Hindi (or Tamil, Telugu…) target sometimes still
+# contains English words — untranslated code-switching ("Have I done something
+# wrong?"), acronyms, and proper nouns. The voice model reads those in its
+# Latin phonetics, which stands out against the Indic audio around them.
+#
+# We find runs of ASCII letters/words in the translated text and, where the
+# run is long enough to be real English and short enough to be a single phrase,
+# re-translate that run from English into the target script. Short acronyms
+# (DBMS, LLM, AI) and single capitalised words (names) are deliberately left
+# alone — translating those produces worse output than leaving them.
 
-_LATIN_RUN = _re.compile(r"[A-Za-z][A-Za-z'’]*(?:\\s+[A-Za-z][A-Za-z'’]*)*")
-_KEEP_ACRONYM = _re.compile(r"^[A-Z]{2,6}$")
+
+_ASCII_RUN = _re.compile(r"[A-Za-z][A-Za-z'\-\.]*(\s+[A-Za-z][A-Za-z'\-\.]*)*", _re.U)
+# Acronyms: 2-6 capital letters, possibly with internal dots (U.S.A.).
+_ACRONYM = _re.compile(r"^[A-Z][A-Z.]{1,6}$")
+# A single capitalised word that is likely a proper noun.
+_LIKELY_NAME = _re.compile(r"^[A-Z][a-z]{1,30}$")
 
 
-def _should_translate_run(run: str) -> bool:
+def _is_candidate_run(run: str) -> bool:
+    """Is this ASCII run worth re-translating into the target script?"""
     words = run.split()
     if not words:
         return False
+    # Single word: keep if it looks like a name or acronym.
     if len(words) == 1:
         w = words[0]
-        if _KEEP_ACRONYM.match(w):      # DBMS, LLM, AI
+        if _ACRONYM.match(w) or _LIKELY_NAME.match(w):
             return False
-        if w[:1].isupper() and len(w) > 1:   # probably a name
-            return False
-        return len(w) >= 4              # a real English word
-    return True                          # a phrase — translate it
+        # Short single words are often names too; only translate if clearly
+        # a multi-letter content word.
+        return len(w) >= 5
+    # Multi-word run: translate it (likely a phrase or clause).
+    return True
 
 
-def fix_code_switching(texts: list, target_lang: str,
-                       source_hint: str = "en") -> list:
+def fix_code_switching(
+    texts: list[str],
+    target_lang: str,
+    source_hint: str = "en",
+) -> list[str]:
+    """Re-translate English code-switching runs in `texts` into the target script.
+
+    `texts` is the translated script from `translate_segments`. For each target
+    language that uses a non-Latin script, run this after translate_segments so
+    that leftover English reads in the target's phonetics through the voice
+    model. For Latin-script targets this is a no-op.
     """
-    Translate leftover Latin-script runs into the target script.
-    """
-    import languages as _L
-
-    try:
-        tgt = _L.target_flores(target_lang)
-    except Exception:
+    src_hint, tgt = _langs_flores(source_hint, target_lang, for_speech=True)
+    tgt_script = tgt.rsplit("_", 1)[-1] if "_" in tgt else ""
+    if tgt_script in ("Latn", "Hans", "Hant", "Jpan", "Kana"):
+        # Latin / CJK: leftover runs are already in a script the voice model
+        # handles natively or the cleanup is not helpful. Skip.
         return texts
-    if tgt.endswith("_Latn"):
-        return texts                     # target is Latin-script; nothing to do
 
-    jobs, sites = [], []
+    # Nothing to do if the target uses the same script as the source hint.
+    if tgt_script == "Latn":
+        return texts
+
+    # Collect (segment_index, start, end, run) for every candidate run.
+    jobs: list[tuple[int, int, int, str]] = []
     for i, text in enumerate(texts):
-        for m in _LATIN_RUN.finditer(text or ""):
+        for m in _ASCII_RUN.finditer(text):
             run = m.group(0).strip()
-            if _should_translate_run(run):
-                jobs.append(run)
-                sites.append((i, m.start(), m.end()))
+            if _is_candidate_run(run):
+                jobs.append((i, m.start(), m.end(), run))
 
     if not jobs:
         return texts
 
-    try:
-        fixed = translate_batch(jobs, source_hint, target_lang)
-    except Exception as e:
-        print(f"[Translation-v2] Code-switch cleanup skipped: {e}")
-        return texts
+    # Re-translate each job from English into the target flores code.
+    tok, model = _load()
+    device = next(model.parameters()).device
 
-    out = list(texts)
-    # Replace right-to-left so earlier offsets stay valid.
-    for (i, a, b), new in sorted(zip(sites, fixed), key=lambda x: -x[0][1]):
-        if new and new.strip():
-            out[i] = out[i][:a] + new.strip() + out[i][b:]
+    results: list[str] = []
+    for _, _s, _e, run in jobs:
+        tok.src_lang = "eng_Latn"
+        inputs = tok(run, return_tensors="pt", truncation=True, max_length=256).to(device)
+        gen = model.generate(
+            **inputs,
+            forced_bos_token_id=tok.convert_tokens_to_ids(tgt),
+            max_new_tokens=128,
+            num_beams=3,
+            no_repeat_ngram_size=3,
+        )
+        translated = tok.batch_decode(gen, skip_special_tokens=True)[0].strip()
+        results.append(translated)
 
-    print(f"[Translation-v2] Rewrote {len(jobs)} Latin-script run(s) into "
-          f"{tgt} to stop them being spoken as English")
-    return out
+    # Apply replacements; do it in reverse order so the offsets stay valid.
+    texts = list(texts)
+    for (i, start, end, _run), replacement in zip(jobs, results):
+        if replacement:
+            texts[i] = texts[i][:start] + replacement + texts[i][end:]
+    return texts
+
+
+# ---------------------------------------------------------------------------
+# Debug helper used by the check scripts
+# ---------------------------------------------------------------------------
+
+def _model_info() -> dict:
+    """Return what the translate stage currently knows, for diagnostics."""
+    return {
+        "model_name": MODEL_NAME,
+        "loaded": _model is not None,
+        "device": "cuda" if torch.cuda.is_available() else "cpu",
+        "transformers_imported": _AUTO_MODEL_CLASS is not None,
+    }
