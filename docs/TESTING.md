@@ -11,10 +11,51 @@ only showed up on a hosted run.
 
 | File | Pins down |
 | --- | --- |
-| `test_requirements_pins.py` | PyAV stays below 19, so `faster-whisper` can keep passing `metadata_errors` to `av.open()` |
+| `test_requirements_pins.py` | PyAV stays below 19, so `faster-whisper` can keep passing `metadata_errors` to `av.open()`; the optional extras stay optional |
 | `test_log_follow.py` | The notebook's log follower cannot append its own output back into `server.log` |
 | `test_platform_layout.py` | The checkout and the runtime tree pick the same platform, and the committed notebooks match the generator |
 | `test_vendor_f5_tts.py` | The vendoring script verifies the same marker the voice engine's guard checks |
+| `test_speaker_plumbing.py` | The speaker registry and the reference resolution chain; a single-speaker plan is unchanged |
+| `test_speaker_diarization.py` | Word-midpoint assignment, carry-forward, the overlap margin, and every diarization failure path |
+| `test_speaker_references.py` | One reference per speaker, the fallback ladder, and that another actor's voice is never substituted |
+| `test_multispeaker_integration.py` | The seams between the phases: transcript → diarization → references → plan → synthesis |
+| `test_background_preservation.py` | Demucs chunking and reassembly, the stem cache, and the LUFS mix with its exact length |
+| `test_overlap.py` | Per-speaker scheduling, the local overlap gain, and that one speaker still cannot overlap themselves |
+| `test_phase6_reporting.py` | Readiness, the run summary, speaker status, artifact invalidation, and that no payload carries a token |
+
+---
+
+## Readiness and the manual checkpoints
+
+Three things answer "can this machine do it", at three levels of cost:
+
+```bash
+# What the machine can do, structured. No model loaded.
+python scripts/final_check.py plan clip.mp4 --target-language hi
+
+# The whole audio pipeline, as far as this machine can go.
+python scripts/final_check.py check clip.mp4 --target-language hi \
+    --preserve-background
+
+# The same, plus Wav2Lip. Needs the lip-sync weights.
+python scripts/final_check.py check clip.mp4 --target-language hi --render
+```
+
+`plan` is cheap enough to run anywhere: every probe is an import spec or a file
+check. It reports each feature as ready, reduced, absent or blocked, and
+distinguishes a missing optional feature from a missing core one — so "Demucs is
+not installed" never reads as "the app is broken".
+
+For one stage at a time, the per-phase scripts are still there and still useful:
+
+| Script | Answers |
+| --- | --- |
+| `scripts/multispeaker_check.py` | Is each actor cloned from their own voice? Prints a phrase-vs-reference similarity matrix |
+| `scripts/background_check.py` | Did the film's music and SFX survive? Writes six listenable layers |
+| `scripts/overlap_check.py` | Do two actors talking at once keep their own timing and voice? Prints the active-speaker table |
+
+All of them read the same `readiness` and `run_summary` structures the studio
+does, so they cannot disagree with it.
 
 ---
 

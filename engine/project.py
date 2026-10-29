@@ -35,6 +35,15 @@ PERSISTED = (
     "reference", "sync", "voice_match", "video_stale", "history",
     "filed_at", "filed_error", "subtitle_mode", "subtitle_language",
     "music_path", "music_gain", "voiceover_seconds",
+    # The speaker registry and the diarization it came from. Persisted so a
+    # reopened project still knows who spoke what, and so a sibling output of
+    # the same clip can reuse the diarization instead of running it again.
+    "speakers", "diarization", "diarization_source",
+    # Phase 4: the separated stems, so a sibling output of the same clip
+    # reuses them instead of spending minutes in Demucs again.
+    "stems",
+    # Phase 6: display names, and the per-speaker voice scores.
+    "speaker_aliases", "speaker_voice_match",
 )
 
 

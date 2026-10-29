@@ -34,12 +34,33 @@ is what the splash screen displays.
 1. **validating** — probe the file, apply in/out points (`av_sync.trim`)
 2. **extracting_audio** — 16 kHz mono for ASR (`av_sync.extract_audio`)
 3. **transcribing** — segments and word timings (`speech_to_text_v2`)
-4. **selecting_reference** — score the cleanest continuous window (`reference_audio`)
-5. **translating** — per segment, then repair code-switching (`translation_v2`)
-6. **synthesizing_voice** — phrase-level, laid onto a fixed-length track (`dubbing`)
-7. **lip_syncing** — mouth region only, single encode (`lip_sync`)
-8. **verifying** — A/V drift and voice match
-9. **filing** — the finished render is copied to the project's output folder
+4. **diarizing** — who spoke when, on the original audio (`speaker_diarization`).
+   Optional: skipped when pyannote is absent, and non-fatal on failure. Without
+   it every segment is one implicit `SPEAKER_00`.
+5. **separating_audio** — Demucs splits the original soundtrack into speech and
+   everything else (`source_separation`). Optional: skipped unless asked for,
+   and non-fatal on failure. The `no_vocals` stem becomes the bed; the `vocals`
+   stem is what ASR and the voice references are read from.
+6. **selecting_reference** — score the cleanest continuous window per speaker
+   (`reference_audio`), cut from the vocals stem when there is one. One speaker
+   gets one window, exactly as before.
+7. **translating** — per segment, then repair code-switching (`translation_v2`)
+8. **synthesizing_voice** — phrase-level, laid onto a fixed-length track (`dubbing`).
+   Each phrase is spoken in its own speaker's reference voice. Scheduling is
+   per speaker, so a different actor may start while another is still talking;
+   the same actor still cannot overlap themselves. Assembly is additive, with
+   the level managed locally where voices coincide (`1/sqrt(n)`, plus a local
+   ceiling inside the overlap only).
+9. **mixing_background** — dialogue over the preserved background, at exactly
+   the video's length (`av_sync.mix_layers`). Layer order is dialogue >
+   preserved background > user music bed.
+10. **lip_syncing** — mouth region only, single encode (`lip_sync`)
+11. **verifying** — A/V drift and voice match
+12. **filing** — the finished render is copied to the project's output folder
+
+The dialogue-only track is kept as its own artifact even when a bed is mixed in:
+it is what the voice-match score compares against, what an A/B against the
+reference needs, and what a remix can reuse without running IndicF5 again.
 
 Two stages report a real counter (`synthesizing_voice (3/8)`,
 `lip_syncing (240/512 frames)`), which is what drives the progress bar and
@@ -73,6 +94,31 @@ finished dub back into a download link. `/videos/` builds one row per project,
 however many outputs it holds, from the manifests **and** the live job
 registry: a run that has not finished has no manifest yet, and listing only
 finished work made a project disappear the moment you started rendering it.
+
+## Readiness, the run summary, and the artifact graph
+
+Three modules carry everything the studio, the API and the check scripts report.
+None of them touches audio.
+
+`readiness.py` answers "can this machine do it", as a structure rather than
+prose. Every probe is an import spec or a file check, so it is cheap enough for a
+request handler. A feature is `ready`, `fallback_available`, `optional_missing`
+or `blocked`, and only a **core** feature can make the whole verdict not-ready —
+a missing Demucs is a reduced dub, not a broken application. It reports
+`HF_TOKEN` as present or missing and never returns any part of it.
+
+`run_summary.py` is what a finished job actually did: stages with the state each
+reached, per-speaker status, overlap regions, which models ran, and a `warnings`
+list in plain sentences. Every stage of this pipeline degrades rather than
+fails, and that is exactly how a dub ends up quietly worse than the user expects
+with nothing on screen to say why. The summary is where a fallback becomes
+visible. It is written into the project manifest and returned by the API.
+
+`artifact_cache.py` is the dependency graph, in one place. Each cache grew up in
+its own phase with its own reuse rule; this says what depends on what, so a
+change invalidates that artifact and its dependents and nothing else. Validity is
+always a comparison against the inputs — never `os.path.exists`, because a stems
+file left over from an untrimmed clip is present and wrong.
 
 ## Cancellation
 

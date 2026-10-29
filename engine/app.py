@@ -26,7 +26,7 @@ _ENV_KEYS = localenv.load(str(_PROJECT_ROOT / ".env"))
 from fastapi import (BackgroundTasks, Body, FastAPI, File, Form, HTTPException,
                      Query, UploadFile)
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response
 
 # ---------------------------------------------------------------------------
 # Storage
@@ -48,8 +48,14 @@ import llm
 import project
 import subtitles
 import voiceover
+import artifact_cache
 import languages as L
+import readiness
 import reference_audio
+import run_summary
+import source_separation
+import speaker_diarization
+import speakers as SPK
 import tts_engines
 # Imported as modules as well as functions: applying a model change without a
 # restart means calling refresh() on the module that owns each stage.
@@ -156,6 +162,111 @@ async def lifespan(app: FastAPI):
         threading.Thread(target=_warmup, daemon=True).start()
     yield
     sweeper.cancel()
+
+
+def _speaker_voice_matches(speakers: list, plan: list, units_dir: str,
+                           reference_path: str, source_path: str,
+                           workdir: str) -> list:
+    """
+    Per-speaker voice similarity, using the existing WavLM infrastructure.
+
+    The old single score compared one reference against the whole dub, which
+    stopped meaning anything the moment a video had two voices: a good clone of
+    speaker A and a bad one of B average into a number that describes neither.
+
+    So each speaker's reference is compared against a track built from THAT
+    speaker's own generated phrases. Both sides are normalised the same way the
+    single-voice score already was — against a same-speaker ceiling and an
+    unrelated-speaker floor — because a raw WavLM cosine sits near 0.9 for
+    almost any pair and is unreadable on its own.
+
+    Deliberately reports a status word rather than a pass/fail: this is a
+    quality diagnostic, not identity proof, and no threshold here has been
+    validated across enough voices to claim one.
+
+    Best effort throughout. A scoring failure must never fail a render that
+    otherwise succeeded.
+    """
+    if os.getenv("VOICE_MATCH", "1") in ("0", "false", "no"):
+        return []
+    if not speakers or not plan:
+        return []
+
+    try:
+        import soundfile as sf
+        from eval_harness import SpeakerScorer
+        scorer = SpeakerScorer()
+    except Exception as e:                                   # noqa: BLE001
+        print(f"[APP] Per-speaker voice match unavailable: {e}")
+        return []
+
+    # Group the cached phrases by speaker, and write one track per speaker.
+    by_speaker: dict = {}
+    for unit in plan:
+        wave = dubbing.read_unit(units_dir, unit["index"])
+        if wave is None or wave.size == 0:
+            continue
+        by_speaker.setdefault(unit.get("speaker") or SPK.DEFAULT_LABEL,
+                              []).append(wave)
+    if not by_speaker:
+        return []
+
+    tracks_dir = os.path.join(workdir, "speakers")
+    os.makedirs(tracks_dir, exist_ok=True)
+
+    results = []
+    for entry in speakers:
+        label = entry.get("label")
+        chunks = by_speaker.get(label) or []
+        ref = entry.get("reference") or {}
+        row = {"label": label, "score": None, "cosine": None,
+               "status": "unmeasured", "phrases": len(chunks),
+               "track": None}
+        if not chunks or not ref.get("path"):
+            results.append(row)
+            continue
+
+        # The isolated track is written whether or not scoring works: it is
+        # worth having for debugging either way.
+        track = os.path.join(tracks_dir, f"{label}.wav")
+        try:
+            joined = np.concatenate(chunks)
+            sf.write(track, joined, dubbing.SAMPLE_RATE, subtype="PCM_16")
+            row["track"] = track
+        except Exception as e:                               # noqa: BLE001
+            print(f"[APP] Could not write the {label} track: {e}")
+            results.append(row)
+            continue
+
+        try:
+            ref_embedding = scorer.embed(ref["path"])
+            dub_embedding = scorer.embed(track)
+            if ref_embedding is None or dub_embedding is None:
+                results.append(row)
+                continue
+            raw = scorer.cosine(ref_embedding, dub_embedding)
+            ceiling = scorer.cosine(ref_embedding, scorer.embed(source_path))
+            floor = scorer.floor(ref["path"])
+            import math
+            if any(math.isnan(v) for v in (raw, ceiling, floor)):
+                results.append(row)
+                continue
+            row["cosine"] = round(raw, 4)
+            if ceiling > floor:
+                norm = (raw - floor) / (ceiling - floor)
+                row["score"] = round(max(0.0, min(1.0, norm)), 3)
+            # `run_summary` turns the score into a word; the vocabulary lives
+            # there so the manifest and the studio cannot disagree.
+            import run_summary
+            row["status"] = run_summary._match_status(row)
+            print(f"[APP] {label} voice match: "
+                  f"{row['score'] if row['score'] is not None else 'n/a'} "
+                  f"(cosine {row['cosine']}, {row['phrases']} phrases)")
+        except Exception as e:                               # noqa: BLE001
+            print(f"[APP] {label} voice match failed: {e}")
+        results.append(row)
+
+    return results
 
 
 def _voice_match(ref_path: str, dub_path: str, source_path: str):
@@ -351,7 +462,9 @@ def process_video_task(job_id: str, input_path: str, original_language: str,
                        user_id: str = "anonymous",
                        trim_start: float = None, trim_end: float = None,
                        music_path: str = None, music_gain: float = -18.0,
-                       kind: str = "dub"):
+                       kind: str = "dub", preserve_background: bool = None,
+                       background_lufs: float = None,
+                       background_duck: bool = None):
     """
     Segment-level dubbing pipeline.
 
@@ -449,14 +562,54 @@ def process_video_task(job_id: str, input_path: str, original_language: str,
         print(f"[APP] Source language: {source_language} "
               f"(detected {detected}, requested {original_language})")
 
+        # ── 2b. Who is speaking ──
+        # Runs on the ORIGINAL audio, not the 16 kHz mono ASR track: resampling
+        # and the ASR pipeline's own filtering both smear the cues pyannote
+        # keys on, and both `video-dubbing-system` and `Ai-Vedio-Dubbing` found
+        # the full-band signal gives better turns. Best effort throughout — no
+        # pyannote, no token, a crash, or zero turns all mean one implicit
+        # speaker, which is exactly the pipeline this project shipped before
+        # diarization existed.
+        diarization, diar_source = [], None
+        if kind in ("dub", "audio") and _diarization_enabled():
+            if sibling and sibling.get("diarization"):
+                diarization = list(sibling["diarization"])
+                diar_source = "sibling"
+                print(f"[APP] Job {job_id} reused {len(diarization)} "
+                      f"diarization turn(s) from a sibling")
+            else:
+                _set(job_id, step="diarizing")
+                # Diarization shares the one GPU with the voice model, so it
+                # queues behind a render like every other heavy stage, and the
+                # model is dropped again before TTS loads.
+                with _HEAVY:
+                    diarization = speaker_diarization.diarize(
+                        input_path,
+                        min_speakers=int(engines.tunable("DIAR_MIN_SPEAKERS")),
+                        max_speakers=int(engines.tunable("DIAR_MAX_SPEAKERS")))
+                speaker_diarization.release()
+                diar_source = "detected" if diarization else None
+            if diarization:
+                segments = speaker_diarization.assign_segments(segments,
+                                                               diarization)
+                print(speaker_diarization.summarize(segments, diarization))
+
         seg_rows = [{"start": float(sg.get("start", 0.0)),
                      "end": float(sg.get("end", 0.0)),
-                     "text": (sg.get("text") or "").strip()}
+                     "text": (sg.get("text") or "").strip(),
+                     "speaker": SPK.label_of(sg)}
                     for sg in segments]
         common = dict(workdir=workdir, input_path=input_path,
                       video_duration=video_dur, source_language=source_language,
                       target_language=target_language, segment_count=len(segments),
                       segments=seg_rows, word_segments=segments,
+                      # The registry itself is filled in below, once the
+                      # per-speaker references have been cut. The diarization
+                      # is known now and travels with the job so a sibling
+                      # output of the same clip can reuse it.
+                      speakers=[], diarization=diarization,
+                      diarization_source=diar_source,
+                      stems=None,
                       video_stale=False)
 
         if kind == "subtitles":
@@ -464,6 +617,38 @@ def process_video_task(job_id: str, input_path: str, original_language: str,
             _save(job_id)
             print(f"[APP] Job {job_id} transcribed ({len(segments)} segments)")
             return
+
+        # ── 2c. Separate the film's music and sound effects from its speech ──
+        # Optional and failure-safe: no Demucs, no weights, a crash or a bad
+        # stem all mean None here and the dialogue-only pipeline below, which is
+        # what this project shipped before. The stems give us two things: a bed
+        # to put the dub on top of, and a cleaner source for the voice
+        # references, since music under a reference clip is contamination the
+        # cloning model happily learns.
+        #
+        # It runs on the ORIGINAL video, not the 16 kHz mono ASR track:
+        # separation needs the full band and the stereo image, and the two
+        # extractions coexist because ASR still falls back to the 16 kHz one.
+        stems = None
+        speech_source = input_path
+        if kind in ("dub", "audio") and _preserve_background(preserve_background):
+            reuse = (sibling.get("stems") if sibling else None) or {}
+            if reuse.get("vocals") and os.path.exists(reuse["vocals"]):
+                stems = dict(reuse)
+                speech_source = stems["vocals"]
+                print(f"[APP] Job {job_id} reused the separated stems from a "
+                      f"sibling")
+            else:
+                _set(job_id, step="separating_audio")
+                stems = source_separation.separate(
+                    input_path, workdir,
+                    chunk_seconds=int(engines.tunable("DEMUCS_CHUNK_SECONDS")))
+                source_separation.release()
+                if stems:
+                    speech_source = stems["vocals"]
+                print(source_separation.summarize(stems))
+        common["stems"] = stems
+        common["speech_source"] = speech_source
 
         # ── 3. Reference clip for cloning ──
         # Only the outputs that actually speak need one. Subtitle jobs were
@@ -473,9 +658,49 @@ def process_video_task(job_id: str, input_path: str, original_language: str,
         reference = None
         if kind in ("dub", "audio"):
             _set(job_id, step="selecting_reference")
+            # References are cut from the SEPARATED VOCALS when there are any.
+            # A reference clip with music under it teaches the cloning model the
+            # music, so `speech_source` is the vocals stem whenever separation
+            # succeeded and the original video otherwise.
+            ref_is_audio = bool(stems) and speech_source == stems.get("vocals")
+
+            # The fallback: the one window the pipeline has always picked, used
+            # when there is no diarization and as the last resort otherwise.
             reference = reference_audio.build_reference(
-                input_path, segments, video_dur,
-                os.path.join(workdir, f"{stem}_ref.wav"), sample_rate=24000)
+                speech_source, segments, video_dur,
+                os.path.join(workdir, f"{stem}_ref.wav"), sample_rate=24000,
+                is_audio=ref_is_audio)
+
+            detected_labels = sorted({SPK.label_of(s) for s in segments
+                                      if SPK.label_of(s)})
+            multi = len(detected_labels) > 1
+            if multi:
+                # One reference per detected speaker, each cut from that
+                # speaker's OWN cleanest windows. A speaker with no usable
+                # audio is marked unresolved rather than given another actor's
+                # voice.
+                common["speakers"] = reference_audio.build_references(
+                    speech_source, segments, video_dur,
+                    os.path.join(workdir, "refs"), labels=detected_labels,
+                    sample_rate=24000, is_audio=ref_is_audio,
+                    generic_path=SPK.generic_voice_path())
+            else:
+                # One speaker, or none detected: the implicit registry, whose
+                # single entry points at the global reference. Byte-identical to
+                # the pipeline before diarization existed.
+                common["speakers"] = SPK.build(
+                    segments, SPK.implicit_speaker(reference))
+
+            segments = _assign_implicit_speaker(segments)
+            seg_rows = [{"start": float(sg.get("start", 0.0)),
+                         "end": float(sg.get("end", 0.0)),
+                         "text": (sg.get("text") or "").strip(),
+                         "speaker": SPK.label_of(sg)}
+                        for sg in segments]
+            common["segments"] = seg_rows
+            common["word_segments"] = segments
+            common["speakers"] = SPK.build(seg_rows, common["speakers"])
+            print(SPK.summarize(common["speakers"], seg_rows))
 
         # ── 4. Translate segment by segment ──
         # Text that is only read goes into the language's own script; text
@@ -561,23 +786,26 @@ def process_video_task(job_id: str, input_path: str, original_language: str,
             def tts_progress(done, total):
                 _set(job_id, step=f"synthesizing_voice ({done + 1}/{total})")
 
+            mixed = None
             dub_path = os.path.join(workdir, f"{stem}_dub.wav")
             units_dir = os.path.join(workdir, "units")
+            _set(job_id, step="assembling_dialogue")
             plan = dubbing.build_dubbed_track(
                 segments, translated, reference, target_language, video_dur,
                 dub_path,
                 source_lang=source_language, progress=tts_progress,
-                source_audio=stt_audio, cache_dir=units_dir)
+                source_audio=stt_audio, cache_dir=units_dir,
+                speakers=common["speakers"])
 
             if kind == "audio":
                 # The bed belongs in the delivered file when there is no
                 # picture to mux it into later.
                 delivered = dub_path
-                if music_path:
-                    delivered = os.path.join(workdir, f"{stem}_mixed.wav")
-                    av_sync.mix_music(dub_path, music_path, delivered,
-                                      gain_db=music_gain)
-                    print(f"[APP] Mixed a music bed at {music_gain:.0f} dB")
+                mixed = _mix_audio(job_id, workdir, stem, dub_path, video_dur,
+                                   stems, music_path, music_gain,
+                                   background_lufs, background_duck)
+                if mixed:
+                    delivered = mixed
                 filed = _file_render(
                     job_id, delivered,
                     os.path.splitext(_safe_name(filename))[0].replace(f"{job_id}_", ""),
@@ -609,11 +837,13 @@ def process_video_task(job_id: str, input_path: str, original_language: str,
             # the reference; the bed is mixed into a separate file that the
             # picture is muxed with.
             audio_for_video = dub_path
-            if music_path:
-                mixed = os.path.join(workdir, f"{stem}_mixed.wav")
-                av_sync.mix_music(dub_path, music_path, mixed, gain_db=music_gain)
+            if stems or music_path:
+                _set(job_id, step="mixing_background")
+            mixed = _mix_audio(job_id, workdir, stem, dub_path, video_dur,
+                               stems, music_path, music_gain,
+                               background_lufs, background_duck)
+            if mixed:
                 audio_for_video = mixed
-                print(f"[APP] Mixed a music bed at {music_gain:.0f} dB")
 
             generate_lip_synced_video(
                 input_path, audio_for_video, output_video_path,
@@ -640,6 +870,14 @@ def process_video_task(job_id: str, input_path: str, original_language: str,
             print(f"[APP] Voice match: {match['score']:.3f} (cosine {match['cosine']})")
             _set(job_id, voice_match=match)
 
+        # Per-speaker similarity, and one isolated track per speaker. The old
+        # single score describes neither actor once there are two.
+        per_speaker = _speaker_voice_matches(
+            common["speakers"], plan, units_dir, reference["path"], stt_audio,
+            workdir)
+        if per_speaker:
+            _set(job_id, speaker_voice_match=per_speaker)
+
         # ── 8. Publish ──
         # The render stays where it was written; this is the URL that serves it.
         _set(job_id, step="uploading_result")
@@ -662,6 +900,13 @@ def process_video_task(job_id: str, input_path: str, original_language: str,
              reference_text=reference.get("text", ""),
              reference_seconds=round(reference.get("duration", 0.0), 2),
              dub_path=dub_path,
+             # The dialogue-only track is kept as its own artifact even when a
+             # bed was mixed in: it is what a voice-match score compares
+             # against, what an A/B against the reference needs, and what a
+             # remix can reuse without running IndicF5 again.
+             mixed_path=(mixed or None),
+             background_path=(stems or {}).get("background"),
+             vocals_path=(stems or {}).get("vocals"),
              source_language=source_language,
              segment_count=len(segments),
              # Whisper's per-segment timings and the translation aligned to
@@ -675,12 +920,31 @@ def process_video_task(job_id: str, input_path: str, original_language: str,
                         "text": reference.get("text", ""),
                         "duration": reference.get("duration", 0.0),
                         "start": reference.get("start")},
+             # The registry the run actually spoke in, with the per-label
+             # tallies filled in from the final segments.
+             speakers=SPK.build(seg_rows, common["speakers"]),
+             diarization=common["diarization"],
+             diarization_source=common.get("diarization_source"),
              target_language=target_language,
              segments=[{"start": float(sg.get("start", 0.0)),
                         "end": float(sg.get("end", 0.0)),
-                        "text": (sg.get("text") or "").strip()}
+                        "text": (sg.get("text") or "").strip(),
+                        "speaker": SPK.label_of(sg)}
                        for sg in segments],
              translated_segments=list(translated))
+
+        # The run summary, built last so it describes the finished artifact set.
+        # Best effort: a reporting failure must not fail a completed render.
+        try:
+            job = jobs.get(job_id) or {}
+            job["job_id"] = job_id
+            summary = run_summary.build(job, readiness=readiness.snapshot(
+                target_language=target_language, source_language=source_language))
+            job["run_summary"] = summary
+            print(run_summary.render(summary))
+        except Exception as e:                               # noqa: BLE001
+            print(f"[APP] Could not build the run summary: {e}")
+
         _save(job_id)
         print(f"[APP] Job {job_id} completed")
 
@@ -694,6 +958,15 @@ def process_video_task(job_id: str, input_path: str, original_language: str,
         _set(job_id, status="failed", step="error", error=str(e))
 
     finally:
+        # A run that did not finish still gets a summary, so the stage that
+        # stopped and the warnings so far survive into the manifest.
+        try:
+            job = jobs.get(job_id)
+            if job and job.get("status") in ("failed", "cancelled"):
+                job["job_id"] = job_id
+                job["run_summary"] = run_summary.build(job)
+        except Exception:                                    # noqa: BLE001
+            pass
         if not KEEP_INTERMEDIATE:
             job = jobs.get(job_id, {})
             # Revising a finished dub needs more than the three output files:
@@ -786,6 +1059,16 @@ async def process_video(
     trim_end: float = Query(None, description="Out point in seconds"),
     music_gain: float = Query(-18.0, description="Music bed level in dB"),
     music: UploadFile = File(None),
+    preserve_background: bool = Query(
+        None, description="Keep the film's own music and sound effects under "
+                          "the dub. Defaults to the PRESERVE_BACKGROUND "
+                          "setting."),
+    background_lufs: float = Query(
+        None, description="Loudness the preserved background is normalised to. "
+                          "Defaults to the BACKGROUND_LUFS setting."),
+    background_duck: bool = Query(
+        None, description="Lower the background while dialogue is present. "
+                          "Defaults to the BACKGROUND_DUCK setting."),
 ):
     # A reopened project has its clip on disk already. Rendering another
     # output from it should not mean finding the file again, so with no
@@ -865,6 +1148,10 @@ async def process_video(
         "target_language": target_language,
         "subtitle_language": (subtitle_language or "").strip() or None,
         "user_id": user_id,
+        # The per-request choices, or None to follow the stored setting.
+        "preserve_background": preserve_background,
+        "background_lufs": background_lufs,
+        "background_duck": background_duck,
         "created_at": asyncio.get_event_loop().time(),
     }
 
@@ -881,12 +1168,220 @@ async def process_video(
     background_tasks.add_task(process_video_task, job_id, input_path,
                              original_language, target_language, safe_filename,
                              user_id, trim_start, trim_end, music_path,
-                             music_gain, kind)
+                             music_gain, kind, preserve_background,
+                             background_lufs, background_duck)
 
     return JSONResponse({
         "status": "accepted",
         "job_id": job_id,
         "message": "Video processing started. Poll /jobs/{job_id}/status.",
+    })
+
+
+@app.get("/api/readiness")
+async def get_readiness(target_language: str = Query(None),
+                        source_language: str = Query(None)):
+    """
+    What this machine can actually do, structured.
+
+    The studio asks before accepting a render so a missing model is a message
+    on the setup screen rather than a failure minutes into a job. Cheap: every
+    probe is an import spec or a file check, and nothing loads a model.
+
+    Never returns a token — only whether one is present. See `readiness`.
+    """
+    return JSONResponse(readiness.snapshot(
+        target_language=target_language, source_language=source_language))
+
+
+@app.get("/jobs/{job_id}/summary")
+async def get_run_summary(job_id: str):
+    """
+    The final report for a run: what ran, what fell back, what it measured.
+
+    Available while a job is still running, so the studio can show progress and
+    fallbacks as they happen rather than only at the end.
+    """
+    job = jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    summary = run_summary.build(job)
+    return JSONResponse({"summary": summary,
+                         "text": run_summary.render(summary)})
+
+
+@app.patch("/jobs/{job_id}/speakers/{label}")
+async def rename_speaker(job_id: str, label: str, body: dict = Body(...)):
+    """
+    Give a speaker a display name.
+
+    The alias is an overlay and nothing else. `label` remains the stable id that
+    the unit cache, the plan, the reference files and the manifest all key on,
+    so renaming a speaker can never invalidate a phrase or move a reference. The
+    studio shows the alias; the pipeline never sees it.
+    """
+    job = _require_editable(job_id)
+    registry = SPK.normalize_speakers(job.get("speakers"))
+    if not any(entry.get("label") == label for entry in registry):
+        raise HTTPException(status_code=404,
+                            detail=f"No speaker {label} in this project")
+
+    alias = str(body.get("alias") or "").strip()
+    aliases = dict(job.get("speaker_aliases") or {})
+    if alias:
+        aliases[label] = alias
+    else:
+        aliases.pop(label, None)
+    job["speaker_aliases"] = aliases
+    project.save(job_id, job)
+
+    return JSONResponse({
+        "label": label,
+        "alias": aliases.get(label),
+        "speakers": SPK.describe_all(registry, aliases=aliases,
+                                     plan=job.get("plan")),
+    })
+
+
+@app.get("/jobs/{job_id}/speakers")
+async def list_speakers(job_id: str):
+    """
+    The detected speakers, with status and warnings.
+
+    A run that finished before diarization existed has no registry; it reports
+    one implicit `SPEAKER_00` whose reference is the video-wide one, which is
+    what those runs actually did.
+    """
+    job = jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    registry = SPK.normalize_speakers(job.get("speakers"))
+    if not registry and job.get("reference"):
+        registry = SPK.implicit_speaker(job["reference"])
+    return JSONResponse({
+        "speakers": SPK.describe_all(registry,
+                                     aliases=job.get("speaker_aliases") or {},
+                                     plan=job.get("plan")),
+        "warnings": SPK.warnings(registry),
+        "voice_match": job.get("speaker_voice_match") or [],
+    })
+
+
+@app.get("/jobs/{job_id}/artifact/{name}")
+async def get_artifact(job_id: str, name: str):
+    """
+    Serve an intermediate artifact by name, for debugging.
+
+    The point of Phase 6's artifact exposure: hearing the vocals stem, one
+    speaker's isolated track, or the mix without the overlap gain is how you
+    tell a scheduling bug from a bad clone. Only names on the allowlist are
+    served, so this cannot be turned into a file-read primitive.
+    """
+    job = jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    allowed = {
+        "dialogue": job.get("dub_path"),
+        "mixed": job.get("mixed_path"),
+        "vocals": job.get("vocals_path"),
+        "background": job.get("background_path"),
+        "output": job.get("output_path"),
+    }
+    # A per-speaker isolated track, when one was written.
+    if name.startswith("speaker:") and name.count(":") == 1:
+        label = name.split(":", 1)[1]
+        workdir = job.get("workdir") or ""
+        candidate = os.path.join(workdir, "speakers", f"{label}.wav")
+        allowed[name] = candidate if os.path.exists(candidate) else None
+
+    path = allowed.get(name)
+    if not path:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No artifact {name!r} for this job. Available: "
+                   f"{sorted(k for k, v in allowed.items() if v)}")
+    if not os.path.exists(path):
+        raise HTTPException(status_code=410,
+                            detail=f"The {name} artifact is no longer on disk.")
+    return FileResponse(path, media_type="audio/wav",
+                        filename=f"{job_id}_{name.replace(':', '_')}.wav")
+
+
+@app.get("/api/artifacts")
+async def get_artifact_graph():
+    """
+    The artifact dependency graph: what each stage's output depends on.
+
+    Exposed so the studio can tell a user what a settings change will cost
+    before they make it — "this re-runs Demucs (minutes)" rather than a
+    surprise. Read-only; nothing here touches a job.
+    """
+    return JSONResponse({
+        "artifacts": {
+            name: {"depends_on": list(entry["depends_on"]),
+                   "inputs": list(entry["inputs"]),
+                   "cost": entry["cost"],
+                   "per_unit": bool(entry.get("per_unit"))}
+            for name, entry in artifact_cache.ARTIFACTS.items()
+        },
+        "text": artifact_cache.describe(),
+    })
+
+
+@app.get("/jobs/{job_id}/cache")
+async def get_job_cache(job_id: str):
+    """
+    Which of this job's artifacts are present, and what a change would cost.
+
+    `invalidated_by` answers the brief's requirement directly: a change to one
+    input invalidates that artifact and its dependents, and nothing else.
+    """
+    job = jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    workdir = job.get("workdir") or ""
+    units = job.get("units_dir") or ""
+    stems = job.get("stems") or {}
+
+    present = {
+        "stems": bool(stems.get("background") and
+                      os.path.exists(stems.get("background") or "")),
+        "transcript": bool(job.get("word_segments")),
+        "diarization": bool(job.get("diarization")),
+        "speakers": bool(job.get("speakers")),
+        "references": bool([e for e in SPK.normalize_speakers(job.get("speakers"))
+                            if (e.get("reference") or {}).get("path")]),
+        "translation": bool(job.get("translated_segments")),
+        "plan": bool(job.get("plan")),
+        "phrase_audio": bool(units and os.path.isdir(units)),
+        "dialogue_track": bool(job.get("dub_path") and
+                               os.path.exists(job.get("dub_path"))),
+        "mixed_audio": bool(job.get("mixed_path") and
+                            os.path.exists(job.get("mixed_path"))),
+        "output_video": bool(job.get("output_path") and
+                             os.path.exists(job.get("output_path"))),
+    }
+
+    costs = {}
+    for field in ("trim", "target_language", "source_language",
+                  "demucs_chunk_seconds", "music_gain", "background_duck",
+                  "dialogue_lufs", "background_lufs", "output_crf"):
+        stale = artifact_cache.invalidated_by([field])
+        costs[field] = {
+            "invalidates": stale,
+            "worst": artifact_cache.cheapest_stale(stale),
+        }
+
+    return JSONResponse({
+        "present": present,
+        "workdir": workdir or None,
+        "reclone": {
+            label: artifact_cache.reference_invalidates(label)
+            for label in SPK.labels(SPK.normalize_speakers(job.get("speakers")))
+        },
+        "change_costs": costs,
     })
 
 
@@ -1113,6 +1608,129 @@ def _source_text_at(segments: list, start: float, duration: float) -> str:
     return best
 
 
+def _diarization_enabled() -> bool:
+    """
+    Whether to look for multiple speakers at all.
+
+    Off by default in two cases: a deployment that has no pyannote (checked
+    cheaply, without loading anything), and an operator who set
+    VIDEOTRANS_DIARIZE=off. Both mean one implicit speaker, which is the
+    previous pipeline — so a machine that cannot diarize never pays for the
+    attempt, and never fails because of it.
+    """
+    setting = os.getenv("VIDEOTRANS_DIARIZE", "").strip().lower()
+    if setting in ("0", "false", "no", "off"):
+        return False
+    if setting in ("1", "true", "yes", "on"):
+        return True
+    return speaker_diarization.available()
+
+
+def _preserve_background(requested: bool = None) -> bool:
+    """
+    Whether to run separation at all.
+
+    Resolution order, most specific first:
+
+      1. `requested` — the per-render choice the studio sends.
+      2. `VIDEOTRANS_PRESERVE_BACKGROUND` — an operator turning it on or off for
+         a whole deployment.
+      3. the `PRESERVE_BACKGROUND` tunable, off by default.
+
+    Demucs is minutes per film on CPU and a heavy optional dependency, so the
+    default has to be the cheap path.
+
+    The package is not checked here: `source_separation.separate` does that, so
+    a machine with the setting on but Demucs missing gets one clear log line and
+    the dialogue-only pipeline rather than a failure.
+    """
+    if requested is not None:
+        return bool(requested)
+    setting = os.getenv("VIDEOTRANS_PRESERVE_BACKGROUND")
+    if setting is not None:
+        return setting.strip().lower() in ("1", "true", "yes", "on")
+    return bool(engines.tunable("PRESERVE_BACKGROUND"))
+
+
+def _mix_audio(job_id: str, workdir: str, stem: str, dub_path: str,
+               video_dur: float, stems: dict, music_path: str,
+               music_gain: float, background_lufs: float = None,
+               background_duck: bool = None):
+    """
+    Compose the deliverable audio: dialogue, plus whatever beds we have.
+
+    Returns the path of the mixed file, or None when there is nothing to mix
+    with — in which case the caller keeps the dialogue-only track it already
+    has, which is the pre-Phase-4 behaviour.
+
+    `background_lufs` and `background_duck` are per-render overrides; when they
+    are None the stored setting is used, which is what keeps a render made
+    without touching the studio identical to one made before these controls
+    existed.
+
+    Both beds are handled in one pass so the dialogue is normalised exactly
+    once. Chaining two ffmpeg calls would re-normalise the output of the first,
+    so the dialogue level would move depending on whether a music file happened
+    to be attached — a coupling that makes a render unpredictable for no gain.
+
+    Layer order is dialogue > preserved background > user music bed. The user's
+    music does NOT replace the film's original score; both are kept.
+    """
+    background = (stems or {}).get("background")
+    if background and not os.path.exists(background):
+        background = None
+    if not background and not music_path:
+        return None
+
+    # A level is clamped to a range that cannot produce obviously clipped or
+    # inaudible output, so a mistyped value degrades rather than ruins a render.
+    level = (float(engines.tunable("BACKGROUND_LUFS"))
+             if background_lufs is None else float(background_lufs))
+    level = max(-40.0, min(-6.0, level))
+    duck = (bool(engines.tunable("BACKGROUND_DUCK"))
+            if background_duck is None else bool(background_duck))
+
+    out_path = os.path.join(workdir, f"{stem}_mixed.wav")
+    try:
+        return av_sync.mix_layers(
+            dub_path, out_path, target=video_dur,
+            background_path=background, music_path=music_path,
+            music_gain=music_gain,
+            dialogue_lufs=float(engines.tunable("DIALOGUE_LUFS")),
+            background_lufs=level,
+            duck=duck,
+            duck_db=float(engines.tunable("DUCK_DB")),
+            duck_ratio=float(engines.tunable("DUCK_RATIO")))
+    except Exception as e:                                   # noqa: BLE001
+        # A mix failure must not fail a dub that has already been synthesized.
+        # The dialogue-only track is complete and correct; it just has no bed.
+        print(f"[APP] Could not mix the background ({e}); delivering the "
+              f"dialogue-only track")
+        return None
+
+
+def _assign_implicit_speaker(segments: list, label: str = None) -> list:
+    """
+    Stamp the one-speaker label onto segments that have none.
+
+    A video with no diarization genuinely has one speaker, and saying so is
+    better than leaving every segment unlabelled: the tallies in the registry
+    are then real numbers, the studio can show who is speaking, and every unit
+    still resolves to the same single reference it always did.
+
+    Segments that already carry a label are left alone, so this never overwrites
+    a real diarization result.
+    """
+    label = label or SPK.DEFAULT_LABEL
+    out = []
+    for seg in segments or []:
+        if SPK.label_of(seg):
+            out.append(seg)
+        else:
+            out.append({**seg, "speaker": label})
+    return out
+
+
 # How many phrase edits can be walked back. Each step keeps one WAV, so the
 # ceiling is on disk use as much as on memory.
 HISTORY_DEPTH = 20
@@ -1264,6 +1882,13 @@ async def list_segments(job_id: str):
         "video_stale": bool(job.get("video_stale")),
         "can_undo": len(job.get("history") or []),
         "target_language": job.get("target_language"),
+        # The registry as the studio shows it: status, warning, reference span
+        # and how many phrases each speaker actually speaks. `label` stays the
+        # stable id; `name` is the alias a person may have given it.
+        "speakers": SPK.describe_all(
+            SPK.normalize_speakers(job.get("speakers")),
+            aliases=job.get("speaker_aliases") or {},
+            plan=job.get("plan")),
         "segments": [
             {
                 "index": u["index"],
@@ -1276,6 +1901,10 @@ async def list_segments(job_id: str):
                 "source_text": _source_text_at(source, u["start"], u["duration"]),
                 "seed": u.get("seed"),
                 "cleared": bool(u.get("cleared")),
+                # Who speaks this phrase. Absent on runs from before
+                # diarization, which were all SPEAKER_00 in practice.
+                "speaker": u.get("speaker") or SPK.DEFAULT_LABEL,
+                "ref_index": u.get("ref_index"),
                 # What this phrase actually takes to say, against the slot it
                 # has. The single most useful thing to know about a dub, and
                 # it used to take a click per phrase to find out.
@@ -1341,8 +1970,14 @@ async def revise_segment(job_id: str, index: int, body: dict = Body(default={}))
             unit.update(previous)
             raise HTTPException(status_code=409, detail=BUSY_DETAIL)
         try:
-            wave = dubbing.synth_unit(unit, ref["path"], ref["text"],
-                                      ref["duration"], job["target_language"],
+            # The phrase is re-spoken in ITS speaker's voice, not the video's
+            # first voice: editing line 12 of a two-hander must not quietly
+            # change who is talking.
+            spoken_ref = SPK.reference_for(unit, job.get("speakers"), ref) or ref
+            wave = dubbing.synth_unit(unit, spoken_ref["path"],
+                                      spoken_ref.get("text", ""),
+                                      float(spoken_ref.get("duration") or 0.0),
+                                      job["target_language"],
                                       seed=unit.get("seed"))
         finally:
             _HEAVY.release()
@@ -1558,7 +2193,11 @@ def rerender_task(job_id: str):
 
 
 @app.get("/jobs/{job_id}/reference/candidates")
-async def reference_candidates(job_id: str):
+async def reference_candidates(job_id: str,
+                               speaker: str = Query(
+                                   None, description="Which speaker's windows "
+                                                     "to list. Omit for the "
+                                                     "single-voice list.")):
     """
     The best few windows the voice could be cloned from.
 
@@ -1580,12 +2219,31 @@ async def reference_candidates(job_id: str):
                    "Re-render to enable it.")
 
     current = job.get("reference", {})
+    # A multi-speaker run has one reference per speaker, so the picker lists
+    # windows for the speaker being asked about rather than for the video as a
+    # whole. With no `speaker` the answer is the single-voice list it always was.
+    speaker = (speaker or "").strip() or None
+    registry = SPK.normalize_speakers(job.get("speakers"))
+    # With a speaker selected, `current` is THAT speaker's reference, not the
+    # video-wide one — otherwise the picker shows one actor's clip while you
+    # are editing another's.
+    chosen = current
+    if speaker:
+        for entry in registry:
+            if entry.get("label") == speaker:
+                chosen = entry.get("reference") or {}
+                break
+
     return JSONResponse({
-        "current": {"start": current.get("start"),
-                    "duration": current.get("duration"),
-                    "text": current.get("text", "")},
+        "speaker": speaker,
+        "current": {"start": chosen.get("start"),
+                    "duration": chosen.get("duration"),
+                    "text": chosen.get("text", "")},
+        "speakers": SPK.describe_all(
+            registry, aliases=job.get("speaker_aliases") or {},
+            plan=job.get("plan")),
         "candidates": reference_audio.candidate_windows(
-            words, job.get("video_duration") or 0.0, limit=5),
+            words, job.get("video_duration") or 0.0, limit=5, speaker=speaker),
     })
 
 
@@ -1613,11 +2271,24 @@ async def choose_reference(job_id: str, background_tasks: BackgroundTasks,
 
     job.update({"status": "processing", "step": "selecting_reference",
                 "cancel_requested": False, "error": None})
-    background_tasks.add_task(reclone_task, job_id, start, duration)
+    background_tasks.add_task(reclone_task, job_id, start, duration,
+                              (body.get("speaker") or None))
     return JSONResponse({"job_id": job_id, "status": "processing"})
 
 
-def reclone_task(job_id: str, start: float, duration: float):
+def reclone_task(job_id: str, start: float, duration: float, speaker: str = None):
+    """
+    Re-cut a reference window and speak again in the new voice.
+
+    With no `speaker` this is the original whole-run re-clone: the one reference
+    every phrase used is replaced and the timeline is rebuilt.
+
+    With a `speaker` it is the cheap, correct version: only that speaker's
+    registry entry changes, and only THEIR phrases are re-synthesized. In a
+    two-hander, re-cloning the second actor used to re-speak the first actor's
+    lines as well — minutes of GPU work, and a fresh stochastic take on phrases
+    nobody asked to change.
+    """
     job = jobs.get(job_id)
     if not job:
         return
@@ -1652,26 +2323,35 @@ def reclone_task(job_id: str, start: float, duration: float):
         def progress(done, total):
             _set(job_id, step=f"synthesizing_voice ({done + 1}/{total})")
 
-        with _HEAVY:
-            _set(job_id, step="synthesizing_voice")
-            track = dubbing.synthesize_timeline(
-                job["plan"], reference["path"], reference["text"],
-                reference["duration"], job["target_language"],
-                job["video_duration"], progress, cache_dir=job["units_dir"])
+        registry = SPK.normalize_speakers(job.get("speakers"))
+        if speaker and registry:
+            track = _respeak_speaker(job_id, job, speaker, reference, progress)
+        else:
+            with _HEAVY:
+                _set(job_id, step="synthesizing_voice")
+                track = dubbing.synthesize_timeline(
+                    job["plan"], reference["path"], reference["text"],
+                    reference["duration"], job["target_language"],
+                    job["video_duration"], progress, cache_dir=job["units_dir"],
+                    speakers=registry)
 
         import soundfile as sf
         sf.write(job["dub_path"], track, dubbing.SAMPLE_RATE, subtype="PCM_16")
 
-        jobs[job_id].update({
+        update = {
             "status": "done", "step": "complete",
             "reference": reference,
             "reference_path": reference["path"],
             "reference_text": reference["text"],
             "reference_seconds": round(reference["duration"], 2),
             "video_stale": True,
-        })
+        }
+        if speaker and registry:
+            update["speakers"] = registry
+        jobs[job_id].update(update)
         _save(job_id)
-        print(f"[APP] Job {job_id} re-cloned from {start:.2f}s "
+        who = f" for {speaker}" if speaker else ""
+        print(f"[APP] Job {job_id} re-cloned{who} from {start:.2f}s "
               f"(+{reference['duration']:.2f}s)")
     except JobCancelled:
         jobs.get(job_id, {}).update(
@@ -1681,6 +2361,44 @@ def reclone_task(job_id: str, start: float, duration: float):
         traceback.print_exc()
         jobs.get(job_id, {}).update(
             {"status": "failed", "step": "error", "error": str(e)})
+
+
+def _respeak_speaker(job_id: str, job: dict, label: str, reference: dict,
+                     progress=None):
+    """
+    Re-synthesize one speaker's phrases in a new reference and rebuild the track.
+
+    Only units whose speaker is `label` are touched; every other unit keeps the
+    audio already in the cache. The registry entry is updated in place so the
+    manifest, the studio and any later edit all see the new voice.
+    """
+    registry = SPK.normalize_speakers(job.get("speakers"))
+    for entry in registry:
+        if entry.get("label") == label:
+            entry["reference"] = dict(reference)
+            entry["reference_score"] = None
+            entry["fallback"] = False
+
+    targets = [u for u in job["plan"]
+               if (u.get("speaker") or SPK.DEFAULT_LABEL) == label]
+    with _HEAVY:
+        _set(job_id, step="synthesizing_voice")
+        for n, unit in enumerate(targets):
+            if progress:
+                progress(n, len(targets))
+            try:
+                wave = dubbing.synth_unit(
+                    unit, reference["path"], reference.get("text", ""),
+                    reference["duration"], job["target_language"])
+            except Exception as e:                           # noqa: BLE001
+                print(f"[APP] Could not re-speak phrase {unit['index']} "
+                      f"for {label}: {e}")
+                continue
+            if wave.size and float(np.max(np.abs(wave))) >= 1e-4:
+                dubbing.write_unit(job["units_dir"], unit["index"], wave)
+
+    job["speakers"] = registry
+    return _rebuild_track(job)
 
 
 @app.post("/jobs/{job_id}/segments/{index}/fit")
@@ -1792,8 +2510,11 @@ async def fit_segment(job_id: str, index: int, body: dict = Body(default={})):
             unit["text"] = original
             raise HTTPException(status_code=409, detail=BUSY_DETAIL)
         try:
-            wave = dubbing.synth_unit(unit, ref["path"], ref["text"],
-                                      ref["duration"], job["target_language"],
+            spoken_ref = SPK.reference_for(unit, job.get("speakers"), ref) or ref
+            wave = dubbing.synth_unit(unit, spoken_ref["path"],
+                                      spoken_ref.get("text", ""),
+                                      float(spoken_ref.get("duration") or 0.0),
+                                      job["target_language"],
                                       seed=unit.get("seed"))
         finally:
             _HEAVY.release()

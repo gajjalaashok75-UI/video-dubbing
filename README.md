@@ -17,26 +17,36 @@ Four models, in order, each handing the next what it needs and nothing more.
 
 ```mermaid
 flowchart LR
-    A[Video] --> B[faster-whisper<br/>large-v3]
+    A[Video] --> ST[Demucs<br/>optional]
+    ST -->|vocals| B[faster-whisper<br/>large-v3]
+    ST -->|background| MIX
     B -->|transcript +<br/>word timings| C[NLLB-200<br/>distilled 600M]
     C -->|translated<br/>segments| D[IndicF5<br/>+ vocos]
-    D -->|cloned voice<br/>audio track| E[Wav2Lip<br/>+ s3fd]
+    D -->|one voice<br/>per speaker| ASM[Overlap-safe<br/>assembly]
+    ASM --> MIX[dialogue +<br/>background]
+    MIX --> E[Wav2Lip<br/>+ s3fd]
     E --> F[Dubbed video]
 
-    subgraph VOICE[Voice reference]
-        G[pick 6-12s of the<br/>speaker] -.-> D
+    subgraph VOICE[Per-speaker voices]
+        H[pyannote: who<br/>spoke when] -.-> G
+        G[pick 6-12s of<br/>each speaker] -.-> D
     end
 
     style A fill:#1f2937,stroke:#374151,color:#e5e7eb
     style F fill:#1f2937,stroke:#374151,color:#e5e7eb
+    style ST fill:#1f2937,stroke:#6b7280,color:#9ca3af,stroke-dasharray:4 4
     style VOICE fill:none,stroke:#6b7280,stroke-dasharray:4 4,color:#9ca3af
 ```
 
 | Stage | Model | Device | What it contributes |
 |---|---|---|---|
+| Separate | Demucs htdemucs | MPS / CUDA | Optional. Splits the soundtrack so the film's music and SFX survive |
 | Transcribe | faster-whisper large-v3 | CPU | Words with timestamps, VAD-gated so silence is never heard as speech |
+| Diarize | pyannote speaker-diarization-3.1 | MPS / CUDA | Optional. Who spoke when, so each actor is cloned from their own voice |
 | Translate | NLLB-200 distilled 600M | MPS / CUDA | One segment at a time, code-switching repaired afterwards |
-| Clone & speak | IndicF5 + vocos | MPS / CUDA | The speaker's voice, from a 6–12 s reference the pipeline picks itself |
+| Clone & speak | IndicF5 + vocos | MPS / CUDA | Each speaker's voice, from a 6–12 s reference picked for them |
+| Assemble | — | CPU | One voice per speaker, overlapping freely, levelled only where they coincide |
+| Mix | — | CPU | The preserved soundtrack under the new dialogue, at exactly the video's length |
 | Lip sync | Wav2Lip + s3fd | MPS / CUDA | The mouth region only, composited back with a feathered mask |
 
 Whisper stays on the CPU because CTranslate2 has no Metal backend; everything
@@ -284,12 +294,44 @@ follow this".*
 Every render scores itself: the studio reports speaker similarity and A/V drift
 per job, so a bad run is visible before you play it.
 
+## Optional dependencies
+
+Two features are extras rather than part of the default install. Both are
+heavy, both are off unless asked for, and neither being absent stops a dub.
+
+| Extra | Install | Enables | Without it |
+|---|---|---|---|
+| pyannote | `pip install 'pyannote.audio>=3.3.2'` + `HF_TOKEN` | Multi-speaker detection, one cloned voice per actor | One voice for the whole video, exactly as before |
+| Demucs | `pip install 'demucs>=4.0.0'` | Keeping the film's own music, sound effects and ambience under the dub | The dub replaces the soundtrack |
+
+pyannote's weights are **gated**: accept the licence on the model page and put a
+read token in `.env` as `HF_TOKEN`. Demucs needs no account.
+
+Every stage degrades rather than failing. If a feature cannot run, the job
+finishes in its reduced form and the run summary says which stage was skipped and
+why — the studio shows it on the finished project, and
+`python scripts/final_check.py plan clip.mp4` reports it before you start.
+
 ## Known limits
 
 - **Slow on CPU.** Voice synthesis dominates; a GPU is strongly recommended. See
   [Deploy on a GPU](#deploy-on-a-gpu).
-- **One voice per video.** Whisper does not diarize, so multi-speaker footage
-  gets a single cloned voice. This is the largest capability gap.
+- **Multi-speaker, when pyannote is installed.** Diarization finds who spoke
+  when, each actor is cloned from their own cleanest window, and their phrases
+  are spoken in that voice. It is an optional, gated extra
+  (`pip install 'pyannote.audio>=3.3.2'` plus `HF_TOKEN`); without it a video
+  still gets one voice, exactly as before. Speakers with no clean audio are
+  marked unresolved rather than given another actor's voice.
+- **Overlapping speakers are supported.** Two actors talking at once keep
+  their own start times and their own voices; the level is managed only where
+  they coincide, so a solo line is never attenuated by a distant overlap. One
+  speaker still cannot talk over themselves.
+- **Background preservation is opt-in and slow.** Turn on *Keep original* and
+  Demucs keeps the film's music, sound effects and ambience under the new
+  dialogue. It is an optional extra (`pip install 'demucs>=4.0.0'`), off by
+  default, and roughly realtime or worse on CPU. Without it the dub replaces
+  the soundtrack, exactly as before. A user-uploaded music bed does not replace
+  the preserved background — both are kept, with the bed underneath.
 - **Talking-head video only.** Wav2Lip needs a visible, roughly front-facing
   face, and generates a 96×96 mouth — the most visible weakness on 1080p.
 - **The voice model is gated** and needs a Hugging Face token, as above.

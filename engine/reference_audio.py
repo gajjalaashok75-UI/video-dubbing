@@ -30,10 +30,38 @@ MAX_INTERNAL_GAP = 0.6
 INTRO_PENALTY_BEFORE = 2.0
 
 
-def _flatten_words(segments: list) -> list:
-    """Collect word-level timestamps across all segments."""
+def _flatten_words(segments: list, speaker: str = None) -> list:
+    """
+    Collect word-level timestamps across all segments.
+
+    When `speaker` is given, only that speaker's words are collected. This is
+    what stops the old failure mode where the "cleanest window" in a two-hander
+    belonged to the other actor: the window is now scored over one person's
+    speech, so a reference can only ever be cut from its own speaker.
+    """
     words = []
     for seg in segments or []:
+        if speaker is not None:
+            seg_speaker = seg.get("speaker")
+            # A word is attributed by its own label when it has one, falling
+            # back to the segment's. `assign_words` writes both.
+            for w in seg.get("words") or []:
+                label = w.get("speaker") or seg_speaker
+                if label != speaker:
+                    continue
+                if w.get("start") is None or w.get("end") is None:
+                    continue
+                text = (w.get("word") or "").strip()
+                if not text:
+                    continue
+                words.append({
+                    "word": text,
+                    "start": float(w["start"]),
+                    "end": float(w["end"]),
+                    "p": float(w.get("probability", 1.0)),
+                })
+            continue
+
         for w in seg.get("words") or []:
             if w.get("start") is None or w.get("end") is None:
                 continue
@@ -83,12 +111,16 @@ def _score_window(window: list) -> float:
     return score
 
 
-def find_best_window(segments: list, total_duration: float) -> tuple:
+def find_best_window(segments: list, total_duration: float,
+                     speaker: str = None) -> tuple:
     """
     Return (start, end, text) for the best reference window, or None if the
     transcript has no usable word timings.
+
+    With `speaker` given, only that speaker's words are considered, so the
+    window is one person talking rather than a mix of two.
     """
-    words = _flatten_words(segments)
+    words = _flatten_words(segments, speaker)
     if not words:
         return None
 
@@ -115,7 +147,9 @@ def find_best_window(segments: list, total_duration: float) -> tuple:
     return start, end, text
 
 
-def candidate_windows(segments: list, total_duration: float, limit: int = 5) -> list:
+def candidate_windows(segments: list, total_duration: float, limit: int = 5,
+                      speaker: str = None,
+                      min_seconds: float = MIN_REF_SECONDS) -> list:
     """
     The best few reference windows, not just the winner.
 
@@ -125,8 +159,16 @@ def candidate_windows(segments: list, total_duration: float, limit: int = 5) -> 
 
     Windows that overlap an already-chosen one by more than half are dropped,
     since a one-word shift is not a real alternative.
+
+    With `speaker` given, only that speaker's windows are returned, which is
+    what the studio's per-speaker reference picker shows.
+
+    `min_seconds` is the shortest window worth returning. It defaults to the
+    preferred 6s, but `build_references` lowers it so a speaker with only short
+    clean runs still has candidates to stitch or to use as a short reference.
+    Filtering at 6s here would make those fallbacks unreachable.
     """
-    words = _flatten_words(segments)
+    words = _flatten_words(segments, speaker)
     if not words:
         return []
 
@@ -139,7 +181,7 @@ def candidate_windows(segments: list, total_duration: float, limit: int = 5) -> 
                     break
                 window.append(words[j])
                 dur = window[-1]["end"] - window[0]["start"]
-                if dur < MIN_REF_SECONDS:
+                if dur < min_seconds:
                     continue
                 if dur > MAX_REF_SECONDS:
                     break
@@ -212,15 +254,20 @@ def _longest_run(words: list):
     return longest
 
 
-def extract_reference(video_path: str, start: float, duration: float,
+def extract_reference(source_path: str, start: float, duration: float,
                       out_path: str, sample_rate: int = 24000,
-                      denoise: bool = False) -> str:
+                      denoise: bool = False, is_audio: bool = False) -> str:
     """
     Cut the reference window and condition it for speaker-embedding quality:
     trim edge silence, remove low-frequency rumble, normalize loudness.
 
-    Deliberately does NOT apply aggressive denoise by default — spectral
+    Deliberately does NOT apply aggressive denoise by default - spectral
     denoisers smear exactly the timbre detail a cloning model keys on.
+
+    `source_path` is normally the video. Pass an audio file (a separated vocals
+    stem, say) with `is_audio=True` and the `-vn` is dropped: a stem has no
+    picture, and asking ffmpeg to ignore a stream that is not there is a
+    needless failure mode.
     """
     # ONLY timing-preserving filters here. `silenceremove` used to be in this
     # chain and it was catastrophic: it strips INTERNAL pauses, not just the
@@ -239,12 +286,13 @@ def extract_reference(video_path: str, start: float, duration: float,
     if denoise:
         chain.insert(1, "afftdn=nr=8:nf=-30")
 
-    cmd = [
-        "ffmpeg", "-y",
-        "-ss", f"{start:.3f}",
-        "-t", f"{duration:.3f}",
-        "-i", video_path,
-        "-vn",
+    cmd = ["ffmpeg", "-y",
+           "-ss", f"{start:.3f}",
+           "-t", f"{duration:.3f}",
+           "-i", source_path]
+    if not is_audio:
+        cmd.append("-vn")
+    cmd += [
         "-af", ",".join(chain),
         "-acodec", "pcm_s16le",
         "-ar", str(sample_rate),
@@ -255,13 +303,69 @@ def extract_reference(video_path: str, start: float, duration: float,
     return out_path
 
 
+def stitch_reference(parts: list, out_path: str, sample_rate: int = 24000,
+                     gap: float = 0.15) -> str:
+    """
+    Join several short same-speaker windows into one longer reference.
+
+    Step 2 of the fallback ladder: when a speaker has no single 6-second run but
+    does have three clean 3-second ones, three 3-second runs are a far better
+    reference than one of them alone - and are honest, because they are all the
+    same person.
+
+    A short silence is inserted between parts so the model hears a boundary
+    rather than a splice. This is not the same as padding one clip: the parts
+    are non-overlapping samples of one speaker, chosen by the same scorer that
+    picks a single window.
+    """
+    import numpy as np
+    import soundfile as sf
+
+    waves = []
+    for path in parts or []:
+        try:
+            wave, sr = sf.read(path, dtype="float32")
+        except Exception as e:                               # noqa: BLE001
+            print(f"[REF] Could not read {path} for stitching: {e}")
+            continue
+        wave = np.asarray(wave, dtype=np.float32).reshape(-1)
+        if wave.size == 0:
+            continue
+        if sr != sample_rate:
+            try:
+                import librosa
+                wave = librosa.resample(wave, orig_sr=sr, target_sr=sample_rate)
+            except Exception:                                # noqa: BLE001
+                continue
+        waves.append(wave)
+
+    if not waves:
+        raise RuntimeError("No usable parts to stitch a reference from")
+
+    silence = np.zeros(int(gap * sample_rate), dtype=np.float32)
+    pieces = []
+    for i, wave in enumerate(waves):
+        if i:
+            pieces.append(silence)
+        pieces.append(wave)
+    joined = np.concatenate(pieces)
+
+    os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
+    sf.write(out_path, joined, sample_rate, subtype="PCM_16")
+    return out_path
+
+
 def build_reference(video_path: str, segments: list, total_duration: float,
-                    out_path: str, sample_rate: int = 24000) -> dict:
+                    out_path: str, sample_rate: int = 24000,
+                    is_audio: bool = False) -> dict:
     """
     Pick and extract the best voice-cloning reference from a video.
 
     Returns {"path", "text", "start", "end", "duration"}.
     `text` is the transcript of the window, required by IndicF5 as `ref_text`.
+
+    `is_audio=True` means `video_path` is already audio (a separated vocals
+    stem), so ffmpeg is not told to drop a video stream that is not there.
     """
     picked = find_best_window(segments, total_duration)
 
@@ -276,7 +380,8 @@ def build_reference(video_path: str, segments: list, total_duration: float,
         start, end, text = picked
 
     requested = max(0.5, end - start)
-    extract_reference(video_path, start, requested, out_path, sample_rate)
+    extract_reference(video_path, start, requested, out_path, sample_rate,
+                      is_audio=is_audio)
 
     # Report the duration of the file we ACTUALLY wrote, never the duration we
     # asked for. Callers use this to compute F5's `fix_duration`, and F5 derives
@@ -306,3 +411,219 @@ def build_reference(video_path: str, segments: list, total_duration: float,
 
     return {"path": out_path, "text": text, "start": start,
             "end": end, "duration": actual}
+
+
+# A same-speaker reference shorter than this is not worth cloning from: F5's
+# speaker identity is unstable below roughly two seconds.
+MIN_USABLE_SECONDS = 2.0
+
+# How many short same-speaker windows may be stitched together for step 2 of the
+# fallback ladder. Bounded so the joined reference stays inside the range F5
+# handles well, rather than becoming an hour of montage.
+MAX_STITCH_PARTS = 4
+
+
+def _measured(path: str, requested: float) -> float:
+    """
+    The real duration of a file we just wrote.
+
+    Never the duration we asked for. F5 derives the reference length from the
+    actual waveform, so if the two disagree every generated phrase comes out the
+    wrong length and is time-stretched to compensate - which is what sounds
+    robotic. Encoder padding alone shifts this by tens of milliseconds.
+    """
+    try:
+        import av_sync
+        return av_sync.duration(path)
+    except Exception as e:                                   # noqa: BLE001
+        print(f"[REF] Could not probe {os.path.basename(path)} ({e}); "
+              f"using the requested {requested:.2f}s")
+        return requested
+
+
+def _windows_for(segments: list, total_duration: float, speaker: str,
+                 limit: int = 5) -> list:
+    """
+    Ranked candidate windows for one speaker, longest-and-cleanest first.
+
+    `candidate_windows` already ranks by confidence, density and gap; this adds
+    the tie-break the multi-speaker case needs - prefer the window closest to
+    the middle of the 6-12s band, because a 6.0s reference is better than a
+    12.0s one only when the 12.0s one is noisier.
+    """
+    windows = candidate_windows(segments, total_duration, limit=max(limit, 5),
+                               speaker=speaker,
+                               min_seconds=MIN_USABLE_SECONDS)
+    if not windows:
+        return []
+
+    def rank(w):
+        dur = float(w.get("duration") or 0.0)
+        # Distance from the middle of the preferred band, as a penalty.
+        mid = (MIN_REF_SECONDS + MAX_REF_SECONDS) / 2.0
+        band = (MAX_REF_SECONDS - MIN_REF_SECONDS) / 2.0
+        off = abs(dur - mid) / band if band else 0.0
+        return (float(w.get("score") or 0.0) - 0.25 * off)
+
+    return sorted(windows, key=rank, reverse=True)
+
+
+def _extract_from(source_path: str, window: dict, out_path: str,
+                  sample_rate: int, is_audio: bool) -> dict | None:
+    """Cut one window to `out_path`. Returns the reference dict, or None."""
+    start = max(0.0, float(window.get("start") or 0.0))
+    duration = max(0.5, float(window.get("duration") or 0.0))
+    try:
+        extract_reference(source_path, start, duration, out_path, sample_rate,
+                          is_audio=is_audio)
+    except Exception as e:                                   # noqa: BLE001
+        print(f"[REF] Could not cut {start:.2f}s+{duration:.2f}s: {e}")
+        return None
+    actual = _measured(out_path, duration)
+    if actual <= 0.05:
+        return None
+    return {"path": out_path, "text": (window.get("text") or "").strip(),
+            "start": round(start, 3), "end": round(start + actual, 3),
+            "duration": round(actual, 3)}
+
+
+def build_references(source_path: str, segments: list, total_duration: float,
+                     out_dir: str, labels: list = None,
+                     sample_rate: int = 24000, is_audio: bool = False,
+                     generic_path: str = None) -> list:
+    """
+    One reference profile per detected speaker.
+
+    Returns the registry `speakers.normalize_speakers` understands:
+
+        [{"label", "total_speech", "segment_count", "reference",
+          "reference_score", "fallback"}, ...]
+
+    `source_path` is normally the video; pass a separated vocals stem with
+    `is_audio=True` to cut references from speech that has no music under it.
+
+    The fallback order is deliberate and is the whole point of this function:
+
+      1. the best clean SAME-SPEAKER window of 6-12s;
+      2. failing that, several clean non-overlapping SAME-SPEAKER windows
+         stitched together, if together they reach the preferred length;
+      3. failing that, 2-6s of same-speaker speech, used with a warning;
+      4. failing that, an explicit generic voice (`generic_path`) if one is
+         available, with `fallback=True`;
+      5. failing that, an empty reference and `fallback=True`.
+
+    At no point does it substitute ANOTHER DETECTED ACTOR's voice. Impersonating
+    a real person in the cast is worse than an obviously generic voice, and it is
+    the one outcome a listener cannot detect.
+    """
+    import speakers as SPK
+
+    labels = list(labels or [])
+    if not labels:
+        labels = sorted({SPK.label_of(s) for s in segments or []
+                         if SPK.label_of(s)})
+    if not labels:
+        return []
+
+    os.makedirs(out_dir, exist_ok=True)
+    registry = []
+
+    for label in labels:
+        entry = {"label": label, "total_speech": 0.0, "segment_count": 0,
+                 "reference": None, "reference_score": None, "fallback": False}
+        tally = SPK.tally(segments, label)
+        entry.update(tally)
+
+        windows = _windows_for(segments, total_duration, label)
+        out_path = os.path.join(out_dir, f"speaker_{label}.wav")
+        out_txt = os.path.join(out_dir, f"speaker_{label}.txt")
+
+        # ── 1. One clean window in the preferred band ──
+        long_enough = [w for w in windows
+                       if float(w.get("duration") or 0.0) >= MIN_REF_SECONDS]
+        chosen = None
+        if long_enough:
+            chosen = _extract_from(source_path, long_enough[0], out_path,
+                                   sample_rate, is_audio)
+            if chosen:
+                entry["reference_score"] = long_enough[0].get("score")
+
+        # ── 2. Stitch several clean same-speaker windows ──
+        if chosen is None and len(windows) >= 2:
+            parts = []
+            texts = []
+            total = 0.0
+            for w in windows:
+                if len(parts) >= MAX_STITCH_PARTS:
+                    break
+                dur = float(w.get("duration") or 0.0)
+                if dur <= 0.5:
+                    continue
+                part = os.path.join(out_dir, f".part_{label}_{len(parts)}.wav")
+                got = _extract_from(source_path, w, part, sample_rate, is_audio)
+                if got is None:
+                    continue
+                parts.append(part)
+                texts.append(got["text"])
+                total += got["duration"]
+                if total >= MIN_REF_SECONDS:
+                    break
+            if parts:
+                try:
+                    stitch_reference(parts, out_path, sample_rate)
+                    actual = _measured(out_path, total)
+                    if actual >= MIN_USABLE_SECONDS:
+                        chosen = {"path": out_path,
+                                  "text": " ".join(t for t in texts if t).strip(),
+                                  "start": None, "end": None,
+                                  "duration": round(actual, 3)}
+                        entry["reference_score"] = None
+                        print(f"[REF] {label}: stitched {len(parts)} windows "
+                              f"into a {actual:.2f}s reference")
+                except Exception as e:                       # noqa: BLE001
+                    print(f"[REF] {label}: could not stitch a reference ({e})")
+                finally:
+                    for part in parts:
+                        try:
+                            os.remove(part)
+                        except OSError:
+                            pass
+
+        # ── 3. Short same-speaker speech (2-6s), used with a warning ──
+        if chosen is None and windows:
+            short = [w for w in windows
+                     if float(w.get("duration") or 0.0) >= MIN_USABLE_SECONDS]
+            if short:
+                chosen = _extract_from(source_path, short[0], out_path,
+                                       sample_rate, is_audio)
+                if chosen:
+                    entry["reference_score"] = short[0].get("score")
+                    print(f"[REF] {label}: only {chosen['duration']:.2f}s of "
+                          f"clean speech; cloning quality will be limited")
+
+        # ── 4. An explicit generic voice ──
+        if chosen is None and generic_path and os.path.exists(generic_path):
+            chosen = {"path": generic_path, "text": "", "start": None,
+                      "end": None, "duration": round(_measured(generic_path, 0.0), 3)}
+            entry["fallback"] = True
+            print(f"[REF] {label}: no usable same-speaker audio; using the "
+                  f"generic fallback voice")
+
+        # ── 5. Nothing usable ──
+        if chosen is None:
+            entry["fallback"] = True
+            print(f"[REF] {label}: {entry['total_speech']:.1f}s of speech but no "
+                  f"usable reference; this speaker is unresolved")
+
+        entry["reference"] = chosen
+        if chosen and chosen.get("text"):
+            try:
+                with open(out_txt, "w", encoding="utf-8") as f:
+                    f.write(chosen["text"])
+            except OSError:
+                pass
+        registry.append(entry)
+
+    print(SPK.summarize(registry, segments))
+    return registry
+

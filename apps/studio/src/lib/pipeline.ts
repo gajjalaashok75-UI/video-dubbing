@@ -31,10 +31,23 @@ export interface Stage {
 export const DUB_STAGES: Stage[] = [
   { key: "validating",         label: "Checking the file",        block: "CHECK", weight: 0.01 },
   { key: "extracting_audio",   label: "Extracting audio",         block: "AUDIO", weight: 0.02 },
-  { key: "transcribing",       label: "Transcribing",             block: "ASR",   weight: 0.10 },
+  { key: "transcribing",       label: "Transcribing",             block: "ASR",   weight: 0.09 },
+  /* Only runs with "preserve background" on. Separating the film's music and
+     sound effects from its speech; Demucs dominates on CPU, so it is weighted
+     heavily and only ever appears in the timeline when it will actually run. */
+  { key: "separating_audio",   label: "Separating the soundtrack", block: "STEMS", weight: 0.18 },
+  /* Only runs when pyannote is installed. Finding who spoke when, so each
+     actor is cloned from their own voice. Weighted for a CPU run, where the
+     embedding pass dominates; on a GPU it is a rounding error. */
+  { key: "diarizing",          label: "Finding the speakers",     block: "SPK",   weight: 0.06 },
   { key: "selecting_reference",label: "Choosing a voice reference",block: "REF",   weight: 0.04 },
   { key: "translating",        label: "Translating",              block: "MT",    weight: 0.06 },
-  { key: "synthesizing_voice", label: "Cloning the voice",        block: "TTS",   weight: 0.52 },
+  { key: "synthesizing_voice", label: "Cloning the voice",        block: "TTS",   weight: 0.32 },
+  /* Dialogue assembled onto an exact-length track, then the preserved
+     soundtrack laid under it. Both are seconds, but they are separate stages
+     and the timeline should say so rather than appearing to stall. */
+  { key: "assembling_dialogue",label: "Assembling dialogue",      block: "ASM",   weight: 0.02 },
+  { key: "mixing_background",  label: "Mixing original background",block: "MIX",  weight: 0.02 },
   { key: "lip_syncing",        label: "Re-syncing lips",          block: "LIPS",  weight: 0.20 },
   { key: "verifying",          label: "Checking sync",            block: "SYNC",  weight: 0.03 },
   { key: "uploading_result",   label: "Finishing",                block: "OUT",   weight: 0.02 },

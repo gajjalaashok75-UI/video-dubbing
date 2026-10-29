@@ -19,6 +19,7 @@ import {
 } from "@/lib/api";
 import {
   getModels, downloadModels, modelProgress, cancelModels,
+  getReadiness, type Readiness,
   type ModelInventory, type ModelProgress,
 } from "@/lib/api";
 import { ScriptModel } from "@/components/ScriptModel";
@@ -35,6 +36,10 @@ export default function Setup() {
   const [error, setError] = useState("");
   const [inv, setInv] = useState<ModelInventory | null>(null);
   const [prog, setProg] = useState<ModelProgress | null>(null);
+  /* What this machine can do, as the API reports it. Includes ffmpeg,
+     torch, the device and the token — none of which the model
+     inventory covers. */
+  const [ready, setReady] = useState<Readiness | null>(null);
 
   useEffect(() => {
     let live = true;
@@ -59,6 +64,12 @@ export default function Setup() {
     let live = true;
     getModels()
       .then((d) => { if (live) { setInv(d); setProg(d.progress); } })
+      .catch(() => {});
+    // Readiness is a separate question from the model inventory: it also covers
+    // ffmpeg, torch, the device and the token, and it distinguishes a missing
+    // optional feature from a missing core one.
+    getReadiness()
+      .then((r) => { if (live) setReady(r); })
       .catch(() => {});
     return () => { live = false; };
   }, []);
@@ -142,6 +153,81 @@ export default function Setup() {
             <p role="alert" className="console-text mt-4 rounded-[2px] bg-[#1b1f26] px-3 py-2 text-[11px] text-c-bad">
               {error}
             </p>
+          )}
+
+          {/* Readiness, above the model list. A missing optional feature is
+              stated with its fallback rather than as a failure, so nobody
+              reads "Demucs is not installed" as "the app is broken". */}
+          {ready && (
+            <section className="mt-5 rounded-[2px] border border-c-edge bg-c-well px-3 py-2.5">
+              <div className="flex items-baseline gap-2">
+                <Lamp state={ready.ready ? "good" : "bad"} />
+                <span className="text-[11px] text-c-text">
+                  {ready.ready
+                    ? "This machine can render a dub."
+                    : "This machine cannot render a dub yet."}
+                </span>
+              </div>
+              <p className="console-text mt-1.5 text-[10px] leading-relaxed text-c-dim">
+                {ready.hardware.device === "cpu"
+                  ? "Running on CPU. Voice synthesis is slow without a GPU."
+                  : `Using ${ready.hardware.device}`}
+                {ready.hardware.gpu_name ? ` — ${ready.hardware.gpu_name}` : ""}
+                {ready.hardware.free_disk_gb != null
+                  ? ` · ${ready.hardware.free_disk_gb} GB free` : ""}
+                {` · HF_TOKEN ${ready.secrets.HF_TOKEN}`}
+              </p>
+
+              {ready.blocking.length > 0 && (
+                <ul className="mt-2 space-y-1">
+                  {ready.blocking.map((name) => (
+                    <li key={name} className="text-[10px] leading-relaxed text-c-bad">
+                      <span className="text-c-text">{name}</span>:{" "}
+                      {ready.features[name]?.reason}
+                    </li>
+                  ))}
+                </ul>
+              )}
+
+              {ready.degraded.length > 0 && (
+                <ul className="mt-2 space-y-1">
+                  {ready.degraded.map((name) => (
+                    <li key={name} className="text-[10px] leading-relaxed text-c-dim">
+                      <span className="text-c-text">{name}</span> is running in a
+                      reduced form.
+                    </li>
+                  ))}
+                </ul>
+              )}
+
+              <details className="mt-2">
+                <summary className="cursor-pointer text-[10px] text-c-mute">
+                  All features
+                </summary>
+                <ul className="mt-1.5 space-y-1">
+                  {Object.entries(ready.features).map(([name, f]) => (
+                    <li key={name} className="flex gap-1.5 text-[10px] leading-relaxed">
+                      <Lamp
+                        state={
+                          f.status === "ready" ? "good"
+                            : f.status === "blocked" ? "bad"
+                            : f.status === "fallback_available" ? "run"
+                            : "idle"
+                        }
+                      />
+                      <span className="text-c-text">{name}</span>
+                      <span className="text-c-dim">
+                        {f.status === "ready" ? "ready"
+                          : f.status === "fallback_available" ? "reduced"
+                          : f.status === "optional_missing" ? "not installed"
+                          : "unavailable"}
+                        {f.reason ? ` — ${f.reason}` : ""}
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+              </details>
+            </section>
           )}
 
           {!data && (

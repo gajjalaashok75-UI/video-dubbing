@@ -67,7 +67,7 @@ gradio_runs/
 eval_runs/
 logs/
 *.log
-
+demo/
 # =========================
 # Media
 # =========================

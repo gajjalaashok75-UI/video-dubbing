@@ -24,10 +24,11 @@ import {
   downloadUrl, downloadAudioUrl, revealRender, getProjectOutputs, renameProject,
   type ProjectOutput,
   undoPhrase, fitOf,
-  getReferenceWindows, chooseReference,
+  getReferenceWindows, chooseReference, getSpeakers,
   EXPORTS, exportUrl, langName,
   type Language, type JobStatus, type Health, type Phrase,
   type ReferenceWindow,
+  type SpeakerProfile,
 } from "@/lib/api";
 import {
   Panel, Tool, Row, Sel, Sub, Stat, Lamp, TitleBar, StatusBar, PageBar,
@@ -35,6 +36,7 @@ import {
 } from "@/components/console";
 import { Timeline } from "@/components/timeline";
 import { CloneProgress } from "@/components/progress";
+import { Speakers } from "@/components/speakers";
 import { stagesFor, readProgress, percent, type JobKind } from "@/lib/pipeline";
 import { Settings } from "@/components/Settings";
 import { inWindow, pickFolder } from "@/lib/native";
@@ -150,6 +152,10 @@ export default function Studio() {
   const [phraseBusy, setPhraseBusy] = useState(false);
   const [phraseNote, setPhraseNote] = useState("");
   const [windows, setWindows] = useState<ReferenceWindow[] | null>(null);
+  /* The detected speakers, with their status and warnings. Loaded from
+     the dedicated endpoint so it works for a job whose timeline is not
+     editable, and so the alias survives a rename. */
+  const [speakers, setSpeakers] = useState<SpeakerProfile[] | null>(null);
   const [stale, setStale] = useState(false);
   const phrasePlayer = useRef<HTMLAudioElement | null>(null);
 
@@ -158,6 +164,16 @@ export default function Studio() {
   const [trimOut, setTrimOut] = useState<number | null>(null);
   const [music, setMusic] = useState<File | null>(null);
   const [musicGain, setMusicGain] = useState(-18);
+  /* Keep the film's own soundtrack. Null means "follow the engine's
+     PRESERVE_BACKGROUND setting", which is off unless an operator
+     turned it on. */
+  const [preserveBackground, setPreserveBackground] = useState<boolean | null>(null);
+  /* Background level in LUFS, and whether the bed ducks under speech.
+     Defaults reproduce the tested Phase 4 behaviour: -26 LUFS, no
+     ducking. The range is bounded because a level outside it produces
+     audibly wrong output rather than a different taste. */
+  const [bgLevel, setBgLevel] = useState(-26);
+  const [duck, setDuck] = useState(false);
 
   // A project reopened from the Projects screen has no File object behind it,
   // only what the manifest recorded.
@@ -384,6 +400,7 @@ export default function Studio() {
           if (s.editable) {
             getPhrases(job_id).then((t) => setPhrases(t.segments)).catch(() => setPhrases(null));
             getReferenceWindows(job_id).then((r) => setWindows(r.candidates)).catch(() => setWindows(null));
+            getSpeakers(job_id).then((r) => setSpeakers(r.speakers)).catch(() => setSpeakers(null));
           }
           getHealth().then(setHealth).catch(() => {});
         }
@@ -654,6 +671,9 @@ export default function Studio() {
             trimEnd: trimOut,
             music,
             musicGain,
+            preserveBackground,
+            backgroundLevel: preserveBackground === true ? bgLevel : undefined,
+            duckBackground: preserveBackground === true ? duck : undefined,
             kind: mode,
             name: name || undefined,
             subtitleLanguage: mode === "subtitled" && subtitleLang
@@ -1055,6 +1075,54 @@ export default function Studio() {
                   </p>
                 )}
 
+                <Sub>Soundtrack</Sub>
+                <Row label="Keep original">
+                  <input
+                    type="checkbox"
+                    checked={preserveBackground === true}
+                    onChange={(e) =>
+                      setPreserveBackground(e.target.checked ? true : null)}
+                    aria-label="Preserve the original soundtrack"
+                  />
+                </Row>
+                <div className="px-2.5 pb-1.5">
+                  <p className="text-[10px] leading-snug text-c-faint">
+                    {preserveBackground === true
+                      ? "The film's own music and sound effects are kept under the new dialogue. Needs the demucs package; slow on CPU."
+                      : "Off. The dub replaces the original soundtrack."}
+                  </p>
+                </div>
+
+                {preserveBackground === true && (
+                  <>
+                    <Row label="Background">
+                      <input
+                        type="range" min={-40} max={-12} step={1}
+                        value={bgLevel}
+                        onChange={(e) => setBgLevel(Number(e.target.value))}
+                        className="w-full accent-c-accent"
+                        aria-label="Preserved background level in LUFS"
+                      />
+                    </Row>
+                    <Stat k="" v={`${bgLevel} LUFS under the dialogue`} />
+                    <Row label="Duck">
+                      <input
+                        type="checkbox"
+                        checked={duck}
+                        onChange={(e) => setDuck(e.target.checked)}
+                        aria-label="Duck the background while someone is talking"
+                      />
+                    </Row>
+                    <div className="px-2.5 pb-1.5">
+                      <p className="text-[10px] leading-snug text-c-faint">
+                        {duck
+                          ? "The music steps back only while someone is speaking. Off by default: ducking hard makes a score sound switched on and off."
+                          : "The music plays at a steady level throughout."}
+                      </p>
+                    </div>
+                  </>
+                )}
+
                 <Sub>Music</Sub>
                 <div className="px-2.5 py-1.5">
                   <input
@@ -1363,6 +1431,25 @@ export default function Studio() {
                   </p>
                 )}
               </>
+            )}
+
+            {speakers && speakers.length > 0 && view !== "working" && (
+              <Speakers
+                jobId={jobId.current ?? ""}
+                speakers={speakers}
+                onRecloned={() => {
+                  // Re-cloning re-speaks one speaker's phrases, so the timeline
+                  // and the speakers both need re-reading.
+                  setStale(true);
+                  if (jobId.current) {
+                    getSpeakers(jobId.current)
+                      .then((r) => setSpeakers(r.speakers))
+                      .catch(() => undefined);
+                  }
+                  watch(jobId.current ?? "");
+                }}
+                onRenamed={setSpeakers}
+              />
             )}
 
             {windows && windows.length > 0 && view !== "working" && (

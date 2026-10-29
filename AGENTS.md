@@ -66,6 +66,163 @@
   voice stage to the guard above. It verifies `AdaLayerNormZero_Final`, the same
   marker the guard tests, so setup cannot pass while synthesis still refuses.
 
+## Multi-speaker + background preservation (planned)
+
+- `docs/INTEGRATION-multispeaker-background.md` is the exploration report for
+  adding multi-speaker dubbing and original-background preservation. Nothing in
+  it is implemented yet; read it before touching `dubbing.py`, `app.py` or
+  `reference_audio.py`.
+- `references/` vendors four read-only reference repos (Python-Autodub,
+  video-dubbing-system, Ai-Vedio-Dubbing, PolyDub). Their `.git` dirs were
+  removed so they commit as plain files. They are inputs to the report, not
+  build dependencies, and nothing imports from them.
+- The core chain is fixed: faster-whisper → NLLB-200 → IndicF5 → Wav2Lip.
+  IndicF5 stays the Indian-language voice model; do not swap in F5-TTS or XTTS
+  when porting techniques from the references, which mostly use F5-TTS/XTTS.
+- Two invariants must survive any port: `dubbing.assemble` returns exactly
+  `video_duration` seconds, and per-phrase audio stays cached in
+  `<workdir>/units/` so one edit re-synthesizes one phrase.
+
+## Multi-speaker dubbing (Phases 1-3 done)
+
+- `engine/speakers.py` owns the registry: one entry per detected voice, with
+  `label`, `total_speech`, `segment_count`, `reference`, `reference_score`,
+  `fallback`. `reference_for(unit, speakers, fallback)` is the resolution chain
+  every synthesis path goes through. A job with no registry resolves to the
+  global reference, which is the pre-diarization behaviour.
+- `engine/speaker_diarization.py` is the optional stage. pyannote is the only
+  backend; `Diarizer` is the interface a second one would implement. `diarize()`
+  returns `[]` rather than raising on EVERY failure path - no pyannote, no
+  token, a crash, zero turns - so a render never fails because the speaker
+  detector did. `release()` drops the model before IndicF5 loads; they share one
+  GPU and the diarizer is idle once the turns are known.
+- `reference_audio.build_references()` cuts one reference per speaker. The
+  fallback ladder is 6-12s same-speaker -> stitched short windows -> 2-6s with a
+  warning -> generic voice -> unresolved. It must NEVER use another detected
+  actor's voice; `tests/test_speaker_references.py` holds that line as a test.
+  `candidate_windows(min_seconds=...)` is lowered to the 2s floor by
+  `build_references`, because filtering at 6s makes rungs 2-5 unreachable.
+- `dubbing.plan_timeline` emits `speaker` and `ref_index`; `synth_unit` and
+  `synthesize_timeline` resolve each unit's own reference; `build_dubbed_track`
+  builds one `DurationModel` per speaker. `natural_for(text, seg, label)` is how
+  a per-speaker generator estimate gets taken BEFORE the closing squeeze in
+  `plan_timeline` - doing it afterwards moves every phrase and breaks the
+  length invariant.
+- Verify a real 2-3 speaker clip with
+  `python scripts/multispeaker_check.py plan|check clip.mp4`. `check` prints a
+  phrase-vs-reference similarity matrix; the diagonal is the pass.
+- `docs/INTEGRATION-multispeaker-background.md` is the design. All six
+  phases are implemented; see the sections below.
+
+## Background preservation (Phase 4 done)
+
+- `engine/source_separation.py` splits the original soundtrack with Demucs
+  `htdemucs --two-stems vocals`. The `no_vocals` stem is the bed; the `vocals`
+  stem is what ASR and the voice references are read from. Off unless asked for
+  (`PRESERVE_BACKGROUND` tunable, `VIDEOTRANS_PRESERVE_BACKGROUND`, or the
+  per-render `preserve_background` query param). Every failure — no Demucs, no
+  weights, a crash, bad output, a timeout — returns `None` and leaves the
+  dialogue-only pipeline intact.
+- The separation input is HQ stereo 44.1 kHz, NOT the 16 kHz mono ASR track.
+  Demucs needs the full band and the stereo image; the two extractions coexist
+  because ASR still falls back to the 16 kHz one.
+- Chunking is 10 minutes at a time, one Demucs invocation for all chunks
+  (`-j 1`). `ffmpeg -f segment -c copy` was measured to reassemble
+  sample-exactly, so the segmentation is safe; Demucs is not, so every chunk's
+  output is fitted back to its own input length before joining. A model that
+  pads each chunk would otherwise drift by seconds over a film.
+- Stems cache in `<workdir>/stems/` with `stems.json` recording the input's
+  size, mtime, model, chunk size and rate. A re-trim changes size and mtime, so
+  it invalidates the cache automatically. `stems` is persisted on the manifest
+  so a sibling output of the same clip reuses them.
+- `av_sync.mix_layers` is the mixer: one ffmpeg pass, layer order dialogue >
+  preserved background > user music bed, `normalize=0`, and length enforced
+  ONCE at the end as `atrim` then `apad=whole_dur=<target>`. Do not move that
+  length fix-up per layer — `apad` with no argument pads to a buffer boundary,
+  not a duration, and `loudnorm` upstream makes the input length unpredictable;
+  per-layer enforcement came out 40 ms short on a 12.96s clip.
+- A user-uploaded music bed goes UNDER the preserved background. It never
+  replaces it; both are kept and both are audible.
+- `_mix_audio` returns `None` when there is nothing to mix with, which is what
+  tells the caller to keep the dialogue-only track. That track is kept as its
+  own artifact either way.
+- Verify a real BGM-heavy clip with
+  `python scripts/background_check.py plan|check clip.mp4`. It writes six
+  listenable artifacts; `3_background.wav` is the one that matters.
+- Phase 6 (polish) is NOT implemented; Phase 5 is done, see below.
+
+## Overlapping dialogue (Phase 5 done)
+
+- `plan_timeline` schedules with ONE CURSOR PER SPEAKER, not one global cursor.
+  A global cursor serialised the whole video, so in a conversation the second
+  actor could not start until the first had finished — `SPEAKER_01` at 11.5s was
+  pushed to 13.0s because `SPEAKER_00` was still talking. Do not reintroduce a
+  single `cursor` variable. The closing squeeze is per speaker for the same
+  reason: one running cursor there would re-serialise everything after a squeeze.
+- `next_start_for` looks ahead to the speaker's OWN next line, not the next line
+  in the list. The following segment is usually the other actor, and treating
+  their start as this speaker's deadline would cap a phrase by someone else's
+  turn. For one speaker the two are the same position, so single-speaker
+  borrowing is unchanged.
+- `assemble(plan, waves, video_duration, overlap_gain=True)` keeps additive
+  placement and multiplies by `_overlap_gain(...)`. That curve is `1/sqrt(n)` for
+  `n` active voices, then a LOCAL CEILING applied only inside the overlap. The
+  ceiling iterates (bounded at 24) because a single pass leaves the peak alive on
+  the smoothed ramp into an overlap; measured, 16 iterations take a 1.27 peak
+  under 1.0 while a solo passage stays at exactly 0.5.
+- The global `if peak > 1: track /= peak` is a LAST-RESORT guard, never the
+  strategy. If it fires on an overlap it scales the whole film, which is audible
+  everywhere the overlap is not. It now prints when it fires.
+- With one speaker the gain curve is exactly 1.0 everywhere, so a single-speaker
+  track is byte-for-byte unchanged. `tests/test_overlap.py` locks that, and
+  `overlap_gain=False` reproduces the pre-Phase-5 mix for A/B.
+- Overlap is an ASSEMBLY concern, so cache identity is untouched: editing one
+  overlapping phrase leaves the other speaker's cached WAV byte-identical. Both
+  `_rebuild_track` and `synthesize_timeline` go through `assemble`, so an edit
+  cannot be levelled differently from the original render.
+- Two diarization turns overlapping does NOT mean the text is spoken twice.
+  Phase 5 consumes Phase 2's assignments; an ambiguous window stays unresolved
+  and yields one unit, not two.
+- `dubbing.overlap_profile(plan)` reports the regions where two or more voices
+  are active. Purely diagnostic; nothing branches on it.
+- Verify a real clip with `python scripts/overlap_check.py plan|check clip.mp4`.
+  It prints the active-speaker table and writes one isolated track per speaker.
+- Phases 1-6 are all done; see the sections below.
+
+## Reporting layer (Phase 6 done)
+
+- `engine/readiness.py` is the ONE readiness answer. The studio, the API and
+  every check script read it; nothing else formats its own opinion. A feature is
+  `ready` / `fallback_available` / `optional_missing` / `blocked`, and only a
+  `tier == "core"` feature can make `ready` false. Never load a model in a probe.
+- `readiness.token_state()` returns `{"present": bool}` and NOTHING else — no
+  value, no prefix, no length. `readiness.redact()` exists so a hand-built
+  payload cannot leak one. `tests/test_phase6_reporting.py` asserts no token
+  material reaches `snapshot()`, `run_summary.build()`, or any endpoint.
+- `engine/run_summary.py` is what a finished job did: `stage_rows()` reports each
+  stage as done/skipped/fallback with a reason, `warnings()` is the plain-
+  sentence list where a fallback becomes visible, and `_match_status()` is the
+  only place a voice score becomes a word. A degraded run is a RESULT, not an
+  error — do not make an optional stage failing turn a render into a failure.
+- `engine/artifact_cache.py` is the dependency graph. `invalidated_by(["field"])`
+  answers what a change costs; `reference_invalidates(label)` is why a per-speaker
+  re-clone is cheap. Validity is a comparison, never `os.path.exists`.
+  The transcript depends on `stems` because it is read from the vocals stem —
+  that is a real dependency, not an adjacency.
+- Speaker status lives in `speakers.status_of()` and is DERIVED, not stored, so
+  it cannot go stale when a reference is re-cut. `describe()` always emits the
+  stable `label`; `name` is the alias and never replaces it.
+- Aliases are an overlay only. `label` is what the unit cache, the plan, the
+  reference files and the manifest key on.
+- The per-speaker voice score is a DIAGNOSTIC, not identity proof. `match` /
+  `uncertain` / `different` / `unmeasured`; no universal pass threshold is
+  claimed because none has been validated.
+- `scripts/final_check.py` is the canonical end-to-end validation. `plan` must
+  work with no torch installed — that is the machine `plan` is for — so the
+  heavy imports are behind `_heavy()` and the readiness gate runs BEFORE them.
+- `docs/VALIDATION-MATRIX.md` is the real-video matrix. Every case is BLOCKED
+  here. Do not mark a case PASS without actually running it.
+
 ## Lint and test
 
 - Python: the project enforces only correctness rules

@@ -69,6 +69,69 @@ def satisfies(version: str, spec: str) -> bool:
     return True
 
 
+class OptionalExtraTests(unittest.TestCase):
+    """
+    The optional, gated extras must stay optional and must stay in step.
+
+    pyannote is the multi-speaker extra. It is heavy and gated, so it is
+    commented out of both files: an install that cannot reach Hugging Face, or
+    that does not want the weight, still gets a working single-speaker
+    pipeline. What must not happen is the two files disagreeing about it, or a
+    stray uncommented line quietly making every install pay for it.
+    """
+
+    def _lines(self, path):
+        return path.read_text(encoding="utf-8").splitlines()
+
+    def test_pyannote_is_not_installed_by_default(self):
+        for path in (REQUIREMENTS, DOCKER_REQUIREMENTS):
+            with self.subTest(path=path.name):
+                for line in self._lines(path):
+                    stripped = line.strip()
+                    if stripped.startswith("#"):
+                        continue
+                    self.assertFalse(
+                        stripped.startswith("pyannote"),
+                        f"{path} installs pyannote unconditionally; it is a "
+                        "gated, heavy extra and must stay commented out")
+
+    def test_both_files_mention_pyannote_the_same_way(self):
+        for path in (REQUIREMENTS, DOCKER_REQUIREMENTS):
+            with self.subTest(path=path.name):
+                text = path.read_text(encoding="utf-8")
+                self.assertIn("pyannote.audio", text,
+                              f"{path} should document how to enable the "
+                              "multi-speaker extra")
+
+    def test_demucs_is_not_installed_by_default(self):
+        # Phase 4's extra. Same rule as pyannote: heavy, optional, and off
+        # unless someone asks for it.
+        for path in (REQUIREMENTS, DOCKER_REQUIREMENTS):
+            with self.subTest(path=path.name):
+                for line in self._lines(path):
+                    stripped = line.strip()
+                    if stripped.startswith("#"):
+                        continue
+                    self.assertFalse(
+                        stripped.startswith("demucs"),
+                        f"{path} installs demucs unconditionally")
+
+    def test_both_files_document_the_background_extra(self):
+        for path in (REQUIREMENTS, DOCKER_REQUIREMENTS):
+            with self.subTest(path=path.name):
+                text = path.read_text(encoding="utf-8")
+                self.assertIn("demucs>=4.0.0", text,
+                              f"{path} should say how to enable background "
+                              "preservation")
+
+    def test_the_gated_model_is_documented_where_the_licence_is(self):
+        # The token and the licence URL belong next to the pin, so the person
+        # reading requirements.txt knows what to accept before installing.
+        text = REQUIREMENTS.read_text(encoding="utf-8")
+        self.assertIn("speaker-diarization", text)
+        self.assertIn("HF_TOKEN", text)
+
+
 class AvPinTests(unittest.TestCase):
     def test_both_requirement_files_pin_av(self):
         for path in (REQUIREMENTS, DOCKER_REQUIREMENTS):

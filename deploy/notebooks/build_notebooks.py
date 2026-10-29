@@ -71,9 +71,10 @@ def _assign_ids(cells: list[dict]) -> None:
 TITLE = md("""
 # VideoTrans - run the whole pipeline on a free GPU
 
-Dub a talking-head video into another language - transcribe, translate, clone
-the speaker's voice, lip-sync - on the machine this notebook is attached to,
-not on your laptop.
+Dub a video into another language - detect who is speaking, clone **each**
+speaker's voice, translate, lay the new dialogue over the film's own music and
+sound effects, lip-sync - on the machine this notebook is attached to, not on
+your laptop.
 
 **This needs a GPU runtime.** In Colab: **Runtime -> Change runtime type -> T4
 GPU**. In Kaggle: **Settings -> Accelerator -> GPU T4 x2**, and turn
@@ -154,6 +155,20 @@ for note in report["notes"]:
     print("  note:", note)
 
 print("FFmpeg:  ", "ready" if runtime.ensure_ffmpeg() else "NOT available")
+
+# The same readiness the studio shows. Every probe is an import spec or a file
+# check, so this is instant and loads no model.
+sys.path.insert(0, "engine")
+import readiness  # noqa: E402
+
+snapshot = readiness.snapshot()
+print()
+print("Features:")
+for line in readiness.summarize(snapshot):
+    print(" ", line)
+print()
+print("A missing OPTIONAL feature is a reduced dub, not a broken install.")
+print("Run the Verify cell after the install to see the full picture.")
 """)
 
 RUNTIME_MD = md("""
@@ -288,7 +303,44 @@ print()
 print("Fetching IndicF5's f5_tts fork...")
 subprocess.run([sys.executable, "scripts/vendor_f5_tts.py"], check=False)
 
-print("\\nInstall complete.")
+# The two optional extras. Both are heavy, both are off unless asked for, and
+# neither being absent stops a dub - so a failure here is reported and the
+# notebook carries on.
+#
+#   pyannote -> multi-speaker detection: one cloned voice per actor
+#   demucs   -> background preservation: the film's own music and SFX survive
+#
+# Demucs pulls `dora-search`, which pins `omegaconf<2.2`; the install is done
+# with `--no-deps` for that one package if the resolver objects, because the
+# only thing it is used for here is a CLI.
+print()
+print("Installing the optional extras (multi-speaker, background)...")
+for label, spec in (
+    ("pyannote (multi-speaker)", "pyannote.audio>=3.3.2"),
+    ("demucs (background)", "demucs>=4.0.0"),
+):
+    proc = subprocess.run(
+        [sys.executable, "-m", "pip", "install", "-q", spec],
+        capture_output=True, text=True,
+    )
+    if proc.returncode == 0:
+        print(f"  ok   {{label}}")
+    else:
+        print(f"  --   {{label}} did not install; the feature will be off")
+        tail = (proc.stderr or "").strip().splitlines()[-3:]
+        for line in tail:
+            print("       ", line)
+
+# Demucs needs its own weights on first use; it fetches them itself, but
+# warming it here turns a slow first render into a slow cell.
+try:
+    import demucs  # noqa: F401
+    print("  demucs importable")
+except Exception as exc:
+    print(f"  demucs not importable ({{exc}}); background preservation is off")
+
+print()
+print("Install complete. Run the Verify cell next.")
 """)
 
 MODELS_MD = md("""
@@ -357,6 +409,81 @@ if blocking:
 
 print()
 print("Ready. Start the server in the next cell.")
+""")
+
+VERIFY_MD = md("""
+## 6a. Verify what actually works
+
+One cell, the whole picture: which stages this runtime can run, which are
+reduced, and which are blocked. It is the same `readiness` report the studio
+shows on its Setup page, and the same one `scripts/final_check.py plan` prints.
+
+Nothing here loads a model, so it takes a second. **Run this before you start a
+render** - it is much cheaper than discovering a missing package ten minutes
+into a job.
+
+A missing *optional* feature is a reduced dub, not a broken install. The two
+extras are:
+
+- **pyannote** - multi-speaker detection, so each actor gets their own cloned
+  voice. Without it the whole video is dubbed in one voice.
+- **Demucs** - keeps the film's own music, sound effects and ambience under the
+  new dialogue. Without it the dub replaces the soundtrack.
+
+Neither being absent stops a dub.
+""")
+
+VERIFY = code(f"""
+import os
+import sys
+
+REPO_DIR = {REPO_DIR_EXPR}
+if REPO_DIR not in sys.path:
+    sys.path.insert(0, REPO_DIR)
+os.chdir(REPO_DIR)
+
+import json
+import readiness
+
+# Ask about a language too, so the answer covers the actual voice engine a
+# render would use rather than the general case.
+TARGET = os.environ.get("VIDEOTRANS_TARGET_LANG", "hi")
+snapshot = readiness.snapshot(target_language=TARGET)
+
+print("=" * 66)
+print("  READINESS")
+print("=" * 66)
+for line in readiness.summarize(snapshot):
+    print(line)
+
+print()
+if snapshot["ready"]:
+    print(f"READY. A dub into {{TARGET}} can be rendered here.")
+else:
+    print("NOT READY. Blocking:")
+    for name in snapshot["blocking"]:
+        feature = snapshot["features"].get(name) or {{}}
+        print(f"  {{name}}: {{feature.get('reason')}}")
+    print()
+    print("These are environment limits, not code failures. Transcription,")
+    print("translation and subtitles still work for the features that are ready.")
+
+# Structured, so it can be diffed between runtimes.
+print()
+print("features =", json.dumps(
+    {{n: f["status"] for n, f in snapshot["features"].items()}}, indent=2))
+
+# The optional extras, stated in terms of what a render will actually do.
+print()
+print("What a render will do here:")
+multi = snapshot["features"]["diarization"]["status"]
+bg = snapshot["features"]["background_preservation"]["status"]
+print("  speakers      :", "one per actor" if multi == "ready"
+      else "a single voice for the whole video")
+print("  soundtrack    :", "the film's music and SFX are kept"
+      if bg == "ready" else "replaced by the dub")
+print("  lip sync      :", "on" if snapshot["features"]["lipsync"]["status"]
+      == "ready" else "unavailable (audio dubbing still works)")
 """)
 
 SERVER_MD = md("""
@@ -434,6 +561,46 @@ ones that are not, and the reason. The 11 Indian languages need `HF_TOKEN`; the
 other languages need the XTTS extra, which is not in the default install
 (`pip install "TTS>=0.22.0"`). Choosing one that is not installed is refused
 before any work starts, with that reason.
+
+### Multi-speaker
+
+When pyannote installed successfully, a conversation is dubbed with **one voice
+per actor**: each speaker is cloned from their own cleanest 6-12 s of speech,
+and their lines are spoken in that voice throughout.
+
+The finished project lists every speaker with its status:
+
+| Status | Meaning |
+|---|---|
+| **Cloned** | a clean reference of their own was found |
+| **Short reference** | under 6 s of usable audio; the clone will be weaker |
+| **Fallback voice** | no usable audio at all; a generic voice is used |
+| **Unresolved** | no reference, so their lines use the video's default voice |
+
+**A speaker is never given another actor's voice.** A weak clone is reported
+rather than disguised.
+
+Each speaker has a **Change** button that lists only that speaker's own
+candidate windows. Picking one re-speaks that speaker's phrases and leaves the
+others byte-identical - it does not re-run transcription, translation or
+Demucs.
+
+### Overlapping dialogue
+
+Two actors talking at once keep their own start times; neither is pushed behind
+the other. The level is lowered only where they actually coincide, so a solo
+line is never attenuated by a distant overlap. One speaker still cannot talk
+over themselves.
+
+### Keeping the soundtrack
+
+Turn on **Keep original** on the Dub page to preserve the film's music, sound
+effects and ambience under the new dialogue. That needs Demucs, and it is
+**slow on CPU** - minutes per minute of video.
+
+The layer order is dialogue, then the preserved soundtrack, then any music bed
+you upload. An uploaded bed goes *under* the film's own score; it never
+replaces it.
 """)
 
 TUNNEL_MD = md("""
@@ -524,6 +691,12 @@ TROUBLE = md("""
 | Out of memory on a small GPU | Use a smaller Whisper: `os.environ["WHISPER_MODEL"] = "medium"` before starting the server. |
 | The LLM test returns 502 | Expected with no LLM configured. Script Intelligence is optional and off by default; nothing else needs it. |
 | The public URL stops working | The runtime recycled. Re-run from cell 1; the URL is valid only while the notebook runs. |
+| Every speaker came out as one voice | pyannote did not install, so there is no speaker detection. Check the install cell for the `--  pyannote` line. |
+| A speaker says "Fallback voice" | That actor had no usable clean audio, so a generic voice is used. Their reference window can be changed from the Speakers panel. |
+| A speaker says "Short reference" | Under 6 s of clean speech was found for them. The clone still works but is weaker; try changing their reference window. |
+| The soundtrack was not preserved | Demucs did not install or the *Keep original* toggle was off. Check the install cell for the `--  demucs` line. |
+| Background preservation is very slow | Demucs is roughly realtime on CPU and much faster on a GPU. Check the device line in the Verify cell. |
+| A render says "reduced" | That is a fallback, not a failure - the Verify cell lists exactly which stage. The run summary on the finished project says the same thing. |
 """)
 
 # ---------------------------------------------------------------------------
@@ -532,6 +705,7 @@ TROUBLE = md("""
 
 SHARED = [TITLE, GET_CODE_MD, GET_CODE, CHECK_MD, CHECK, RUNTIME_MD, RUNTIME,
           TOKEN_MD, TOKEN, INSTALL_MD, INSTALL, MODELS_MD, MODELS,
+          VERIFY_MD, VERIFY,
           SERVER_MD, SERVER, LOG_MD, LOG, USE_MD]
 
 COLAB = SHARED + [STOP_MD, STOP, TROUBLE]

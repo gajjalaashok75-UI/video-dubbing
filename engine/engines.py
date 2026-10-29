@@ -208,6 +208,19 @@ def save(choices: dict) -> dict:
 # studio change them without asking anyone to export a variable, while an
 # environment variable still wins so a scripted run stays predictable.
 #
+# How a stored or exported value is turned back into the right type. One table
+# for both readers: adding a kind to `TUNABLES` and forgetting one of them is
+# how a boolean ends up silently stored as the string "false" and read as True.
+def _as_bool(raw) -> bool:
+    """Truthy for the strings a person actually types, not for any non-empty one."""
+    if isinstance(raw, bool):
+        return raw
+    return str(raw).strip().lower() in ("1", "true", "yes", "on")
+
+
+_COERCE = {"int": int, "float": float, "str": str, "bool": _as_bool}
+
+
 # key: (default, kind, label, help, which engine it only applies to)
 TUNABLES = {
     "OUTPUT_CRF": (18, "int", "Encode quality",
@@ -227,6 +240,38 @@ TUNABLES = {
     "VIDEOTRANS_SWEEP_HOURS": (48, "float", "Keep unfinished runs for",
                             "Hours before an abandoned working folder is "
                             "swept. Saved projects are never swept.", None),
+    "DIAR_MIN_SPEAKERS": (1, "int", "Minimum speakers",
+                          "A hint to the diarizer. 1 lets it find as many as "
+                          "it hears; raise it when a video under-counts.", None),
+    "DIAR_MAX_SPEAKERS": (10, "int", "Maximum speakers",
+                          "A hint to the diarizer. A ceiling keeps background "
+                          "chatter from becoming extra characters.", None),
+    # Phase 4: keep the film's own music, ambience and sound effects.
+    "PRESERVE_BACKGROUND": (False, "bool", "Preserve original background",
+                            "Run Demucs to keep the film's music and sound "
+                            "effects under the new dialogue. Needs the demucs "
+                            "package and is slow on CPU.", None),
+    "BACKGROUND_LUFS": (-26.0, "float", "Background level (LUFS)",
+                        "Loudness the preserved background is normalised to. "
+                        "Lower buries the score further under the dialogue.",
+                        None),
+    "DIALOGUE_LUFS": (-12.0, "float", "Dialogue level (LUFS)",
+                      "Loudness the synthesized dialogue is normalised to.",
+                      None),
+    "BACKGROUND_DUCK": (False, "bool", "Duck background under speech",
+                        "Lower the music while someone is talking. Off by "
+                        "default: it keeps the score cinematic rather than "
+                        "switching it on and off.", None),
+    "DUCK_DB": (-12.0, "float", "Ducking depth (dB)",
+                "How far the background drops while dialogue is present.",
+                None),
+    "DUCK_RATIO": (6.0, "float", "Ducking ratio",
+                   "Compressor ratio for the ducking sidechain. Higher is "
+                   "firmer.", None),
+    "DEMUCS_CHUNK_SECONDS": (600, "int", "Separation chunk (seconds)",
+                             "Audio is separated in chunks this long, which "
+                             "bounds peak memory. Changing it re-runs Demucs.",
+                             None),
 }
 
 
@@ -257,7 +302,7 @@ def tunable(key: str):
         return default
     kind = TUNABLES[key][1]
     try:
-        return {"int": int, "float": float, "str": str}[kind](raw)
+        return _COERCE[kind](raw)
     except (TypeError, ValueError):
         return default
 
@@ -302,7 +347,7 @@ def save_tunables(values: dict) -> dict:
             continue
         kind = TUNABLES[key][1]
         try:
-            bucket[key] = {"int": int, "float": float, "str": str}[kind](value)
+            bucket[key] = _COERCE[kind](value)
         except (TypeError, ValueError):
             continue
     stored["tunables"] = bucket

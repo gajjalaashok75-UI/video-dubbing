@@ -89,6 +89,31 @@ gradio>=5,<6
 pillow>=10.0.0
 fonttools>=4.40.0
 
+# Multi-speaker dubbing. Diarization finds who spoke when, so each actor is
+# cloned from their own voice instead of the video getting one.
+#
+# pyannote is GATED, exactly like IndicF5: accept the licence on the model page
+# and HF_TOKEN in .env covers it. Without it the pipeline runs single-speaker,
+# which is what it did before this existed - the stage is never fatal.
+#   https://huggingface.co/pyannote/speaker-diarization-3.1
+#   https://huggingface.co/pyannote/segmentation-3.0
+#
+# Kept out of the default install because it is a heavy optional extra and most
+# videos are one speaker. To enable:  pip install "pyannote.audio>=3.3.2"
+# pyannote.audio>=3.3.2
+
+# Background preservation. Demucs splits the original soundtrack into speech and
+# everything else, so the film's music, sound effects and ambience survive under
+# the new dialogue instead of being replaced by it. Off by default; turn it on
+# per render in the studio, or set VIDEOTRANS_PRESERVE_BACKGROUND=1.
+#
+# Heavy and slow: roughly realtime or worse on CPU, and it downloads a ~300 MB
+# checkpoint on first use. Audio is separated in 10-minute chunks so peak memory
+# stays bounded on a full-length film.
+#
+# To enable:  pip install "demucs>=4.0.0"
+# demucs>=4.0.0
+
 # Utilities
 requests>=2.31.0
 typing-extensions>=4.12.0

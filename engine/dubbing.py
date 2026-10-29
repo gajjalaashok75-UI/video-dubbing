@@ -21,6 +21,11 @@ Here the dubbed track is *constructed* to be exactly as long as the video:
 
 Because step 4 is an invariant rather than a check, Wav2Lip always receives an
 audio track the same length as its video, and cannot loop or truncate.
+
+Every unit also carries the speaker it belongs to, and is spoken in that
+speaker's reference voice. A video with no diarization has one implicit
+`SPEAKER_00` whose reference is the global one, so the single-voice path is
+unchanged; see `speakers`.
 """
 
 import os
@@ -29,6 +34,7 @@ from contextlib import contextmanager
 import numpy as np
 
 import languages as L
+import speakers as SPK
 import tts_engines
 
 SAMPLE_RATE = 24000
@@ -82,9 +88,21 @@ class DurationModel:
     MAX_SPEAKER_FACTOR = 1.7
 
     def __init__(self, ref_duration: float, ref_text: str,
-                 source_lang: str = None, target_lang: str = "hi"):
+                 source_lang: str = None, target_lang: str = "hi",
+                 speaker_factor: float = None):
         self.source_cps = L.chars_per_second(source_lang) if source_lang else None
         self.target_cps = L.chars_per_second(target_lang)
+
+        # A caller that has already measured this speaker's tempo — from their
+        # own reference window — passes it in, because a per-speaker model is
+        # the whole point of a multi-speaker run: two actors do not talk at the
+        # same rate, and calibrating both against one of them makes the slower
+        # one sound rushed.
+        if speaker_factor is not None:
+            self.speaker_factor = min(self.MAX_SPEAKER_FACTOR,
+                                      max(self.MIN_SPEAKER_FACTOR,
+                                          float(speaker_factor)))
+            return
 
         factor = 1.0
         if ref_duration > 0.5 and ref_text and len(ref_text.strip()) > 8:
@@ -94,6 +112,15 @@ class DurationModel:
                 factor = typical / ref_cps
         self.speaker_factor = min(self.MAX_SPEAKER_FACTOR,
                                   max(self.MIN_SPEAKER_FACTOR, factor))
+
+    def tempo_factor(self) -> float:
+        """
+        This speaker's tempo, for handing to another `DurationModel`.
+
+        Exposed so `build_dubbed_track` can build one model per speaker without
+        re-deriving the ratio from the same reference twice.
+        """
+        return self.speaker_factor
 
     def estimate(self, text: str, source_text: str = None,
                  slot: float = None) -> float:
@@ -234,34 +261,118 @@ def prepare_units(segments: list, translated_texts: list,
 
     Falls back to whole-segment units if the audio is unavailable or VAD fails,
     so this can only improve on the previous behaviour, never break it.
+
+    Each returned unit inherits the SPEAKER of the segment it was split from,
+    so a phrase is always spoken in the voice that segment was assigned.
     """
     if not source_audio:
-        return segments, translated_texts
+        # The whole-segment path: the "units" ARE the segments, so the
+        # translations are passed through untouched rather than read off a
+        # `target` key that only phrase units carry.
+        units = _with_speakers(segments, segments, translated_texts)
+        return units, list(translated_texts)
 
     try:
         import speech_activity as SA
         runs = SA.detect_speech_runs(source_audio)
         units = SA.build_phrase_units(segments, translated_texts, runs)
         if not units:
-            return segments, translated_texts
+            units = _with_speakers(segments, segments, translated_texts)
+            return units, list(translated_texts)
         print(SA.summarize(units, segments, video_duration))
+        units = _with_speakers(segments, units, [u["target"] for u in units])
         return units, [u["target"] for u in units]
     except Exception as e:
         print(f"[DUB] Pause detection unavailable ({e}); "
               f"falling back to whole-segment units")
-        return segments, translated_texts
+        units = _with_speakers(segments, segments, translated_texts)
+        return units, list(translated_texts)
+
+
+def _with_speakers(segments: list, units: list, texts: list):
+    """
+    Copy each unit's speaker across from the segment it came from.
+
+    `speech_activity.build_phrase_units` splits a segment into several phrase
+    units and records the source segment index on each, so the label travels
+    with the phrase rather than being re-derived from the clock. Units that
+    already carry a speaker are left alone, so this is safe to call twice.
+    """
+    out = []
+    for i, unit in enumerate(units):
+        label = unit.get("speaker")
+        if label is None:
+            src_i = unit.get("segment")
+            if isinstance(src_i, int) and 0 <= src_i < len(segments):
+                label = SPK.label_of(segments[src_i])
+            elif i < len(segments):
+                label = SPK.label_of(segments[i])
+        out.append({**unit, "speaker": label})
+    return out
 
 
 def plan_timeline(segments: list, texts: list, duration_model: DurationModel,
-                  video_duration: float, natural_fn=None) -> list:
+                  video_duration: float, natural_fn=None, speakers: list = None,
+                  duration_models: dict = None, natural_for=None) -> list:
     """
     Decide the start time and allotted duration for every segment.
 
-    Returns a list of dicts: {index, text, start, duration, natural, rate}.
+    Returns a list of dicts:
+    {index, text, start, duration, natural, rate, speaker, ref_index}.
     `rate` is the speaking-rate multiplier actually applied, for logging.
+
+    `speakers` is the registry the unit's label is resolved against; when it is
+    omitted or empty every unit is `SPEAKER_00` with `ref_index` None, which is
+    exactly what a single-speaker job produces.
+
+    `duration_models` optionally maps a label to its own `DurationModel`, so two
+    actors are timed against their own measured tempo rather than one shared
+    average.
+
+    `natural_fn(text)` and `natural_for(text, seg, label)` both ask the generator
+    for its own length estimate. `natural_for` wins when both are given: it can
+    see which speaker the phrase belongs to, so the estimate is measured against
+    the reference that phrase will actually be spoken in. Either way the estimate
+    is taken here, before the closing squeeze, so the length invariant holds.
+
+    Scheduling is per speaker, not global. A single cursor serialised the whole
+    video, so in a conversation
+
+        SPEAKER_00  10.0 ───────── 13.0
+        SPEAKER_01        11.5 ───────── 14.0
+
+    the second line was pushed to 13.0-15.5 because the first had not finished.
+    That is not what a conversation sounds like, and it desynchronises the
+    speaker from the picture. Each speaker now keeps their own cursor, so a
+    different actor may start while another is still talking, which is the
+    normal case in film. The same speaker still cannot overlap themselves: their
+    own cursor advances, so a second line waits for the first to finish.
+
+    With one speaker there is one cursor, which is the previous behaviour
+    exactly — the single-speaker plan is byte-for-byte what it always was.
     """
     plan = []
-    cursor = 0.0
+    speakers = speakers or []
+    duration_models = duration_models or {}
+
+    # One cursor per speaker. `cursors` is the whole scheduling state; there is
+    # deliberately no global cursor, because a global one is the bug.
+    cursors: dict = {}
+
+    def next_start_for(label: str, from_index: int, seg_end: float) -> float:
+        """
+        When this speaker next speaks, which is how long they have to finish.
+
+        Deliberately the next segment belonging to the SAME speaker, not simply
+        the next segment in the list. In a conversation the following segment is
+        usually the other actor, and treating their start as this speaker's
+        deadline would cap a phrase by someone else's turn. For a single speaker
+        the two are the same list position, so this is the previous behaviour.
+        """
+        for j in range(from_index + 1, len(segments)):
+            if SPK.label_of(segments[j]) == label:
+                return float(segments[j].get("start", seg_end))
+        return video_duration
 
     # strict: one translation per segment. A short list used to truncate
     # the plan silently, which loses the end of the video with no error.
@@ -270,15 +381,16 @@ def plan_timeline(segments: list, texts: list, duration_model: DurationModel,
         if not text:
             continue
 
+        label = SPK.label_of(seg) or (speakers[0]["label"] if speakers
+                                      else SPK.DEFAULT_LABEL)
+
         seg_start = float(seg.get("start", 0.0))
         seg_end = float(seg.get("end", seg_start))
         slot = max(0.05, seg_end - seg_start)
 
-        # Pause between this segment and the next (or the tail of the video).
-        if i + 1 < len(segments):
-            next_start = float(segments[i + 1].get("start", seg_end))
-        else:
-            next_start = video_duration
+        # Pause between this segment and this speaker's next (or the tail of
+        # the video).
+        next_start = next_start_for(label, i, seg_end)
         gap = max(0.0, next_start - seg_end)
         available = slot + gap * BORROW_FRACTION
 
@@ -288,13 +400,20 @@ def plan_timeline(segments: list, texts: list, duration_model: DurationModel,
         # asking F5 for exactly what it would produce anyway means it never has
         # to internally compress or pad. Fall back to the text-ratio model.
         natural = None
-        if natural_fn is not None:
+        if natural_for is not None:
             try:
-                natural = natural_fn(text)
+                natural = natural_for(text, seg, label)
             except Exception:
                 natural = None
         if not natural or natural <= 0.05:
-            natural = duration_model.estimate(
+            if natural_fn is not None:
+                try:
+                    natural = natural_fn(text)
+                except Exception:
+                    natural = None
+        if not natural or natural <= 0.05:
+            model = duration_models.get(label, duration_model)
+            natural = model.estimate(
                 text, source_text=(seg.get("text") or "").strip(), slot=slot)
 
         # Give the generator the length it actually wants.
@@ -320,28 +439,73 @@ def plan_timeline(segments: list, texts: list, duration_model: DurationModel,
             target = available * 2.5
             rate = natural / target
 
-        # Never start before the previous segment finished.
+        # Never start before THIS SPEAKER's previous line finished. Another
+        # speaker's position is not a constraint.
+        cursor = cursors.get(label, 0.0)
         start = max(seg_start, cursor)
         plan.append({
             "index": i, "text": text, "start": start,
             "duration": target, "natural": natural, "rate": rate,
+            "speaker": label,
+            "ref_index": SPK.ref_index_for(speakers, label),
         })
-        cursor = start + target
+        cursors[label] = start + target
 
     # If cascading pushed us past the end of the video, compress everything by
     # the (small) residual so the last word still lands inside the picture.
-    if plan and cursor > video_duration > 0:
-        squeeze = video_duration / cursor
-        print(f"[DUB] Timeline overflows by {cursor - video_duration:.2f}s; "
+    # The end of the plan is the latest any speaker runs, not a single cursor.
+    end = max(cursors.values()) if cursors else 0.0
+    if plan and end > video_duration > 0:
+        squeeze = video_duration / end
+        print(f"[DUB] Timeline overflows by {end - video_duration:.2f}s; "
               f"compressing by {1 / squeeze:.3f}x")
-        c = 0.0
+        # The re-serialisation below has to be per speaker too. Applying one
+        # running cursor here would undo the whole point of the change: it would
+        # push every overlapping speaker back into a queue after the squeeze.
+        tightened: dict = {}
         for p in plan:
+            label = p.get("speaker") or SPK.DEFAULT_LABEL
+            c = tightened.get(label, 0.0)
             p["start"] *= squeeze
             p["duration"] *= squeeze
             p["start"] = max(p["start"], c)
-            c = p["start"] + p["duration"]
+            tightened[label] = p["start"] + p["duration"]
 
     return plan
+
+
+def overlap_profile(plan: list) -> list:
+    """
+    Where more than one generated voice is speaking at once.
+
+    Returns `[{"start", "end", "speakers"}]` for each region with two or more
+    active speakers, which is what the manual check reports and what the log
+    line below is built from. Purely diagnostic: nothing in the pipeline
+    branches on it.
+    """
+    edges = set()
+    for unit in plan or []:
+        start = float(unit.get("start", 0.0))
+        end = start + float(unit.get("duration", 0.0))
+        if end > start:
+            edges.add(start)
+            edges.add(end)
+    points = sorted(edges)
+    regions = []
+    for a, b in zip(points, points[1:]):
+        if b - a <= 1e-9:
+            continue
+        mid = (a + b) / 2.0
+        active = sorted({
+            (u.get("speaker") or SPK.DEFAULT_LABEL)
+            for u in plan or []
+            if float(u.get("start", 0.0)) <= mid
+            < float(u.get("start", 0.0)) + float(u.get("duration", 0.0))
+        })
+        if len(active) > 1:
+            regions.append({"start": round(a, 3), "end": round(b, 3),
+                            "speakers": active})
+    return regions
 
 
 @contextmanager
@@ -411,11 +575,121 @@ def synth_unit(unit: dict, ref_path: str, ref_text: str, ref_duration: float,
     return _edge_fade(wave, EDGE_FADE_MS)
 
 
-def assemble(plan: list, waves: dict, video_duration: float) -> np.ndarray:
+def _overlap_gain(track: np.ndarray, plan: list, waves: dict,
+                  fade_ms: float = EDGE_FADE_MS,
+                  ceiling: float = 1.0) -> np.ndarray:
+    """
+    Scale down only where several generated voices are simultaneously active.
+
+    Additive placement is right — two actors really do occupy the same samples —
+    but summing them can exceed full scale, and the pre-existing guard (`if peak
+    > 1: track /= peak`) is the wrong answer to that: one loud 300 ms overlap
+    would attenuate the entire film, which is audible everywhere the overlap is
+    not.
+
+    Two stages, both local:
+
+    1. **Power-preserving gain, `1/sqrt(n)`** for `n` voices active at a sample.
+       Power sums linearly, so `n` equal uncorrelated voices scaled by
+       `1/sqrt(n)` keep the total power constant:
+
+           1 voice  -> 1.000
+           2 voices -> 0.707 each
+           3 voices -> 0.577 each
+
+    2. **A local ceiling, inside the overlap regions only.** Stage 1 preserves
+       *power*, which is the right model for uncorrelated speech but not a
+       bound: two near-full-scale voices summing in phase give `2/sqrt(2)` =
+       1.41, which still clips. Rather than let the global limiter answer that
+       by scaling the whole film, the excess is taken out of the overlap region
+       itself. Solo audio is never touched.
+
+    Crucially both stages are *local curves*, not per-phrase decisions. A phrase
+    that overlaps another for 300 ms is scaled for those 300 ms and left alone
+    for the rest, rather than being quietened throughout. They are also built
+    from the same plan `assemble` places from, so the two cannot disagree about
+    where the overlap is.
+
+    **With one speaker both stages are exactly 1.0 everywhere**, so this is a
+    no-op and a single-speaker track is byte-for-byte what it always was. That is
+    not a coincidence — it is why the single-speaker regression tests still pass.
+
+    Edges are smoothed over `fade_ms` so a gain step cannot click. The window is
+    a box filter applied twice, which is cheap and has no ringing; a sharp step
+    at a phrase boundary would be audible as a tick.
+    """
+    total = len(track)
+    if total == 0:
+        return np.ones(0, dtype=np.float32)
+
+    # 1. Count, per sample, how many generated voices are active.
+    active = np.zeros(total + 1, dtype=np.int32)
+    for unit in plan or []:
+        wave = waves.get(unit.get("index"))
+        if wave is None or wave.size == 0:
+            continue
+        at = int(round(float(unit.get("start", 0.0)) * SAMPLE_RATE))
+        if at >= total:
+            continue
+        end = min(total, at + wave.size)
+        if end <= at:
+            continue
+        active[at] += 1
+        active[end] -= 1
+    counts = np.cumsum(active[:total])
+
+    if counts.max(initial=0) <= 1:
+        return np.ones(total, dtype=np.float32)
+
+    def smooth(curve: np.ndarray) -> np.ndarray:
+        n = max(1, int(SAMPLE_RATE * fade_ms / 1000.0))
+        if n > 1 and curve.size > n:
+            kernel = np.ones(n, dtype=np.float32) / n
+            curve = np.convolve(curve, kernel, mode="same").astype(np.float32)
+            curve = np.convolve(curve, kernel, mode="same").astype(np.float32)
+        return curve
+
+    # 2. Stage 1: the power-preserving curve.
+    gain = smooth((1.0 / np.sqrt(np.maximum(1, counts))).astype(np.float32))
+
+    # 3. Stage 2: the local ceiling.
+    #
+    #    Measured over the WHOLE track but applied only where the mask is set, so
+    #    the reduction lands in the overlap and never in a solo passage. The mask
+    #    is the same smoothed curve the gain uses, which matters: a single pass
+    #    is not enough, because at the ramp into an overlap the mask is partial,
+    #    so the reduction there is partial too and the peak survives at the
+    #    boundary. Each iteration takes the remaining excess out of the masked
+    #    region and leaves solo audio untouched, and the sequence converges
+    #    geometrically — measured, it needs 16 iterations to bring a 1.27 peak
+    #    under 1.0 while a solo passage stays at exactly 0.5. The loop is bounded
+    #    so a pathological input cannot spin, and it exits as soon as the peak is
+    #    inside the ceiling, which is the common case.
+    mask = smooth((counts > 1).astype(np.float32))
+    if mask.size and float(mask.max()) > 0.0:
+        for _ in range(24):
+            peak = float(np.max(np.abs(track * gain))) if track.size else 0.0
+            if peak <= ceiling:
+                break
+            scale = ceiling / peak
+            gain = (gain * (1.0 + (scale - 1.0) * mask)).astype(np.float32)
+
+    return gain
+
+
+def assemble(plan: list, waves: dict, video_duration: float,
+             overlap_gain: bool = True) -> np.ndarray:
     """
     Lay already-synthesized unit waves onto a track of exactly
     `video_duration` seconds. `waves` maps plan index to wave; a missing entry
     leaves silence in that slot.
+
+    Placement is additive, so two speakers may occupy the same samples — which
+    is the whole point of Phase 5. Where they do, `_overlap_gain` scales the sum
+    locally so the overlap cannot clip and the rest of the track is untouched.
+
+    `overlap_gain=False` reproduces the pre-Phase-5 mix exactly; it exists so the
+    difference is testable rather than asserted.
     """
     total_samples = int(round(video_duration * SAMPLE_RATE))
     track = np.zeros(total_samples, dtype=np.float32)
@@ -430,6 +704,12 @@ def assemble(plan: list, waves: dict, video_duration: float) -> np.ndarray:
         end = min(total_samples, at + wave.size)
         track[at:end] += wave[: end - at]
 
+    # Local overlap management, applied BEFORE the peak check so the check sees
+    # what will actually be written. With one speaker the curve is 1.0 and this
+    # is a no-op.
+    if overlap_gain and track.size:
+        track = track * _overlap_gain(track, plan, waves)
+
     peak = float(np.max(np.abs(track))) if track.size else 0.0
 
     # The guard that was missing. A track of exactly the right length made
@@ -441,7 +721,14 @@ def assemble(plan: list, waves: dict, video_duration: float) -> np.ndarray:
             "Synthesized track is silent (peak %.2e). The TTS model produced no "
             "audio — check that its weights actually loaded." % peak)
 
+    # Last-resort safety only. `_overlap_gain` has already handled the overlap
+    # case; anything still above full scale is three or more voices summing in
+    # phase, or a unit that came back louder than it should have. This is the
+    # guard, not the strategy: scaling the whole film for one loud moment is
+    # exactly what the local curve exists to avoid.
     if peak > 1.0:
+        print(f"[DUB] Peak {peak:.3f} above full scale after overlap gain; "
+              f"scaling the track by {1 / peak:.3f}")
         track /= peak
     return track
 
@@ -488,23 +775,34 @@ def unit_seconds(cache_dir: str, index) -> float | None:
 
 def synthesize_timeline(plan: list, ref_path: str, ref_text: str, ref_duration: float,
                         target_lang: str, video_duration: float,
-                        progress=None, cache_dir: str = None) -> np.ndarray:
+                        progress=None, cache_dir: str = None,
+                        speakers: list = None) -> np.ndarray:
     """
     Synthesize every planned segment and lay it onto a track of exactly
     `video_duration` seconds.
 
     When `cache_dir` is given, each unit's conditioned wave is written there so
     a later edit can rebuild one phrase instead of the whole track.
+
+    Each unit is spoken in ITS OWN speaker's reference when `speakers` is given;
+    the `ref_path`/`ref_text`/`ref_duration` arguments are the single-voice
+    fallback and are what a job with no registry uses, so the previous
+    behaviour is reproduced exactly.
     """
     waves = {}
     failures = []
     silent = []
+    global_ref = {"path": ref_path, "text": ref_text, "duration": ref_duration}
 
     for n, unit in enumerate(plan):
         if progress:
             progress(n, len(plan))
+        ref = SPK.reference_for(unit, speakers, global_ref) or global_ref
         try:
-            wave = synth_unit(unit, ref_path, ref_text, ref_duration, target_lang)
+            wave = synth_unit(unit, ref.get("path") or ref_path,
+                              ref.get("text") or ref_text,
+                              float(ref.get("duration") or ref_duration),
+                              target_lang)
         except Exception as e:
             print(f"[DUB] Segment {unit['index']} failed ({e}); leaving silence")
             failures.append((unit["index"], str(e)))
@@ -555,39 +853,113 @@ def _synth_fixed(engine, text, ref_path, ref_text, lang, fix_duration):
     return np.asarray(wave, dtype=np.float32).reshape(-1), out_sr
 
 
+def _speaker_duration_models(speakers: list, reference: dict,
+                             source_lang: str, target_lang: str,
+                             baseline: DurationModel) -> dict:
+    """
+    One `DurationModel` per speaker, each calibrated on that speaker's own
+    reference clip.
+
+    A shared model measures one actor's tempo and applies it to everyone. Two
+    people in one scene rarely talk at the same rate, so the slower one gets
+    compressed and the faster one gets padded — the same "the voice is
+    inconsistent" complaint the per-unit fix in `plan_timeline` addressed,
+    arriving from a different direction.
+
+    A speaker whose reference is missing or too short keeps the baseline, which
+    is the single-voice behaviour.
+    """
+    models = {}
+    for entry in speakers or []:
+        label = entry.get("label")
+        ref = entry.get("reference") or {}
+        duration = float(ref.get("duration") or 0.0)
+        text = ref.get("text") or ""
+        if not label:
+            continue
+        if ref is reference or (duration <= 0.0 and not text):
+            models[label] = baseline
+            continue
+        models[label] = DurationModel(duration, text,
+                                      source_lang=source_lang,
+                                      target_lang=target_lang)
+    return models
+
+
 def build_dubbed_track(segments: list, translated_texts: list, reference: dict,
                        target_lang: str, video_duration: float, out_path: str,
                        source_lang: str = None, progress=None,
-                       source_audio: str = None, cache_dir: str = None) -> list:
+                       source_audio: str = None, cache_dir: str = None,
+                       speakers: list = None) -> list:
     """
     Full segment-level dub. Writes a WAV of exactly `video_duration` seconds.
 
-    `reference` is the dict returned by reference_audio.build_reference().
+    `reference` is the dict returned by reference_audio.build_reference(): the
+    single-voice fallback, and the only voice a job without a speaker registry
+    ever uses.
+
+    `speakers` is the optional registry from `reference_audio.build_references`.
+    When it is present each phrase is spoken in its own speaker's reference and
+    timed against that speaker's tempo; when it is absent or empty the run is
+    the single-speaker pipeline, unchanged.
     """
+    speakers = speakers or []
     dm = DurationModel(reference["duration"], reference["text"],
                        source_lang=source_lang, target_lang=target_lang)
+    models = _speaker_duration_models(speakers, reference, source_lang,
+                                      target_lang, dm)
 
     units, texts = prepare_units(segments, translated_texts,
                                  source_audio, video_duration)
 
     engine = tts_engines.get_engine(target_lang)
     natural_fn = None
+    natural_for = None
     if hasattr(engine, "natural_duration"):
         _lang = L.synth_lang(target_lang)
-        natural_fn = lambda t: engine.natural_duration(
-            t, reference["path"], reference["text"], lang=_lang)
 
-    plan = plan_timeline(units, texts, dm, video_duration, natural_fn=natural_fn)
+        def natural_for(text, seg=None, label=None):
+            # F5's own estimate is measured against whichever reference the
+            # phrase will actually be spoken in, so the per-speaker call passes
+            # that speaker's clip rather than the global one. Resolving by label
+            # rather than by a plan unit is deliberate: this runs while the plan
+            # is still being built, so no unit exists yet.
+            ref = reference
+            for entry in speakers:
+                if (entry.get("label") == label
+                        and (entry.get("reference") or {}).get("path")):
+                    ref = entry["reference"]
+                    break
+            return engine.natural_duration(text, ref["path"], ref.get("text", ""),
+                                           lang=_lang)
+
+    plan = plan_timeline(units, texts, dm, video_duration, natural_fn=natural_fn,
+                         speakers=speakers, duration_models=models,
+                         natural_for=natural_for)
+
     if not plan:
         raise RuntimeError("Nothing to synthesize: no non-empty translated segments")
 
     speech = sum(p["duration"] for p in plan)
     print(f"[DUB] {len(plan)} segments, {speech:.1f}s speech in a "
           f"{video_duration:.1f}s video ({L.display_name(target_lang)})")
+    if speakers:
+        print(SPK.summarize(speakers, segments))
+
+    # Where two actors talk over each other. Purely informational, but it is
+    # the one thing about a multi-speaker dub that is invisible in the numbers:
+    # a total speech time that exceeds the video is normal, not a bug.
+    regions = overlap_profile(plan)
+    if regions:
+        total = sum(r["end"] - r["start"] for r in regions)
+        print(f"[DUB] {len(regions)} overlap region(s), {total:.1f}s of "
+              f"simultaneous dialogue "
+              f"(e.g. {regions[0]['speakers']} at {regions[0]['start']:.1f}s)")
 
     track = synthesize_timeline(plan, reference["path"], reference["text"],
                                 reference["duration"], target_lang,
-                                video_duration, progress, cache_dir=cache_dir)
+                                video_duration, progress, cache_dir=cache_dir,
+                                speakers=speakers)
 
     import soundfile as sf
     sf.write(out_path, track, SAMPLE_RATE, subtype="PCM_16")

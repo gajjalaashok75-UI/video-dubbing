@@ -51,6 +51,15 @@ MODELS = [
          why="Scores clone similarity in the evaluation harness",
          size="400 MB", required=False,
          files=("config.json", "pytorch_model.bin")),
+    # Optional: multi-speaker dubbing. Gated like IndicF5, so it shares the
+    # token path and the file-level presence check. Not `required`, because a
+    # single-speaker video - which is most of them - never loads it, and the
+    # pipeline falls back to one voice when it is absent.
+    dict(label="Speaker diarization", id="pyannote/speaker-diarization-3.1",
+         why="Finds who spoke when, so each actor is cloned from their own "
+             "voice. Needs pyannote.audio installed; optional",
+         size="32 MB", required=False, gated=True,
+         files=("config.yaml",)),
 ]
 
 # The Wav2Lip weights are not a Hub snapshot repo, and they are too large to

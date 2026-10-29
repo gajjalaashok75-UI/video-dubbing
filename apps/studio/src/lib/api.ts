@@ -204,6 +204,17 @@ export interface RenderOptions {
   /** A bed laid under the finished dub. */
   music?: File | null;
   musicGain?: number;
+  /**
+   * Keep the film's own music, sound effects and ambience under the new
+   * dialogue, via Demucs. Omit to follow the PRESERVE_BACKGROUND setting.
+   * If the user also attached a `music` bed, both are kept: the film's
+   * soundtrack stays, and the uploaded bed sits under it.
+   */
+  preserveBackground?: boolean | null;
+  /** Preserved-background level in LUFS. Omitted uses the engine default. */
+  backgroundLevel?: number;
+  /** Lower the music while someone is speaking. Off by default. */
+  duckBackground?: boolean;
   /** What this run should produce. Omitted means a full dub. */
   kind?: JobKind;
   /** What to call the project. Defaults to the file name. */
@@ -233,6 +244,15 @@ export async function submitVideo(
   if (options.trimStart != null) params.set("trim_start", String(options.trimStart));
   if (options.trimEnd != null) params.set("trim_end", String(options.trimEnd));
   if (options.music) params.set("music_gain", String(options.musicGain ?? -18));
+  if (options.preserveBackground != null) {
+    params.set("preserve_background", String(options.preserveBackground));
+  }
+  if (options.backgroundLevel != null) {
+    params.set("background_lufs", String(options.backgroundLevel));
+  }
+  if (options.duckBackground != null) {
+    params.set("background_duck", String(options.duckBackground));
+  }
   if (options.kind && options.kind !== "dub") params.set("kind", options.kind);
   if (options.name) params.set("name", options.name);
   if (options.subtitleLanguage) {
@@ -263,6 +283,13 @@ export interface Phrase {
   cleared?: boolean;
   /** What the current take actually takes to say, in seconds. */
   spoken?: number | null;
+  /**
+   * Who speaks this phrase. `SPEAKER_00` on a single-speaker video, which is
+   * every run made before diarization existed.
+   */
+  speaker?: string;
+  /** Where this phrase's speaker sits in the job's registry. */
+  ref_index?: number | null;
 }
 
 /** How a phrase sits in its slot. */
@@ -284,6 +311,55 @@ export interface PhraseTimeline {
   video_stale: boolean;
   target_language: string;
   segments: Phrase[];
+  /** The voice registry: one entry per detected speaker. */
+  speakers?: SpeakerProfile[];
+}
+
+/** One detected speaker, and the reference their phrases are spoken in. */
+export interface SpeakerProfile {
+  /** The stable id. Everything keys on this; an alias never replaces it. */
+  label: string;
+  /** What a person sees: the alias if they gave one, else the label. */
+  name: string;
+  alias?: string | null;
+  /**
+   * `cloned` — a clean same-speaker reference.
+   * `short_reference` — usable, but under the preferred length.
+   * `generic_fallback` — an explicit generic voice.
+   * `unresolved` — no usable reference at all.
+   */
+  status: "cloned" | "short_reference" | "generic_fallback" | "unresolved";
+  /** One sentence naming the problem, or null when the clone is clean. */
+  warning?: string | null;
+  fallback: boolean;
+  total_speech: number;
+  segment_count: number;
+  /** How many phrases this speaker actually speaks. */
+  phrase_count?: number;
+  reference: SpeakerReference | null;
+  reference_score?: number | null;
+}
+
+/** How a speaker's clone turned out, in the words the UI shows. */
+export const speakerStatusLabel = (status: SpeakerProfile["status"]) =>
+  ({
+    cloned: "Cloned",
+    short_reference: "Short reference",
+    generic_fallback: "Fallback voice",
+    unresolved: "Unresolved",
+  }[status] ?? status);
+
+/**
+ * The clip a speaker's voice was cloned from. Unlike `ReferenceWindow`, this is
+ * a clip that has already been cut, so it carries a path and a real duration
+ * rather than a score.
+ */
+export interface SpeakerReference {
+  path: string;
+  text: string;
+  start?: number | null;
+  end?: number | null;
+  duration: number;
 }
 
 export interface PhraseResult {
@@ -473,18 +549,160 @@ export interface ReferenceWindow {
   text: string;
 }
 
-export const getReferenceWindows = (id: string) =>
+export const getReferenceWindows = (id: string, speaker?: string) =>
   request<{ current: { start?: number; duration?: number; text: string };
+            speaker?: string | null;
+            speakers?: SpeakerProfile[];
             candidates: ReferenceWindow[] }>(
-    `/jobs/${encodeURIComponent(id)}/reference/candidates`);
+    `/jobs/${encodeURIComponent(id)}/reference/candidates`
+    + (speaker ? `?speaker=${encodeURIComponent(speaker)}` : ""));
 
-export const chooseReference = (id: string, start: number, duration: number) =>
+/**
+ * Clone from a different window. With `speaker`, only that speaker's phrases
+ * are re-spoken; without it, the whole script is.
+ */
+export const chooseReference = (id: string, start: number, duration: number,
+                                speaker?: string) =>
   request<{ job_id: string; status: string }>(
     `/jobs/${encodeURIComponent(id)}/reference`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ start, duration }),
+      body: JSON.stringify(speaker ? { start, duration, speaker }
+                                   : { start, duration }),
     });
+
+/* --- readiness ------------------------------------------------------------ */
+
+/** The four states a feature can be in. */
+export type FeatureStatus =
+  | "ready"
+  | "fallback_available"
+  | "optional_missing"
+  | "blocked";
+
+export interface Feature {
+  status: FeatureStatus;
+  tier: "core" | "optional";
+  /** Why, in a sentence a person can act on. */
+  reason?: string | null;
+  /** What happens without it, when it is optional. */
+  fallback?: string | null;
+  [key: string]: unknown;
+}
+
+export interface Readiness {
+  /** A dub can be rendered here. Missing optional features do not change it. */
+  ready: boolean;
+  blocking: string[];
+  /** Features that work, but in a reduced form. */
+  degraded: string[];
+  hardware: {
+    device: string;
+    cuda: boolean;
+    mps: boolean;
+    gpu_name?: string | null;
+    vram_gb?: number | null;
+    cpus?: number | null;
+    free_disk_gb?: number | null;
+  };
+  /**
+   * Whether a token is configured. Never the token itself, and never any part
+   * of it — the API reports presence and nothing else.
+   */
+  secrets: { HF_TOKEN: "present" | "missing" };
+  features: Record<string, Feature>;
+}
+
+export const getReadiness = (targetLanguage?: string, sourceLanguage?: string) => {
+  const params = new URLSearchParams();
+  if (targetLanguage) params.set("target_language", targetLanguage);
+  if (sourceLanguage) params.set("source_language", sourceLanguage);
+  const q = params.toString();
+  return request<Readiness>(`/api/readiness${q ? `?${q}` : ""}`);
+};
+
+/* --- run summary ---------------------------------------------------------- */
+
+export interface RunSummary {
+  status: string;
+  kind: string;
+  languages: { source?: string | null; target?: string | null };
+  video_duration?: number | null;
+  segments: { transcribed: number; translated: number; synthesized: number };
+  speakers: {
+    count: number;
+    labels: string[];
+    fallback: string[];
+    detail: SpeakerProfile[];
+  };
+  diarization: { ran: boolean; turns: number; source?: string | null };
+  overlap: { regions: number; seconds: number; max_speakers: number };
+  background: {
+    enabled: boolean; separated: boolean; ducking: boolean;
+    mixed: boolean; model?: string | null;
+  };
+  models: Record<string, string | null>;
+  artifacts: Record<string, string | null>;
+  stages: { key: string; label: string; state: string; detail?: string | null }[];
+  warnings: string[];
+  verification: {
+    sync?: { ok: boolean; reason: string } | null;
+    voice_match?: { score: number; cosine: number } | null;
+    per_speaker: { label: string; score?: number | null;
+                   cosine?: number | null; status: string }[];
+  };
+  environment?: {
+    device?: string | null;
+    ready?: boolean;
+    degraded?: string[];
+    secrets?: Record<string, string>;
+  };
+}
+
+export const getRunSummary = (id: string) =>
+  request<{ summary: RunSummary; text: string }>(
+    `/jobs/${encodeURIComponent(id)}/summary`);
+
+/* --- speakers ------------------------------------------------------------- */
+
+export const getSpeakers = (id: string) =>
+  request<{ speakers: SpeakerProfile[]; warnings: string[];
+            voice_match: { label: string; score?: number | null;
+                           cosine?: number | null; status: string }[] }>(
+    `/jobs/${encodeURIComponent(id)}/speakers`);
+
+/**
+ * Name a speaker.
+ *
+ * The alias is a display overlay: `label` stays the stable id, so renaming
+ * cannot invalidate a phrase or move a reference.
+ */
+export const renameSpeaker = (id: string, label: string, alias: string) =>
+  request<{ label: string; alias: string | null; speakers: SpeakerProfile[] }>(
+    `/jobs/${encodeURIComponent(id)}/speakers/${encodeURIComponent(label)}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ alias }),
+    });
+
+/**
+ * A URL for an intermediate artifact, for debugging by ear.
+ *
+ * Relative, like every other request here: FastAPI serves the built studio from
+ * the same origin, so there is no base URL to prepend.
+ */
+export const artifactUrl = (id: string, name: string) =>
+  `/jobs/${encodeURIComponent(id)}/artifact/${encodeURIComponent(name)}`;
+
+/** What a change to one input would re-run. */
+export interface CacheState {
+  present: Record<string, boolean>;
+  reclone: Record<string, string[]>;
+  change_costs: Record<string, { invalidates: string[]; worst: string | null }>;
+}
+
+export const getJobCache = (id: string) =>
+  request<CacheState>(`/jobs/${encodeURIComponent(id)}/cache`);
 
 /* --- engines -------------------------------------------------------------- */
 
