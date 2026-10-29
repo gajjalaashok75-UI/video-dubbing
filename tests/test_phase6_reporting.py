@@ -474,8 +474,13 @@ class RunSummaryTests(unittest.TestCase):
         snap = readiness.snapshot()
         summary = RS.build(job(), readiness=snap)
         self.assertIn("environment", summary)
+        # Whether a token is configured is a property of the machine running
+        # the test, not something this test can assume: asserting "missing"
+        # made it fail on every machine that HAS one. What must hold is that
+        # the summary carries a word and never the value.
+        present = bool(os.getenv("HF_TOKEN"))
         self.assertEqual(summary["environment"]["secrets"],
-                         {"HF_TOKEN": "missing"})
+                         {"HF_TOKEN": "present" if present else "missing"})
         self.assertIn("device", summary["environment"])
 
 

@@ -44,6 +44,10 @@ PERSISTED = (
     "stems",
     # Phase 6: display names, and the per-speaker voice scores.
     "speaker_aliases", "speaker_voice_match",
+    # `{skipped, reason}` when the clip had no face to sync. Persisted so a
+    # reopened project does not claim its lips were re-synced, and so the run
+    # summary keeps saying why the picture is unchanged.
+    "lip_sync",
 )
 
 

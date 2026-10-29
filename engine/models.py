@@ -60,6 +60,23 @@ MODELS = [
              "voice. Needs pyannote.audio installed; optional",
          size="32 MB", required=False, gated=True,
          files=("config.yaml",)),
+    # The 3.1 pipeline loads TWO other Hub repos the first time it runs:
+    # `segmentation-3.0` for the turns and the wespeaker model for the
+    # embeddings. They are separate snapshots, so a check on the pipeline repo
+    # alone read "present" while the first render still had to fetch 33 MB — or
+    # failed offline and silently fell back to one voice. Named here so setup
+    # fetches them and `readiness` can tell the truth. Filenames confirmed
+    # against both repos' `main` revision.
+    dict(label="Speaker segmentation", id="pyannote/segmentation-3.0",
+         why="Splits the soundtrack into speech turns. Gated with the "
+             "diarization model; optional",
+         size="6 MB", required=False, gated=True,
+         files=("config.yaml", "pytorch_model.bin")),
+    dict(label="Speaker embedding", id="pyannote/wespeaker-voxceleb-resnet34-LM",
+         why="Tells the detected voices apart, so two actors get two voices. "
+             "Optional",
+         size="27 MB", required=False,
+         files=("config.yaml", "pytorch_model.bin")),
 ]
 
 # The Wav2Lip weights are not a Hub snapshot repo, and they are too large to

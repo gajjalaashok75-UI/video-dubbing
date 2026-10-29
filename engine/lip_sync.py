@@ -97,6 +97,21 @@ class LipSyncError(RuntimeError):
     pass
 
 
+class NoFaceDetected(LipSyncError):
+    """
+    There is no face anywhere in the clip, so there is nothing to lip sync.
+
+    A separate type from `LipSyncError` because the two need opposite answers.
+    A broken decode or a failed encode means the render did not happen; a clip
+    with no face in it (a landscape, a screen recording, a title card, a shot
+    from behind) means lip sync is not APPLICABLE, and the dub is still
+    perfectly deliverable with the original picture. Callers catch this one and
+    mux the dubbed audio onto the untouched video instead of failing the job.
+    """
+
+    no_face = True
+
+
 def _out_of_memory() -> LipSyncError:
     """One message for both numpy's MemoryError and torch's OOM RuntimeError."""
     return LipSyncError(
@@ -287,9 +302,10 @@ class Wav2LipRunner:
             sparse.append(last)
 
         if all(b is None for b in sparse):
-            raise LipSyncError(
+            raise NoFaceDetected(
                 "No face detected anywhere in the video. Wav2Lip needs a "
-                "visible face; check framing, lighting, or crop the shot.")
+                "visible face; the dub is delivered on the original picture "
+                "without lip sync.")
 
         # Backfill any leading samples taken before the first good box.
         first = next(b for b in sparse if b is not None)

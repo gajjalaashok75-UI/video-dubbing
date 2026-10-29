@@ -135,18 +135,39 @@ class AssignmentTests(unittest.TestCase):
         out = SD.assign_segments(rows, turns)
         self.assertEqual([s["speaker"] for s in out], labels)
 
-    def test_a_speaker_change_inside_one_segment_is_split_by_word(self):
-        # The whole point of word-level assignment: one Whisper segment, two
-        # speakers. Labelling the segment as a whole would give the line to
-        # whoever talked more.
+    def test_a_speaker_change_inside_one_segment_becomes_two_segments(self):
+        # One Whisper segment, two speakers, two real runs of speech. Keeping
+        # it as one row gave the whole exchange to whoever talked more, so half
+        # of it was spoken in the other actor's cloned voice.
         turns = [turn(0.0, 2.0, "SPEAKER_00"), turn(2.0, 4.0, "SPEAKER_01")]
-        rows = [seg(0.0, 4.0, "hello there",
-                    [word("hello", 0.5, 1.0), word("there", 2.5, 3.0)])]
+        rows = [seg(0.0, 4.0, "hello there how are you",
+                    [word("hello", 0.2, 0.7), word("there", 0.9, 1.6),
+                     word("how", 2.2, 2.6), word("are", 2.7, 3.1),
+                     word("you", 3.2, 3.8)])]
         out = SD.assign_segments(rows, turns)
-        self.assertEqual([w["speaker"] for w in out[0]["words"]],
+        self.assertEqual([s["speaker"] for s in out],
                          ["SPEAKER_00", "SPEAKER_01"])
-        # The segment takes the majority, which is a tie broken by first-seen.
-        self.assertIn(out[0]["speaker"], ("SPEAKER_00", "SPEAKER_01"))
+        self.assertEqual(out[0]["text"], "hello there")
+        self.assertEqual(out[1]["text"], "how are you")
+        self.assertEqual((out[0]["start"], out[0]["end"]), (0.2, 1.6))
+        self.assertEqual((out[1]["start"], out[1]["end"]), (2.2, 3.8))
+
+    def test_a_one_word_interjection_does_not_become_its_own_speaker(self):
+        # A single short word across a change is a backchannel, not a line.
+        # Splitting there would speak one word in the other actor's voice.
+        turns = [turn(0.0, 2.0, "SPEAKER_00"), turn(2.0, 4.0, "SPEAKER_01")]
+        rows = [seg(0.0, 4.0, "and then",
+                    [word("and", 5.75, 5.95), word("then", 6.05, 6.25)])]
+        out = SD.assign_segments(rows, turns)
+        self.assertEqual(len(out), 1)
+
+    def test_a_single_speaker_segment_is_not_split(self):
+        turns = [turn(0.0, 4.0, "SPEAKER_00")]
+        rows = [seg(0.0, 4.0, "one line",
+                    [word("one", 0.2, 0.9), word("line", 1.1, 2.0)])]
+        out = SD.assign_segments(rows, turns)
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["text"], "one line")
 
     def test_unresolved_words_carry_the_previous_speaker_forward(self):
         # The gap at 4.0-6.0 is covered by no turn. Without carry-forward this

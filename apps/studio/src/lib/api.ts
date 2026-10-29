@@ -636,6 +636,9 @@ export interface RunSummary {
     detail: SpeakerProfile[];
   };
   diarization: { ran: boolean; turns: number; source?: string | null };
+  /** `skipped` means the clip has no visible face, so the dub plays over the
+   *  original picture. The stage row carries the same answer in words. */
+  lip_sync?: { skipped: boolean; reason?: string | null };
   overlap: { regions: number; seconds: number; max_speakers: number };
   background: {
     enabled: boolean; separated: boolean; ducking: boolean;

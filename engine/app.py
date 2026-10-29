@@ -845,16 +845,25 @@ def process_video_task(job_id: str, input_path: str, original_language: str,
             if mixed:
                 audio_for_video = mixed
 
-            generate_lip_synced_video(
-                input_path, audio_for_video, output_video_path,
-                wav2lip_batch_size=engines.tunable("W2L_BATCH"),
-                face_det_batch_size=engines.tunable("W2L_DET_BATCH"),
-                crf=engines.tunable("OUTPUT_CRF"),
-                preset=engines.tunable("OUTPUT_PRESET"),
-                progress=w2l_progress)
+            lip_sync_note = None
+            try:
+                generate_lip_synced_video(
+                    input_path, audio_for_video, output_video_path,
+                    wav2lip_batch_size=engines.tunable("W2L_BATCH"),
+                    face_det_batch_size=engines.tunable("W2L_DET_BATCH"),
+                    crf=engines.tunable("OUTPUT_CRF"),
+                    preset=engines.tunable("OUTPUT_PRESET"),
+                    progress=w2l_progress)
+            except lip_sync.NoFaceDetected as e:
+                # Not a failure: there is nothing in this picture to move. Keep
+                # the finished dub and deliver it on the original video.
+                _set(job_id, step="lip_sync_skipped")
+                lip_sync_note = _deliver_without_lip_sync(
+                    input_path, audio_for_video, output_video_path, str(e))
 
         if not os.path.exists(output_video_path):
             raise RuntimeError("Lip sync produced no output file")
+        _set(job_id, lip_sync=lip_sync_note)
 
         # ── 7. Verify audio and video actually agree ──
         _set(job_id, step="verifying")
@@ -905,6 +914,12 @@ def process_video_task(job_id: str, input_path: str, original_language: str,
              # against, what an A/B against the reference needs, and what a
              # remix can reuse without running IndicF5 again.
              mixed_path=(mixed or None),
+             # `stems` itself, not just the two paths. `run_summary`,
+             # `artifact_cache` and `_reusable_sibling` all resolve the
+             # background from this key; without it a render that DID preserve
+             # the soundtrack reported "not preserved" and a sibling re-ran
+             # Demucs from scratch.
+             stems=stems,
              background_path=(stems or {}).get("background"),
              vocals_path=(stems or {}).get("vocals"),
              source_language=source_language,
@@ -1709,6 +1724,29 @@ def _mix_audio(job_id: str, workdir: str, stem: str, dub_path: str,
         return None
 
 
+def _deliver_without_lip_sync(input_path: str, audio_path: str,
+                              out_path: str, reason: str) -> dict:
+    """
+    Attach the dub to the untouched picture when there is no face to sync.
+
+    Lip sync is only applicable when a face is visible for most of the clip. A
+    landscape, a screen recording, a title card, a product shot or footage from
+    behind used to raise `LipSyncError`, which the job treated as a failure: the
+    whole render was thrown away even though the dubbed audio was finished and
+    correct. The face detector failing to find anything is a statement about the
+    PICTURE, not about the audio, so the right answer is to skip the stage and
+    deliver the original video with the new soundtrack.
+
+    `av_sync.mux` copies the video stream untouched and encodes only the audio,
+    so this is the same quality the source had. The reason string is kept on the
+    job so the studio and the run summary can say the lips were not moved
+    instead of implying they were.
+    """
+    av_sync.mux(input_path, audio_path, out_path)
+    print(f"[Wav2Lip] Lip sync skipped — {reason}")
+    return {"skipped": True, "reason": reason}
+
+
 def _assign_implicit_speaker(segments: list, label: str = None) -> list:
     """
     Stamp the one-speaker label onto segments that have none.
@@ -2158,16 +2196,26 @@ def rerender_task(job_id: str):
         def w2l_progress(done, total):
             _set(job_id, step=f"lip_syncing ({done}/{total} frames)")
 
+        note = None
         with _HEAVY:
-            generate_lip_synced_video(
-                job["input_path"], job["dub_path"], job["output_path"],
-                wav2lip_batch_size=engines.tunable("W2L_BATCH"),
-                face_det_batch_size=engines.tunable("W2L_DET_BATCH"),
-                crf=engines.tunable("OUTPUT_CRF"),
-                preset=engines.tunable("OUTPUT_PRESET"),
-                progress=w2l_progress)
+            try:
+                generate_lip_synced_video(
+                    job["input_path"], job["dub_path"], job["output_path"],
+                    wav2lip_batch_size=engines.tunable("W2L_BATCH"),
+                    face_det_batch_size=engines.tunable("W2L_DET_BATCH"),
+                    crf=engines.tunable("OUTPUT_CRF"),
+                    preset=engines.tunable("OUTPUT_PRESET"),
+                    progress=w2l_progress)
+            except lip_sync.NoFaceDetected as e:
+                # Same rule as the first render: a clip with no face in it has
+                # nothing to sync, so the edited audio is muxed onto it instead
+                # of the re-render failing.
+                _set(job_id, step="lip_sync_skipped")
+                note = _deliver_without_lip_sync(
+                    job["input_path"], job["dub_path"], job["output_path"],
+                    str(e))
 
-        _set(job_id, step="verifying")
+        _set(job_id, step="verifying", lip_sync=note)
         check = av_sync.verify_sync(
             job["output_path"], tolerance=engines.tunable("SYNC_TOLERANCE"))
 
@@ -2327,6 +2375,17 @@ def reclone_task(job_id: str, start: float, duration: float, speaker: str = None
         if speaker and registry:
             track = _respeak_speaker(job_id, job, speaker, reference, progress)
         else:
+            # A whole-run re-clone means "every phrase now speaks in this
+            # clip". Since Phase 3 each phrase is spoken in its OWN speaker's
+            # reference, and `reference_for` prefers the registry over the
+            # global one — so replacing only `job["reference"]` left every
+            # unit resolving to the OLD file. The registry entries that were
+            # resolving to it have to move with it, or the re-clone re-speaks
+            # in the previous voice while claiming to have changed.
+            rebound = _rebind_reference(registry, job.get("reference") or {},
+                                        reference)
+            if rebound:
+                job["speakers"] = registry
             with _HEAVY:
                 _set(job_id, step="synthesizing_voice")
                 track = dubbing.synthesize_timeline(
@@ -2338,14 +2397,19 @@ def reclone_task(job_id: str, start: float, duration: float, speaker: str = None
         import soundfile as sf
         sf.write(job["dub_path"], track, dubbing.SAMPLE_RATE, subtype="PCM_16")
 
-        update = {
-            "status": "done", "step": "complete",
-            "reference": reference,
-            "reference_path": reference["path"],
-            "reference_text": reference["text"],
-            "reference_seconds": round(reference["duration"], 2),
-            "video_stale": True,
-        }
+        update = {"status": "done", "step": "complete",
+                  "video_stale": True}
+        # A per-speaker re-clone changes THAT voice; the job-wide reference —
+        # what the studio shows as "the clip the voice was cloned from" and
+        # what unresolved speakers fall back to — must not be overwritten with
+        # one actor's window.
+        if not speaker or len(registry) <= 1:
+            update.update({
+                "reference": reference,
+                "reference_path": reference["path"],
+                "reference_text": reference["text"],
+                "reference_seconds": round(reference["duration"], 2),
+            })
         if speaker and registry:
             update["speakers"] = registry
         jobs[job_id].update(update)
@@ -2361,6 +2425,34 @@ def reclone_task(job_id: str, start: float, duration: float, speaker: str = None
         traceback.print_exc()
         jobs.get(job_id, {}).update(
             {"status": "failed", "step": "error", "error": str(e)})
+
+
+def _rebind_reference(registry: list, old: dict, new: dict) -> int:
+    """
+    Point the speakers that were using `old` at `new`. Returns how many moved.
+
+    Only entries with no reference of their own, or with exactly the old
+    global clip, are touched. A speaker cloned from their own window keeps it:
+    a whole-run re-clone must not collapse a two-hander back into one voice,
+    which is the failure this whole phase exists to prevent.
+    """
+    old_path = (old or {}).get("path")
+    rebound = 0
+    for entry in registry or []:
+        ref = entry.get("reference") or {}
+        if ref.get("path") and not (old_path and ref.get("path") == old_path):
+            continue
+        entry["reference"] = dict(new)
+        entry["reference_score"] = None
+        entry["fallback"] = False
+        rebound += 1
+    if rebound:
+        print(f"[APP] Re-clone rebound {rebound} speaker(s) to "
+              f"{os.path.basename(new['path'])}")
+    elif registry:
+        print(f"[APP] Re-clone left {len(registry)} per-speaker reference(s) "
+              f"unchanged; name a speaker to re-clone one of them")
+    return rebound
 
 
 def _respeak_speaker(job_id: str, job: dict, label: str, reference: dict,

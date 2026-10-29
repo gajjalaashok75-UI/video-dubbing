@@ -80,6 +80,26 @@ gated repos: the failed fetch is what leaves the README behind, and counting it
 as "downloaded" is how a gated model used to look ready while every render
 failed.
 
+## The multi-speaker model is gated too
+
+Multi-speaker dubbing needs pyannote, and its weights are gated the same way.
+Accepting the licence on ONE repo is not enough: the 3.1 pipeline loads three,
+and the first render fails — non-fatally, with one voice for the whole video —
+if any of them is not granted to the same account the token belongs to.
+
+1. <https://huggingface.co/pyannote/speaker-diarization-3.1> (the pipeline)
+2. <https://huggingface.co/pyannote/segmentation-3.0> (finds the turns)
+3. <https://huggingface.co/pyannote/wespeaker-voxceleb-resnet34-LM> (open, no
+   licence — listed because it is downloaded alongside the other two)
+
+`pip install 'pyannote.audio>=3.3.2'` is still needed; the licence grants the
+weights, not the package. With both in place a conversation is dubbed with one
+cloned voice per actor, and the log says
+`[DIAR] N turns, 2 speaker(s)` instead of `Speaker diarization unavailable`.
+The studio's Setup page reports this feature as `ready` only when all three
+snapshots are on disk, so it cannot promise multi-speaker and then quietly
+produce one voice.
+
 ## If you have a token and it still fails
 
 - **Access not granted yet.** The token only works after step 2. Re-open the

@@ -6,9 +6,15 @@
   warmup; `models.py` owns the model catalogue and the Hugging Face cache
   checks; `subtitles.py` burns captions; `tts_engines.py` wraps the voices.
   `lip_sync.py` must never hold the whole clip: it reads the file twice (count
-  and detect, then render) and keeps one batch. Decoding a 60-second
-  1080x1920 clip into a list is 1,799 frames, 10.4 GiB — more than a hosted
-  runtime has, so the render is killed and takes the session with it.
+  and detect, then render) and keeps one batch. A clip with NO face anywhere
+  raises `lip_sync.NoFaceDetected` (a `LipSyncError` subclass); that is not a
+  failure — `process_video_task` and `rerender_task` catch it and mux the
+  finished dub onto the untouched picture via `av_sync.mux`, recording
+  `job["lip_sync"] = {"skipped", "reason"}` for the run summary. Do not turn it
+  back into a failed job: a landscape or a screen recording is a normal input.
+  Decoding a 60-second 1080x1920 clip into a list is 1,799 frames, 10.4 GiB —
+  more than a hosted runtime has, so the render is killed and takes the session
+  with it.
 - `apps/studio/` — React + Tauri desktop studio. `src/` is the UI; the built
   output is committed to `web/` and served by the engine.
 - `scripts/` — `selftest.py` (end-to-end), `download_models.py`, `fit_bench.py`.
@@ -90,6 +96,13 @@
   `fallback`. `reference_for(unit, speakers, fallback)` is the resolution chain
   every synthesis path goes through. A job with no registry resolves to the
   global reference, which is the pre-diarization behaviour.
+- `speaker_diarization.assign_segments` SPLITS a segment where the speaker
+  changes, using the per-word labels. One Whisper segment routinely spans a
+  question and its answer; labelling the segment as a whole spoke half the
+  exchange in the other actor's cloned voice. Runs shorter than
+  `MIN_SPLIT_SECONDS` fold into their neighbour, and more than four changes in
+  one segment is treated as diarizer noise and left whole, so the text is never
+  spoken twice and no single word is given to the wrong actor.
 - `engine/speaker_diarization.py` is the optional stage. pyannote is the only
   backend; `Diarizer` is the interface a second one would implement. `diarize()`
   returns `[]` rather than raising on EVERY failure path - no pyannote, no
@@ -111,6 +124,10 @@
 - Verify a real 2-3 speaker clip with
   `python scripts/multispeaker_check.py plan|check clip.mp4`. `check` prints a
   phrase-vs-reference similarity matrix; the diagonal is the pass.
+- A re-clone has to move the references the PLAN resolves, not just
+  `job["reference"]`: `_rebind_reference` repoints the registry entries that
+  were using the old global clip, and leaves a two-hander's per-speaker clips
+  alone. A per-speaker re-clone must not overwrite the job-wide reference.
 - `docs/INTEGRATION-multispeaker-background.md` is the design. All six
   phases are implemented; see the sections below.
 
@@ -131,6 +148,11 @@
   sample-exactly, so the segmentation is safe; Demucs is not, so every chunk's
   output is fitted back to its own input length before joining. A model that
   pads each chunk would otherwise drift by seconds over a film.
+- The finished dub stores `stems` ITSELF on the job, not just
+  `background_path`/`vocals_path`. `run_summary`, `artifact_cache` and sibling
+  reuse all read `job["stems"]`; when the dub path omitted it, a render that
+  did preserve the soundtrack reported "background not preserved" and warned
+  that the music was lost.
 - Stems cache in `<workdir>/stems/` with `stems.json` recording the input's
   size, mtime, model, chunk size and rate. A re-trim changes size and mtime, so
   it invalidates the cache automatically. `stems` is persisted on the manifest

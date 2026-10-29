@@ -931,5 +931,63 @@ class MixTests(unittest.TestCase):
         self.assertGreater(band_energy(out, 60, 110), 1e3)
 
 
+class ManifestTests(unittest.TestCase):
+    """
+    The finished job must carry the stems, not just their two paths.
+
+    `run_summary`, `artifact_cache` and sibling reuse all resolve the
+    background from `job["stems"]`. The dub completion path stored
+    `background_path`/`vocals_path` and forgot `stems`, so a render that DID
+    preserve the soundtrack reported "background not preserved", raised the
+    warning that says the music was lost, and re-ran Demucs on the next
+    sibling. The audio path spread `**common` and was correct, which is why
+    only one of the two outputs lied.
+    """
+
+    def test_the_dub_completion_stores_the_stems(self):
+        import ast
+        path = os.path.join(ROOT, "engine", "app.py")
+        with open(path, encoding="utf-8") as f:
+            tree = ast.parse(f.read())
+
+        function = next((n for n in tree.body
+                         if isinstance(n, ast.FunctionDef)
+                         and n.name == "process_video_task"), None)
+        self.assertIsNotNone(function, "process_video_task is gone")
+
+        # The dub completion is the call that records where the background
+        # went; requiring the stems there is the invariant that broke.
+        done = []
+        for node in ast.walk(function):
+            if not isinstance(node, ast.Call):
+                continue
+            if getattr(node.func, "id", None) != "_set":
+                continue
+            keywords = {k.arg for k in node.keywords}
+            if "background_path" in keywords:
+                done.append(keywords)
+
+        self.assertTrue(done, "the dub completion call was not found")
+        for keywords in done:
+            self.assertIn("stems", keywords,
+                          "a finished dub does not record its stems, so the "
+                          "run summary reports the background as lost")
+
+    def test_a_job_with_stems_reports_the_background_as_preserved(self):
+        import run_summary as RS
+        stems = {"vocals": "/tmp/v.wav", "background": "/tmp/b.wav",
+                 "model": "htdemucs", "chunks": 1}
+        summary = RS.build({"job_id": "j", "kind": "dub", "status": "done",
+                            "stems": stems, "mixed_path": "/tmp/m.wav",
+                            "segments": [], "translated_segments": [],
+                            "plan": [], "speakers": [], "diarization": []})
+        self.assertTrue(summary["background"]["separated"])
+        self.assertTrue(summary["background"]["mixed"])
+        row = next(r for r in summary["stages"]
+                   if r["key"] == "separating_audio")
+        self.assertEqual(row["state"], "done")
+        self.assertNotIn("were not preserved", " ".join(summary["warnings"]))
+
+
 if __name__ == "__main__":
     unittest.main()

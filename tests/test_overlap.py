@@ -595,9 +595,11 @@ class AmbiguousDiarizationTests(unittest.TestCase):
                          {_matching(r["text"]) for r in rows})
         self.assertTrue(dubbing.overlap_profile(plan))
 
-    def test_assignment_does_not_duplicate_one_segment_into_two(self):
-        # A segment straddling a change yields ONE labelled segment, whose
-        # words carry the split. It is not cloned into two segments.
+    def test_a_straddling_segment_is_split_without_duplicating_its_text(self):
+        # Two diarization turns overlapping in time does NOT mean the words are
+        # spoken twice. The segment is cut at the change so each half is spoken
+        # in the right voice, and the two halves still add up to the original
+        # text — no word is synthesized by both actors.
         turns = [{"start": 0.0, "end": 2.0, "speaker": "SPEAKER_00"},
                  {"start": 2.0, "end": 4.0, "speaker": "SPEAKER_01"}]
         rows = [{"start": 0.0, "end": 4.0, "text": "one two",
@@ -606,7 +608,12 @@ class AmbiguousDiarizationTests(unittest.TestCase):
                            {"word": "two", "start": 2.5, "end": 3.0,
                             "probability": 0.9}]}]
         labelled = SD.assign_segments(rows, turns)
-        self.assertEqual(len(labelled), 1)
+        self.assertEqual([s["speaker"] for s in labelled],
+                         ["SPEAKER_00", "SPEAKER_01"])
+        self.assertEqual(" ".join(s["text"] for s in labelled), "one two")
+        # Each word appears exactly once across the rows.
+        seen = [w["word"] for s in labelled for w in s["words"]]
+        self.assertEqual(sorted(seen), ["one", "two"])
 
 
 # ---------------------------------------------------------------------------

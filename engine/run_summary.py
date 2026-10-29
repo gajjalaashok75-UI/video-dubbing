@@ -93,10 +93,19 @@ def stage_rows(job: dict) -> list:
                 row["detail"] = ("No background was preserved, so the dub is "
                                  "the only audio.")
         elif key == "lip_syncing":
+            note = job.get("lip_sync") or {}
             if job.get("kind") in ("audio", "subtitles",
                                    "subtitles_translated"):
                 row["state"] = "skipped"
                 row["detail"] = f"not needed for a {job.get('kind')} output"
+            elif note.get("skipped"):
+                # The stage was applicable but not possible: no face was found
+                # in the picture. The dub is still delivered, on the original
+                # video, and this is the only place that says so.
+                row["state"] = "fallback"
+                row["detail"] = (note.get("reason")
+                                 or "No face was found, so the dub plays over "
+                                    "the original picture.")
         elif key == "verifying":
             sync = job.get("sync") or {}
             if sync.get("reason"):
@@ -192,6 +201,7 @@ def build(job: dict, readiness: dict = None) -> dict:
             "output": job.get("output_path") or job.get("filed_at"),
             "units_dir": job.get("units_dir"),
         },
+        "lip_sync": dict(job.get("lip_sync") or {"skipped": False}),
         "stages": stage_rows(job),
         "warnings": warnings(job),
         "verification": verification(job),
@@ -290,6 +300,11 @@ def warnings(job: dict) -> list:
     if not job.get("stems") and job.get("kind") in ("dub", "audio"):
         out.append("The original music and sound effects were not preserved; "
                    "the dub is the only audio track.")
+
+    note = job.get("lip_sync") or {}
+    if note.get("skipped"):
+        out.append("No face was found in the video, so the lips were not "
+                   "re-synced; the dub plays over the original picture.")
 
     missing = [m for m in (job.get("missing_units") or [])]
     if missing:

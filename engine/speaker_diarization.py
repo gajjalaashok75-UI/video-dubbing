@@ -454,6 +454,108 @@ def _majority(labels: list):
     return max(counts.items(), key=lambda kv: (kv[1], -list(counts).index(kv[0])))[0]
 
 
+# A run of words shorter than this on one side of a speaker change is a
+# backchannel ("mhm", "yeah"), not a line. Splitting there would hand one word
+# to the other actor and then speak it in their voice, which is the mismatch
+# this function exists to remove.
+MIN_SPLIT_SECONDS = 0.30
+
+
+def _split_at_changes(segment: dict) -> list:
+    """
+    Split one labelled segment wherever the speaker changes.
+
+    Whisper segments do not respect speaker boundaries: a three-second segment
+    routinely starts with one actor's question and ends with the other's answer.
+    Labelling the segment as a whole (which is what this used to do) gave the
+    whole exchange to whoever talked more, so half of it was spoken in the wrong
+    voice — audibly, male lines in the female voice.
+
+    The words already carry per-word labels from `assign_words`, so the split is
+    a groupby over them. A segment with one speaker — every segment of a
+    single-speaker video — is returned unchanged, so that path is untouched.
+    """
+    words = segment.get("words") or []
+    if len(words) < 2:
+        return [_row(segment, segment.get("start"), segment.get("end"),
+                     segment.get("text"), segment.get("speaker"), words)]
+
+    labels = {w.get("speaker") for w in words}
+    if len(labels) < 2 or None in labels:
+        return [_row(segment, segment.get("start"), segment.get("end"),
+                     segment.get("text"), segment.get("speaker"), words)]
+
+    # Word timings are required: the split rows' spans come from them, and the
+    # timeline schedules against the spans.
+    if any(w.get("start") is None or w.get("end") is None for w in words):
+        return [_row(segment, segment.get("start"), segment.get("end"),
+                     segment.get("text"), segment.get("speaker"), words)]
+
+    groups = []
+    for word in words:
+        if groups and groups[-1]["speaker"] == word["speaker"]:
+            groups[-1]["words"].append(word)
+        else:
+            groups.append({"speaker": word["speaker"], "words": [word]})
+
+    # More than a handful of changes inside one Whisper segment is a diarizer
+    # flip-flopping, not a conversation. Splitting there would shred a line
+    # into alternating one-word phrases spoken by different actors.
+    if len(groups) > 4:
+        return [_row(segment, segment.get("start"), segment.get("end"),
+                     segment.get("text"), segment.get("speaker"), words)]
+
+    # Fold a too-short run into the neighbour it is closest to, so a cough in
+    # the middle of a line cannot become that speaker's one-word phrase.
+    merged = []
+    for group in groups:
+        span = _span(group["words"])
+        if merged and span < MIN_SPLIT_SECONDS:
+            merged[-1]["words"].extend(group["words"])
+        else:
+            merged.append(group)
+    if len(merged) > 1 and _span(merged[0]["words"]) < MIN_SPLIT_SECONDS:
+        merged[1]["words"] = merged[0]["words"] + merged[1]["words"]
+        merged = merged[1:]
+
+    if len(merged) < 2:
+        return [_row(segment, segment.get("start"), segment.get("end"),
+                     segment.get("text"), segment.get("speaker"), words)]
+
+    rows = []
+    for group in merged:
+        start, end = _span(group["words"], with_bounds=True)
+        text = " ".join((w.get("word") or "").strip()
+                        for w in group["words"]).strip()
+        if not text:
+            continue
+        rows.append(_row(segment, start, end, text, group["speaker"],
+                         group["words"]))
+    return rows or [_row(segment, segment.get("start"), segment.get("end"),
+                         segment.get("text"), segment.get("speaker"), words)]
+
+
+def _span(words: list, with_bounds: bool = False):
+    """The seconds a run of words occupies, or (start, end) when asked."""
+    try:
+        start = min(float(w["start"]) for w in words)
+        end = max(float(w["end"]) for w in words)
+    except (KeyError, TypeError, ValueError):
+        return (0.0, 0.0) if with_bounds else 0.0
+    return (start, end) if with_bounds else max(0.0, end - start)
+
+
+def _row(segment: dict, start, end, text, speaker, words) -> dict:
+    """One segment-shaped row, with the timings coerced the way callers read them."""
+    return {"start": float(start if start is not None
+                           else segment.get("start", 0.0)),
+            "end": float(end if end is not None
+                         else segment.get("end", 0.0)),
+            "text": (text or "").strip(),
+            "speaker": speaker,
+            "words": words}
+
+
 def assign_segments(segments: list, turns: list,
                     tolerance: float = TOLERANCE) -> list:
     """
@@ -471,12 +573,10 @@ def assign_segments(segments: list, turns: list,
     with_words = any((seg.get("words") or []) for seg in segments or [])
     if with_words:
         labelled = assign_words(segments, turns, tolerance)
-        return [{"start": float(s.get("start", 0.0)),
-                 "end": float(s.get("end", 0.0)),
-                 "text": (s.get("text") or "").strip(),
-                 "speaker": s.get("speaker"),
-                 "words": s.get("words")}
-                for s in labelled]
+        rows = []
+        for s in labelled:
+            rows.extend(_split_at_changes(s))
+        return rows
 
     out = []
     last_known = None

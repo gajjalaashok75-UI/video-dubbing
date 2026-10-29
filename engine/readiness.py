@@ -179,6 +179,14 @@ def _gated_reason(package: str, repo: str, present: bool, token: bool) -> str:
             f"Setup page, or run scripts/download_models.py.")
 
 
+# Every Hub snapshot pyannote's 3.1 pipeline loads: the pipeline itself, the
+# segmentation model that finds the turns, and the embedding model that tells
+# the voices apart.
+_DIARIZATION_REPOS = ("pyannote/speaker-diarization-3.1",
+                      "pyannote/segmentation-3.0",
+                      "pyannote/wespeaker-voxceleb-resnet34-LM")
+
+
 def feature_diarization(token: bool = None) -> dict:
     """Multi-speaker detection: pyannote plus its gated weights."""
     token = token_state()["present"] if token is None else token
@@ -198,10 +206,15 @@ def feature_diarization(token: bool = None) -> dict:
                                         present, token)
         return entry
 
+    # ALL THREE repos, not just the pipeline one. pyannote 3.1's config names
+    # `pyannote/segmentation-3.0` and `pyannote/wespeaker-voxceleb-resnet34-LM`,
+    # which it fetches on first use. Checking only the pipeline repo made the
+    # Setup page say READY while a render still had to download, or -- offline --
+    # quietly produced one voice for a two-hander.
     downloaded = True
     try:
         import models
-        downloaded = models.is_cached("pyannote/speaker-diarization-3.1")
+        downloaded = all(models.is_cached(repo) for repo in _DIARIZATION_REPOS)
     except Exception:                                        # noqa: BLE001
         pass
     if not downloaded:
