@@ -148,16 +148,67 @@ def _load_model():
     try:
         AutoModelForSeq2SeqLM, AutoTokenizer = _get_transformers_classes()
         _tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-        # NLLB-200 models use M2M100 architecture. In transformers 4.49+,
-        # AutoModelForSeq2SeqLM should resolve M2M100ForConditionalGeneration
-        # from the config's model_type. If it fails, fall back to the explicit
-        # class so a version drift in the auto-mapping does not break the load.
+        
+        # NLLB-200 models use M2M100 architecture. Try multiple loading strategies:
+        # 1. AutoModelForSeq2SeqLM (works with most transformers versions)
+        # 2. Explicit M2M100ForConditionalGeneration import (older transformers)
+        # 3. Direct model class lookup from config (newer transformers)
+        loaded = False
+        
+        # Strategy 1: AutoModelForSeq2SeqLM
         try:
             _model = AutoModelForSeq2SeqLM.from_pretrained(MODEL_NAME).to(DEVICE)
+            loaded = True
+            print("[Translation-v2] Loaded via AutoModelForSeq2SeqLM")
         except (ValueError, ImportError) as auto_err:
-            # Explicit import as a fallback when the auto mapper fails.
-            from transformers.models.m2m_100 import M2M100ForConditionalGeneration
-            _model = M2M100ForConditionalGeneration.from_pretrained(MODEL_NAME).to(DEVICE)
+            print(f"[Translation-v2] AutoModelForSeq2SeqLM failed: {auto_err}")
+        
+        # Strategy 2: Explicit M2M100ForConditionalGeneration
+        if not loaded:
+            try:
+                from transformers.models.m2m_100 import M2M100ForConditionalGeneration
+                _model = M2M100ForConditionalGeneration.from_pretrained(MODEL_NAME).to(DEVICE)
+                loaded = True
+                print("[Translation-v2] Loaded via M2M100ForConditionalGeneration")
+            except (ImportError, AttributeError) as m2m_err:
+                print(f"[Translation-v2] M2M100ForConditionalGeneration failed: {m2m_err}")
+        
+        # Strategy 3: Try M2M100Model (some versions use this naming)
+        if not loaded:
+            try:
+                from transformers.models.m2m_100 import M2M100Model
+                _model = M2M100Model.from_pretrained(MODEL_NAME).to(DEVICE)
+                loaded = True
+                print("[Translation-v2] Loaded via M2M100Model")
+            except (ImportError, AttributeError) as m2m_err:
+                print(f"[Translation-v2] M2M100Model failed: {m2m_err}")
+        
+        # Strategy 4: Try to get the class from the config
+        if not loaded:
+            try:
+                from transformers import AutoConfig
+                config = AutoConfig.from_pretrained(MODEL_NAME)
+                model_class_name = config.model_type.title() + "ForConditionalGeneration"
+                # Try to find the class dynamically
+                for module_name in ['transformers.models.m2m_100', 'transformers.models.nllb']:
+                    try:
+                        module = __import__(module_name, fromlist=[model_class_name])
+                        if hasattr(module, model_class_name):
+                            model_class = getattr(module, model_class_name)
+                            _model = model_class.from_pretrained(MODEL_NAME).to(DEVICE)
+                            loaded = True
+                            print(f"[Translation-v2] Loaded via {module_name}.{model_class_name}")
+                            break
+                    except (ImportError, AttributeError):
+                        continue
+            except Exception as config_err:
+                print(f"[Translation-v2] Config-based loading failed: {config_err}")
+        
+        if not loaded:
+            raise RuntimeError(
+                f"Could not load NLLB model '{MODEL_NAME}' with any known strategy. "
+                f"transformers version may be incompatible. Try: pip install 'transformers<4.50'"
+            )
 
         # FP16 on CUDA for speed
         if DEVICE == "cuda":

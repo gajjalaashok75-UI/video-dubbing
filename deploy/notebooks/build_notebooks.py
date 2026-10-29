@@ -425,10 +425,13 @@ PROBE = ("import sys, numpy, numba, transformers, huggingface_hub, torchcodec;"
          "print(transformers.__version__);"
          "print(huggingface_hub.__version__);"
          "print(torchcodec.__version__);"
-         "sys.exit(0 if transformers.__version__.startswith('4.')"
+         "ok = (numpy.__version__.startswith('2.2') or numpy.__version__.startswith('2.1')"
+         " or numpy.__version__.startswith('2.0') or numpy.__version__.startswith('1.'))"
+         " and transformers.__version__.startswith('4.')"
          " and huggingface_hub.__version__.startswith('0.')"
-         " and torchcodec.__version__.startswith('0.10.') else 1)")
-REPAIR = ["numpy>=1.26.0,<2.3", "transformers>=4.49,<5",
+         " and torchcodec.__version__.startswith('0.10.');"
+         "print('OK' if ok else 'FAIL'); sys.exit(0 if ok else 1)")
+REPAIR = ["numpy==2.2.6", "transformers>=4.49,<5",
           "huggingface-hub>=0.30,<1.0", "torchcodec==0.10.0"]
 
 probe = subprocess.run([sys.executable, "-c", PROBE],
