@@ -189,15 +189,21 @@ def _langs_flores(source: str, target: str, for_speech: bool = True) -> tuple[st
         for_speech: if True, use the script the voice model reads; if False,
                    use the language's own script (for subtitles in the original
                    script where that differs from speech, e.g. Urdu).
+
+    Uses languages.py for special cases like Urdu where the spoken script
+    (Devanagari for IndicF5) differs from the written script (Arabic).
     """
+    import languages as _L  # local import to avoid startup cost
+
     src = _resolve_code(source)
+    
     if for_speech:
-        # For speech, use the target flores code directly
-        tgt = _resolve_code(target)
+        # For speech: use languages.py target_flores which handles Urdu->Devanagari
+        tgt = _L.target_flores(target, for_speech=True)
     else:
-        # For subtitles in original script, same logic but the caller may pass
-        # a different target (e.g. Urdu subtitles in Urdu script, not Devanagari)
-        tgt = _resolve_code(target)
+        # For subtitles: use the language's own script
+        tgt = _L.target_flores(target, for_speech=False)
+    
     return src, tgt
 
 
