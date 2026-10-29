@@ -410,7 +410,7 @@ try:
 except Exception as exc:
     print(f"  demucs not importable ({{exc}}); background preservation is off")
 
-# Re-assert the two pins a manual `pip install -U` breaks. Both are silent
+# Re-assert the pins a manual `pip install -U` breaks. These are silent
 # until boot, where the voice model or NLLB simply fails to import:
 #
 #   NumPy  - numba (librosa's audio loader, used by the voice engine AND by
@@ -418,14 +418,18 @@ except Exception as exc:
 #                "Numba needs NumPy 2.2 or less. Got NumPy 2.5."
 #   transformers - 5.x cannot be installed next to the hub pin below, and the
 #            symptom is "cannot import name 'GenerationMixin'".
-PROBE = ("import sys, numpy, numba, transformers, huggingface_hub;"
+#   torchcodec - f5-tts pulls >=0.11.0 which only has CUDA 13 wheels;
+#            the app needs 0.10.0 for CUDA 12 compatibility.
+PROBE = ("import sys, numpy, numba, transformers, huggingface_hub, torchcodec;"
          "print(numpy.__version__);"
          "print(transformers.__version__);"
          "print(huggingface_hub.__version__);"
+         "print(torchcodec.__version__);"
          "sys.exit(0 if transformers.__version__.startswith('4.')"
-         " and huggingface_hub.__version__.startswith('0.') else 1)")
+         " and huggingface_hub.__version__.startswith('0.')"
+         " and torchcodec.__version__.startswith('0.10.') else 1)")
 REPAIR = ["numpy>=1.26.0,<2.3", "transformers>=4.49,<5",
-          "huggingface-hub>=0.30,<1.0"]
+          "huggingface-hub>=0.30,<1.0", "torchcodec==0.10.0"]
 
 probe = subprocess.run([sys.executable, "-c", PROBE],
                        capture_output=True, text=True)
