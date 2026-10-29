@@ -299,7 +299,21 @@ def _cuda12_torch():
     return probe.returncode == 0
 
 
-if _cuda12_torch():
+# Decide whether a CUDA 12 torch is usable in this kernel. Probe in a
+# subprocess so we never import torch into this kernel first - on Python 3.13
+# unloading and re-importing PyTorch's C-extensions raises
+#   RuntimeError: function '_has_torch_function' already has a docstring
+cuda12 = False
+if "torch" in sys.modules:
+    # An earlier cell already imported torch in this kernel; check it directly
+    # rather than probing a subprocess that may not match.
+    import torch  # noqa: E402
+    cuda12 = bool(torch.cuda.is_available()
+                  and (torch.version.cuda or "").startswith("12"))
+else:
+    cuda12 = _cuda12_torch()
+
+if cuda12:
     print("A CUDA 12 torch is already installed; skipping the reinstall")
 else:
     subprocess.run(
@@ -307,12 +321,19 @@ else:
          "--index-url", TORCH_INDEX, "--force-reinstall"],
         check=True,
     )
+    # pip installed CUDA 12 on disk, but if torch is already in sys.modules
+    # (imported by an earlier cell) it is still the stale non-CUDA-12 build.
+    # PyTorch's C-extensions cannot be unloaded and re-imported in the same
+    # process on Python 3.13, so the kernel cannot switch to the new build.
+    if "torch" in sys.modules:
+        raise SystemExit(
+            f"torch {{torch.__version__}} (CUDA {{torch.version.cuda}}) is already "
+            "loaded in this session. The CUDA 12 build was installed on disk, "
+            "but this kernel still holds the older build. Restart the runtime "
+            "and re-run this cell."
+        )
+    import torch  # noqa: E402
 
-# Import torch for the version check below. torch was never imported in this
-# process before now (the CUDA check ran in a subprocess), so there is nothing
-# to unload and no reload conflict - which matters on Python 3.13, where
-# re-importing PyTorch's C-extensions raises a docstring error.
-import torch  # noqa: E402
 print("torch", torch.__version__, "| CUDA available:", torch.cuda.is_available())
 if not (torch.version.cuda or "").startswith("12"):
     raise SystemExit(
