@@ -1,145 +1,173 @@
+# ============================================================
+# Video Dubbing — pinned runtime dependencies
+# Target: Google Colab / Kaggle, CUDA 12.4, Python 3.12/3.13
+# ============================================================
+
+# ----------------------------
 # Core
-fastapi>=0.111.0
-uvicorn[standard]>=0.30.0
-python-multipart>=0.0.31   # < 0.0.31 has advisories in the upload parser
-pydantic>=2.6.0
+# ----------------------------
+fastapi>=0.111.0,<1
+uvicorn[standard]>=0.30.0,<1
+python-multipart>=0.0.31
+pydantic>=2.10,<3
 
-# Torch stack. The CUDA-12 code line is required, not cosmetic: CTranslate2
-# (faster-whisper's backend) is built against CUDA 12 and dlopens
-# libcublas.so.12 at the FIRST encode. torch >= 2.7 ships CUDA 13 wheels whose
-# cuBLAS is libcublas.so.13, so a hosted image that already had torch 2.11+cu130
-# satisfied `torch>=2.2.0` and every render then died ~6s in with
-# "RuntimeError: Library libcublas.so.12 is not found or cannot be loaded" -
-# after the model had loaded and the job had been accepted.
-# 2.6.0 is the last release published for cu124; see the install cell in
-# deploy/notebooks/build_notebooks.py, which force-installs that build.
-torch>=2.2.0,<2.7
-torchaudio>=2.2.0,<2.7
-torchvision>=0.17.0,<0.22
 
+# ============================================================
+# Torch stack
+# ============================================================
+#
+# IMPORTANT:
+# The actual CUDA 12.4 wheels are installed separately by the
+# Colab/Kaggle install cell using the official PyTorch cu124 index.
+#
+# Keep these EXACTLY aligned:
+#
+#   torch       2.6.0
+#   torchaudio  2.6.0
+#   torchvision 0.21.0
+#
+# Do not let pyannote/f5-tts/other packages upgrade this stack.
+
+torch==2.6.0
+torchaudio==2.6.0
+torchvision==0.21.0
+
+
+# ============================================================
 # Audio / Video
+# ============================================================
+
 ffmpeg-python==0.2.0
-librosa>=0.10.0
-soundfile>=0.12.0
-# Numba (through librosa, which the voice engine and Wav2Lip both load audio
-# with) refuses NumPy newer than 2.2:
-#     "Numba needs NumPy 2.2 or less. Got NumPy 2.5."
-# IndicF5 then fails at boot and lip sync's warmup fails with it, so the dub
-# never gets a voice. Unpinned, a fresh install takes the newest NumPy.
-numpy>=1.26.0,<2.3
-scipy>=1.11.0
-opencv-python>=4.8.0
 
-# STT — faster-whisper (CTranslate2 backend, replaces openai-whisper)
-faster-whisper>=1.0.0
-ctranslate2>=4.0.0
-# PyAV is faster-whisper's audio decoder and its one unpinned dependency: it
-# declares `av>=11` with no ceiling, so a fresh install takes the newest. PyAV
-# 19.0.0 (2026-09-29) REMOVED the `metadata_errors` argument to av.open() that
-# faster-whisper 1.2.1 still passes, and every transcription then dies in
-# decode_audio with "TypeError: open() got an unexpected keyword argument
-# 'metadata_errors'" before a single frame is decoded. Held below 19 until
-# faster-whisper stops passing it.
-av>=11,<19
+# NumPy 2.5 broke numba/librosa/Wav2Lip in the Colab image.
+numpy==2.2.6
 
-# Imported directly by the voice engine (tts_engines.py reads IndicF5's
-# safetensors by hand) and by the vendored Wav2Lip face detector. Both
-# arrive with torch/transformers today, but pinning them means a future
-# dependency change cannot remove a module the code imports by name.
-safetensors>=0.4.0
-tqdm>=4.66.0
+librosa==0.11.0
+soundfile>=0.12,<1
+scipy>=1.11,<2
+opencv-python>=4.8,<5
 
-# Translation — NLLB-200 (replaces IndicTrans2)
-transformers>=4.49,<5   # <5 is not optional: transformers 5.x needs
-                        # huggingface-hub>=1.5, which contradicts the pin
-                        # below and makes the whole file uninstallable.
-sentencepiece>=0.1.99
-huggingface-hub>=0.30,<1.0  # <1.0: transformers 4.49 refuses hub 1.x
 
-# TTS / Voice Cloning — IndicF5 (ai4bharat) for Indian languages.
-# Weights come from the HF cache at runtime; nothing hits the network at
-# inference time. edge-tts is GONE: it was a round-trip to Azure, so the old
-# pipeline was never actually local.
+# ============================================================
+# STT — faster-whisper / CTranslate2
+# ============================================================
+
+faster-whisper==1.2.1
+ctranslate2>=4.0,<5
+
+# faster-whisper 1.2.1 still uses av.open(metadata_errors=...).
+# Keep PyAV below 18 until a released faster-whisper version
+# containing the newer PyAV compatibility fix is adopted.
+av>=11,<18
+
+safetensors>=0.4,<1
+tqdm>=4.66,<5
+
+
+# ============================================================
+# Translation — NLLB-200
+# ============================================================
 #
-# f5-tts is pinned to the release only so the shared deps (vocos, torchdiffeq,
-# x-transformers) resolve; IndicF5's checkpoint is NOT compatible with the
-# release's forward math. engine/vendor/f5_tts holds the fork the checkpoint was
-# trained with and engine/tts_engines.py puts it first on sys.path. See
-# _use_vendored_f5_tts there before changing this.
+# NLLB does NOT require Transformers 5.
+# Keep the known working Transformers 4 generation.
 #
-# torchcodec MUST be pinned before f5-tts, because f5-tts>=0.1.0
-# pulls torchcodec>=0.11.0 which only publishes cu130 (PyTorch 2.7+) wheels.
-# torch 2.6.0+cu124 is the last CUDA 12 release; torchcodec 0.10.0 is the
-# last version that works with it (the +cu124 variant is not published on PyPI,
-# so we pin to the base version which resolves to a compatible wheel).
-torchcodec==0.10.0
-f5-tts>=0.1.0
-vocos>=0.1.0
-x-transformers>=1.31.0
-torchdiffeq>=0.2.3
-num2words>=0.5.13
-accelerate>=0.30.0
-jieba>=0.42.1
-pypinyin>=0.49.0
+# Exact pins prevent a future Colab base-image update from silently
+# replacing this stack.
 
-# Foreign-language cloning. XTTS speaks the 16 non-Indian languages the app
-# offers; IndicF5 covers the 12 Indian ones and needs nothing extra.
+transformers==4.57.6
+sentencepiece==0.2.2
+huggingface-hub==0.36.2
+
+
+
+# Pin the version your previous resolver selected successfully.
+f5-tts==1.1.10
+
+vocos==0.1.0
+x-transformers>=1.31,<3
+torchdiffeq>=0.2.3,<1
+num2words>=0.5.13,<1
+accelerate>=0.30,<2
+jieba>=0.42.1,<1
+pypinyin>=0.49,<1
+
+
+# ============================================================
+# Foreign-language voice cloning — XTTS
+# ============================================================
 #
-# Left out of the default install on purpose: the Coqui Public Model License
-# is NON-COMMERCIAL, and the package drags in a very large dependency tree.
-# Without it the studio marks those languages unavailable and refuses a dub
-# into one up front, so nothing fails halfway through a render. Translated
-# subtitles work in every language either way, because they never synthesize.
+# OPTIONAL.
+# Coqui TTS has separate licensing/dependency implications.
 #
-# To enable them:  pip install "TTS>=0.22.0"
-#TTS>=0.22.0
+# Install manually only when required:
+#
+# pip install "TTS>=0.22.0"
+#
+# TTS>=0.22.0
 
-# Cloud Storage & Database
 
-# Test harness UI (engine/gradio_app.py)
-# MUST stay on 5.x: gradio 6 requires huggingface-hub>=1.16, but transformers
-# 4.49 requires <1.0, and installing gradio 6 breaks NLLB + IndicF5 at import.
+# ============================================================
+# Test / development UI
+# ============================================================
+
+# Keep Gradio on 5.x for this environment.
 gradio>=5,<6
 
-# Subtitles are drawn onto the picture with Pillow (ffmpeg from Homebrew has
-# no libass). fontTools reads each installed font's character map, so the
-# one that actually holds the script gets picked - Telugu in a Telugu font,
-# not boxes in a Devanagari one. Both arrive with torchvision/matplotlib
-# already; pinned here so a future dependency change cannot drop them.
-pillow>=10.0.0
-fonttools>=4.40.0
 
-# Multi-speaker dubbing. Diarization finds who spoke when, so each actor is
-# cloned from their own voice instead of the video getting one.
-#
-# pyannote is GATED, exactly like IndicF5: accept the licence on the model page
-# and HF_TOKEN in .env covers it. Without it the pipeline runs single-speaker,
-# which is what it did before this existed - the stage is never fatal.
-#   https://huggingface.co/pyannote/speaker-diarization-3.1
-#   https://huggingface.co/pyannote/segmentation-3.0
-#
-# Kept out of the default install because it is a heavy optional extra and most
-# videos are one speaker. To enable:  pip install "pyannote.audio>=3.3.2"
-# pyannote.audio>=3.3.2
+# ============================================================
+# Subtitle rendering
+# ============================================================
 
-# Background preservation. Demucs splits the original soundtrack into speech and
-# everything else, so the film's music, sound effects and ambience survive under
-# the new dialogue instead of being replaced by it. Off by default; turn it on
-# per render in the studio, or set VIDEOTRANS_PRESERVE_BACKGROUND=1.
-#
-# Heavy and slow: roughly realtime or worse on CPU, and it downloads a ~300 MB
-# checkpoint on first use. Audio is separated in 10-minute chunks so peak memory
-# stays bounded on a full-length film.
-#
-# To enable:  pip install "demucs>=4.0.0"
-# demucs>=4.0.0
+pillow>=10,<12
+fonttools>=4.40,<5
 
+
+# ============================================================
+# Multi-speaker diarization
+# ============================================================
+#
+# IMPORTANT:
+# DO NOT use:
+#
+#   pyannote.audio>=3.3.2
+#
+# because that allows pip to select pyannote 4.x and pull a newer
+# Torch ecosystem.
+#
+# speaker-diarization-3.1 is the pipeline used by this project.
+
+pyannote.audio==3.3.2
+
+
+# ============================================================
+# Background preservation
+# ============================================================
+#
+# Demucs is optional at runtime, but Colab/Kaggle installs it.
+# Keep it outside the main resolver so its old dependency tree
+# cannot rewrite the application's core ML environment.
+#
+# Installed separately by the notebook with --no-deps.
+#
+# demucs==4.0.1
+
+
+# ============================================================
 # Utilities
-requests>=2.31.0
-typing-extensions>=4.12.0
-pydub>=0.25.0
+# ============================================================
 
-# Script intelligence — length-aware rewriting, run locally through Ollama.
-# No Python package required: it speaks Ollama's HTTP API with `requests`.
+requests>=2.31,<3
+typing-extensions>=4.12,<5
+pydub==0.25.1
+
+
+# ============================================================
+# Script intelligence
+# ============================================================
+#
+# Ollama is accessed through HTTP using requests.
+# No Python package required.
+#
+# Example:
+#
 #   ollama pull qwen2.5:7b
-# Optional. Every feature using it degrades cleanly when Ollama is not running.
