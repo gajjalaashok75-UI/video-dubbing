@@ -275,6 +275,45 @@ def _reset():
         MODEL_NAME = _engines.get("mt") or "facebook/nllb-200-distilled-600M"
 
 
+def _explain_load_error(exc: BaseException) -> str:
+    """Say whether this is a missing package, missing weights, or a code bug.
+
+    The message used to be identical for every failure: "pip install
+    transformers sentencepiece && huggingface-cli download ...". A plain
+    AttributeError raised inside this function therefore sent a run that already
+    had both packages AND the weights on disk into reinstalling and
+    re-downloading them. The three causes have three different answers, so the
+    answer is chosen from the exception instead of assumed.
+    """
+    name = type(exc).__name__
+    if isinstance(exc, (ImportError, ModuleNotFoundError)):
+        return (f" [{name}] A package the loader imports is missing. "
+                "Install it with: pip install transformers sentencepiece")
+    if isinstance(exc, OSError):
+        return (f" [{name}] The weights could not be read or downloaded. "
+                f"Fetch them with `huggingface-cli download {MODEL_NAME}`, or "
+                "set HF_TOKEN for a gated repo. This is a model/download "
+                "failure, not a code failure.")
+    return (f" [{name}] The packages and weights were found: this failed inside "
+            "the load path itself, which is a code failure, not a missing "
+            "package or weight. Read the traceback above; reinstalling or "
+            "re-downloading will not change it.")
+
+
+def refresh() -> str:
+    """Drop the loaded model so the next render uses the newly chosen one.
+
+    `app.py` calls `refresh()` on the module that owns each stage when the
+    studio saves a new choice. This module never had one, so the change was
+    stored, logged as "Could not apply the mt change live", and only took
+    effect after a restart - while the API still answered
+    `"restart_required": false`. Returns the model name now in use, like the
+    other stages' refresh().
+    """
+    _reset()
+    return MODEL_NAME
+
+
 def _load():
     """Load (or return the cached) tokenizer + model.
 
@@ -294,8 +333,16 @@ def _load():
             mdl = mdl.to(device)
             mdl.eval()
 
-            if device == "cuda" and tok.dtype is not None:
+            if device == "cuda":
                 # Half precision saves VRAM and is what the card wants.
+                #
+                # The condition used to be `tok.dtype is not None`. `dtype` is a
+                # property of a MODEL; a tokenizer has none, and transformers'
+                # PreTrainedTokenizerBase.__getattr__ raises
+                #     AttributeError: NllbTokenizerFast has no attribute dtype
+                # That fired AFTER the weights had loaded and moved to the GPU,
+                # so every render died at this line on a perfectly good install.
+                # `half()` is already guarded; no test is needed.
                 try:
                     mdl = mdl.half()
                 except Exception:
@@ -308,11 +355,18 @@ def _load():
         except Exception as exc:
             _tokenizer = _model = None
             raise RuntimeError(
-                f"Could not load NLLB model '{MODEL_NAME}'. "
-                "Fix: pip install transformers sentencepiece && "
-                "huggingface-cli download facebook/nllb-200-distilled-600M "
-                f"— original error: {exc}"
+                f"Could not load NLLB model '{MODEL_NAME}': {exc}"
+                f"{_explain_load_error(exc)}"
             ) from exc
+
+
+# The loader's name before it was shortened to `_load`. `app.py`'s boot warmup
+# imports `_load_model` (the same name `speech_to_text_v2` uses), so when the
+# rename landed the warmup died with
+#     ImportError: cannot import name '_load_model' from 'translation_v2'
+# and the first render paid the load. Both names are kept so a rename here
+# cannot break the warmup again.
+_load_model = _load
 
 
 # ---------------------------------------------------------------------------

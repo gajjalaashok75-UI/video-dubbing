@@ -494,6 +494,22 @@ print("=" * 70)
 print("INSTALLING OPTIONAL BACKGROUND ENGINE")
 print("=" * 70)
 
+# Demucs' own import chain, installed alongside it with --no-deps for the same
+# reason: `pip check` reported dora-search, lameenc and openunmix missing, which
+# is why "demucs installed" printed ok while the separation command could not
+# start. dora-search's own small dependencies are named too, since --no-deps
+# skips them.
+DEMUCS_DEPS = [
+    "lameenc",
+    "julius",
+    "openunmix",
+    "dora-search",
+    "omegaconf",
+    "retrying",
+    "submitit",
+    "treetable",
+]
+
 demucs = subprocess.run(
     [
         sys.executable,
@@ -510,10 +526,43 @@ demucs = subprocess.run(
 
 if demucs.returncode == 0:
     print("ok   demucs 4.0.1 installed")
+    print("     installing the modules demucs imports, also with --no-deps:")
+    deps = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            "--no-cache-dir",
+            "--no-deps",
+            *DEMUCS_DEPS,
+        ],
+        text=True,
+        capture_output=True,
+    )
+    if deps.returncode != 0:
+        print("--   some Demucs dependencies did not install")
+        for line in (deps.stderr or deps.stdout or "").strip().splitlines()[-3:]:
+            print("       ", line)
 else:
     print("--   demucs installation failed")
     print(demucs.stdout)
     print(demucs.stderr)
+
+# The only check that means anything. `find_spec("demucs")` answered yes for an
+# install whose `python -m demucs.separate` died on `import lameenc`, so the
+# separation command is asked to come up once instead.
+demucs_ready = subprocess.run(
+    [sys.executable, "-m", "demucs.separate", "--help"],
+    text=True,
+    capture_output=True,
+)
+if demucs_ready.returncode == 0:
+    print("ok   demucs can start (background preservation is usable)")
+else:
+    print("--   demucs is installed but cannot start; background preservation is off")
+    for line in (demucs_ready.stderr or demucs_ready.stdout or "").strip().splitlines()[-3:]:
+        print("       ", line)
 
 
 # ============================================================

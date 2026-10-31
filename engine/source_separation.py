@@ -79,19 +79,44 @@ TIMEOUT_SECONDS = int(os.getenv("DEMUCS_TIMEOUT", str(6 * 60 * 60)))
 _STEMS = dict  # {"vocals": path, "background": path, "sample_rate": int, ...}
 
 
+# What `python -m demucs.separate` imports before it does any work:
+# separate.py (dora.log, torch, torchaudio), audio.py (lameenc, julius, numpy),
+# states.py (omegaconf), pretrained.py (dora.log), apply.py (tqdm).
+# `dora-search` provides the `dora` module; lameenc and julius are separate
+# wheels. Demucs itself is installed with `--no-deps` so its old tree cannot
+# rewrite torch or numpy, which is exactly why these have to be named here.
+REQUIRED_MODULES = ("demucs.separate", "lameenc", "julius", "openunmix", "dora",
+                    "omegaconf", "tqdm")
+
+
+def missing_deps() -> list:
+    """The separation command's imports this interpreter cannot resolve."""
+    missing = []
+    for name in REQUIRED_MODULES:
+        try:
+            import importlib.util
+            if importlib.util.find_spec(name) is None:
+                missing.append(name)
+        except Exception:                                    # noqa: BLE001
+            missing.append(name)
+    return missing
+
+
 def available() -> bool:
     """
-    Whether Demucs can run here, cheaply and without loading anything.
+    Whether Demucs can actually run here, cheaply and without loading anything.
 
     Checked by import spec rather than by running `demucs --help`, because this
     is called on the request path and shelling out to answer a yes/no question
     is a needless way to make a dub feel slow.
+
+    But one spec was not enough: `find_spec("demucs")` answered yes for an
+    install whose `python -m demucs.separate` died on `import lameenc`, and the
+    Setup page called background preservation ready while every render dropped
+    the soundtrack. The question asked here is whether the command's imports
+    resolve, not whether one package directory exists.
     """
-    try:
-        import importlib.util
-        return importlib.util.find_spec("demucs") is not None
-    except Exception:                                        # noqa: BLE001
-        return False
+    return not missing_deps()
 
 
 def _run(cmd: list, timeout: int = None) -> subprocess.CompletedProcess:

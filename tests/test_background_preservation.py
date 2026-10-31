@@ -105,6 +105,18 @@ class FakeDemucs:
             f.write(_FAKE_SEPARATE_SRC)
         with open(os.path.join(pkg, "_config.json"), "w", encoding="utf-8") as f:
             json.dump({"mode": self.mode, "pad_frames": self.pad_frames}, f)
+        # `available()` asks whether the separation command's own imports
+        # resolve, not just whether `demucs` exists: an install that skipped
+        # them could not start (demucs is installed with --no-deps). A real
+        # install has these, so the fake one has them too.
+        for name in ("lameenc", "julius", "openunmix", "tqdm"):
+            with open(os.path.join(tmp, name + ".py"), "w", encoding="utf-8") as f:
+                f.write("")
+        for name in ("dora", "omegaconf"):
+            stub = os.path.join(tmp, name)
+            os.makedirs(stub, exist_ok=True)
+            with open(os.path.join(stub, "__init__.py"), "w", encoding="utf-8") as f:
+                f.write("")
         sys.path.insert(0, tmp)
         return tmp
 

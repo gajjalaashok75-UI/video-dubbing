@@ -121,7 +121,7 @@ class PyannoteDiarizer(Diarizer):
                     "in .env (see docs/GATED-MODELS.md).")
             print(f"[DIAR] Loading {self.model}...")
             try:
-                pipeline = Pipeline.from_pretrained(self.model, token=token)
+                pipeline = self._from_pretrained(token)
             except Exception as e:                           # noqa: BLE001
                 raise RuntimeError(self._explain_load_failure(e)) from e
             device = self._device
@@ -147,6 +147,26 @@ class PyannoteDiarizer(Diarizer):
             print(f"[DIAR] Ready on {device}")
             self._pipeline = pipeline
             return self._pipeline
+
+    def _from_pretrained(self, token: str):
+        """Load the pipeline with the auth keyword THIS pyannote accepts.
+
+        The pinned 3.3.2 signature is `from_pretrained(checkpoint_path,
+        hparams_file=None, use_auth_token=None, cache_dir=...)` - `token`
+        arrived with the newer hub API. Passing the wrong name raised
+            Pipeline.from_pretrained() got an unexpected keyword argument 'token'
+        on every run, which the caller reports as "diarization unavailable" and
+        then dubs a conversation in one voice. Try the pinned spelling first and
+        fall back to the newer one, so neither version loses speaker detection.
+        """
+        from pyannote.audio import Pipeline
+
+        try:
+            return Pipeline.from_pretrained(self.model, use_auth_token=token)
+        except TypeError as e:
+            if "use_auth_token" not in str(e):
+                raise
+            return Pipeline.from_pretrained(self.model, token=token)
 
     def _explain_load_failure(self, exc: Exception) -> str:
         """

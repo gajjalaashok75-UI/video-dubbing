@@ -153,6 +153,13 @@ async def sweep_loop():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Refuse to serve a pipeline this interpreter cannot run. A NumPy newer than
+    # the pinned one kills the voice model and lip sync at load (numba refuses
+    # it), and the only trace used to be two "warmup failed" lines while the
+    # Setup page advertised both. See readiness.require_compatible_runtime.
+    from readiness import require_compatible_runtime
+    require_compatible_runtime()
+
     restored = project.scan(UPLOAD_DIR)
     if restored:
         jobs.update(restored)

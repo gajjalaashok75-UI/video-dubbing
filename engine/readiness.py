@@ -32,6 +32,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import sys
 
 # The four states a feature can be in.
 READY = "ready"                            # usable now
@@ -107,6 +108,121 @@ def _torch_info() -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Runtime compatibility: NumPy, which numba refuses above 2.2
+# ---------------------------------------------------------------------------
+#
+# numba is not optional here: librosa loads audio through it, and both the voice
+# engine and Wav2Lip load audio with librosa. A hosted run verified numpy 2.2.6
+# and then started a server that reported "Numba needs NumPy 2.2 or less. Got
+# NumPy 2.5" - two warmups failed, and the Setup page had already called both
+# features ready. The version alone did not identify it, so the report names the
+# interpreter and the numpy file too.
+
+NUMPY_MAXIMUM = "2.2"
+
+
+def _version_tuple(text: str) -> tuple:
+    """(2, 2, 6) from "2.2.6": leading digits per part."""
+    parts = []
+    for chunk in str(text).split(".")[:3]:
+        digits = ""
+        for ch in chunk:
+            if not ch.isdigit():
+                break
+            digits += ch
+        if not digits:
+            break
+        parts.append(int(digits))
+    return tuple(parts) or (0,)
+
+
+def numpy_verdict(version: str | None,
+                  numba_error: str | None = None) -> tuple:
+    """Whether this NumPy can run numba, plus the sentence to say if it cannot.
+
+    Pure on purpose: the failing case is a NumPy that is not installed here, so
+    it can only be tested by passing the version in.
+    """
+    if not version:
+        return False, "NumPy is not installed in this interpreter."
+    if numba_error:
+        first = (numba_error or "").strip().splitlines()
+        return False, ("numba cannot be imported in this interpreter: "
+                       + (first[0] if first else "unknown error"))
+    if _version_tuple(version)[:2] > _version_tuple(NUMPY_MAXIMUM)[:2]:
+        return False, (f"numba needs NumPy {NUMPY_MAXIMUM} or less and this "
+                       f"interpreter has {version}. librosa loads audio through "
+                       "numba, so the voice model and Wav2Lip cannot load while "
+                       "every package and weight check still passes.")
+    return True, None
+
+
+def numpy_report() -> dict:
+    """What NumPy this process has, and whether numba accepts it.
+
+    `sys.executable` and `numpy.__file__` are the point: "Got NumPy 2.5" in a
+    log does not say WHICH interpreter loaded it, so a session that verified
+    2.2.6 reads like an impossible report.
+    """
+    report = {"executable": sys.executable, "version": None, "file": None,
+              "numba": None, "maximum": NUMPY_MAXIMUM, "compatible": False,
+              "reason": None}
+    numba_error = None
+    try:
+        import numba
+        report["numba"] = getattr(numba, "__version__", "?")
+    except Exception as e:                                   # noqa: BLE001
+        numba_error = str(e)
+    try:
+        import numpy
+        report["version"] = getattr(numpy, "__version__", None)
+        report["file"] = getattr(numpy, "__file__", None)
+    except Exception as e:                                   # noqa: BLE001
+        report["reason"] = f"NumPy is not importable ({e})."
+        return report
+
+    ok, reason = numpy_verdict(report["version"], numba_error)
+    report["compatible"] = ok
+    report["reason"] = reason
+    return report
+
+
+def require_compatible_runtime() -> dict:
+    """Fail a server start that cannot run the pipeline, and say exactly why.
+
+    Called from the app's lifespan, so the failure is one clear startup error
+    carrying the interpreter, the NumPy file and the numba version - instead of
+    two "warmup failed" lines while the Setup page advertises IndicF5 and lip
+    sync. `VIDEOTRANS_ALLOW_INCOMPATIBLE_NUMPY=1` starts anyway for work that
+    needs neither (transcription, translation, subtitles); readiness still
+    reports both features as unavailable, so nothing claims to be ready.
+    """
+    report = numpy_report()
+    if report["compatible"]:
+        return report
+    reason = report["reason"] or "NumPy is not usable in this interpreter."
+    override = os.getenv("VIDEOTRANS_ALLOW_INCOMPATIBLE_NUMPY", "")
+    if override not in ("", "0", "false", "no"):
+        print("[APP] WARNING: " + reason)
+        print("[APP] Continuing because VIDEOTRANS_ALLOW_INCOMPATIBLE_NUMPY is "
+              "set; the voice model and lip sync will fail to load.")
+        return report
+    lines = [
+        "Runtime check failed: " + reason,
+        f"  executable : {report['executable']}",
+        f"  numpy      : {report['version']} ({report['file']})",
+        f"  numba      : {report['numba']}",
+        f"  needed     : numpy <= {NUMPY_MAXIMUM}",
+        "Install the pinned NumPy in THIS interpreter "
+        "(pip install numpy==2.2.6) and start again. Set "
+        "VIDEOTRANS_ALLOW_INCOMPATIBLE_NUMPY=1 to start without the voice model "
+        "and lip sync.",
+    ]
+    print("\n".join(lines))
+    raise RuntimeError(lines[0])
+
+
+# ---------------------------------------------------------------------------
 # Secrets
 # ---------------------------------------------------------------------------
 def token_state() -> dict:
@@ -179,6 +295,96 @@ def _gated_reason(package: str, repo: str, present: bool, token: bool) -> str:
             f"Setup page, or run scripts/download_models.py.")
 
 
+def _source_of(module_name: str) -> str | None:
+    """The text of a local module's source file, or None if it is not there."""
+    try:
+        import importlib.util
+        spec = importlib.util.find_spec(module_name)
+        if spec is None or not spec.origin or not os.path.isfile(spec.origin):
+            return None
+        with open(spec.origin, encoding="utf-8") as fh:
+            return fh.read()
+    except Exception:                                        # noqa: BLE001
+        return None
+
+
+def _defines(module_name: str, *names: str) -> list | None:
+    """Which of these top-level names a module's source does NOT define.
+
+    Parsed rather than imported: `translation_v2` imports torch, and a readiness
+    probe has to stay cheap and work on a machine with no GPU. None means the
+    module could not be found at all, which is a different problem from a name
+    missing inside it.
+    """
+    source = _source_of(module_name)
+    if source is None:
+        return None
+    try:
+        import ast
+        tree = ast.parse(source)
+    except Exception:                                        # noqa: BLE001
+        return None
+    defined = set()
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
+                             ast.ClassDef)):
+            defined.add(node.name)
+        elif isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    defined.add(target.id)
+    return [name for name in names if name not in defined]
+
+
+def translation_api() -> str | None:
+    """None when the translate stage exposes what the application calls.
+
+    Two renames took this stage down while every package and weight check
+    passed: the boot warmup imports `_load_model`, and the studio's model switch
+    calls `refresh()`, and neither existed. Reading the names out of the source
+    means the next rename shows up here instead of in a failed render.
+    """
+    missing = _defines("translation_v2", "translate_segments", "_load_model",
+                       "refresh")
+    if not missing:
+        return None
+    return ("The translate stage's code does not expose "
+            f"{', '.join(missing)}, which the application calls at boot and "
+            "when the model is changed, so a render would fail at translation. "
+            "This is a code/install mismatch, not a missing weight.")
+
+
+def diarization_api() -> str | None:
+    """None when the diarization call path can authenticate to pyannote.
+
+    pyannote 3.x takes `use_auth_token`; `token` arrived with the newer hub API.
+    Passing the wrong name raised TypeError on every load, so the whole video
+    was dubbed in one voice while this module still reported the feature ready.
+    """
+    source = _source_of("speaker_diarization")
+    if source is None:
+        return None
+    if "use_auth_token" not in source:
+        return ("The diarization call path does not pass pyannote's "
+                "`use_auth_token`, so loading the pipeline raises TypeError and "
+                "the whole video is dubbed in one voice. This is a code/version "
+                "mismatch, not a missing weight.")
+
+
+# Everything `python -m demucs.separate` imports before it does anything.
+_DEMUCS_MODULES = ("demucs.separate", "lameenc", "julius", "openunmix", "dora",
+                   "omegaconf")
+
+
+def _demucs_missing() -> list:
+    """Demucs' own import-time dependencies this runtime cannot resolve."""
+    try:
+        import source_separation as S
+        return S.missing_deps()
+    except Exception:                                        # noqa: BLE001
+        return [name for name in _DEMUCS_MODULES if not _has_module(name)]
+
+
 # Every Hub snapshot pyannote's 3.1 pipeline loads: the pipeline itself, the
 # segmentation model that finds the turns, and the embedding model that tells
 # the voices apart.
@@ -224,12 +430,18 @@ def feature_diarization(token: bool = None) -> dict:
                                         present, token)
         return entry
 
+    api = diarization_api()
+    if api:
+        entry["status"] = OPTIONAL_MISSING
+        entry["reason"] = api
+        return entry
+
     entry["status"] = READY
     return entry
 
 
 def feature_background(token: bool = None) -> dict:
-    """Background preservation: Demucs, which is open and ungated."""
+    """Background preservation: Demucs and the modules it imports at startup."""
     entry = {"status": OPTIONAL_MISSING, "tier": OPTIONAL, "reason": None,
              "fallback": "the dub replaces the original soundtrack"}
     if not _has_module("demucs"):
@@ -238,8 +450,23 @@ def feature_background(token: bool = None) -> dict:
             "cannot be preserved. Dubbing continues with dialogue-only audio. "
             "Install with: pip install 'demucs>=4.0.0'")
         return entry
-    # Demucs downloads htdemucs itself on first use; there is no file to check
-    # and no token involved, so the package being present is the whole answer.
+
+    # `find_spec("demucs")` alone answered ready for an install that could not
+    # start: Demucs arrives with --no-deps, so lameenc, openunmix and
+    # dora-search were absent and `python -m demucs.separate` died on import.
+    # The probe asks Demucs' own import list instead.
+    missing = _demucs_missing()
+    if missing:
+        entry["reason"] = (
+            f"Demucs is installed but cannot start: {', '.join(missing)} is "
+            "missing from this interpreter (Demucs is installed with --no-deps "
+            "so it cannot rewrite torch or numpy). Background preservation is "
+            "off; dubbing continues with dialogue-only audio. Install with: "
+            f"pip install --no-deps {' '.join(missing)}")
+        return entry
+
+    # No weights to check: Demucs fetches htdemucs itself on first use, and no
+    # token is involved.
     entry["status"] = READY
     return entry
 
@@ -290,6 +517,12 @@ def feature_indicf5(token: bool = None, target_language: str = None) -> dict:
                 return entry
         except Exception:                                    # noqa: BLE001
             pass
+
+    numpy_ok = numpy_report()
+    if not numpy_ok["compatible"]:
+        entry["status"] = BLOCKED
+        entry["reason"] = numpy_ok["reason"]
+        return entry
 
     entry["status"] = READY
     return entry
@@ -348,6 +581,12 @@ def feature_translation() -> dict:
         entry["status"] = FALLBACK_AVAILABLE
         entry["reason"] = f"Could not check the translation weights ({e})."
         return entry
+    api = translation_api()
+    if api:
+        entry["status"] = BLOCKED
+        entry["reason"] = api
+        return entry
+
     entry["status"] = READY
     return entry
 
@@ -377,6 +616,11 @@ def feature_lipsync() -> dict:
         entry["status"] = FALLBACK_AVAILABLE
         entry["reason"] = f"Could not check the lip-sync weights ({e})."
         return entry
+    numpy_ok = numpy_report()
+    if not numpy_ok["compatible"]:
+        entry["reason"] = numpy_ok["reason"]
+        return entry
+
     entry["status"] = READY
     return entry
 
@@ -481,6 +725,7 @@ def snapshot(target_language: str = None, source_language: str = None) -> dict:
         hardware["free_disk_gb"] = None
 
     return redact({
+        "runtime": numpy_report(),
         "ready": not blocking,
         "blocking": blocking,
         "degraded": degraded,
