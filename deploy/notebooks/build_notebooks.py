@@ -255,199 +255,591 @@ used. Installing the plain `requirements.txt` alone would fetch the CPU-only
 wheels and every render would silently fall back to the CPU.
 """)
 
-INSTALL = code(f"""
+INSTALL = code('''
 import os
-
-# Locate the checkout and work from it, so this cell does not depend on an
-# earlier cell having run in this session.
-REPO_DIR = {REPO_DIR_EXPR}
-os.chdir(REPO_DIR)
-
 import subprocess
 import sys
 
-print("Installing the CUDA PyTorch build (the slow part)...")
+# ============================================================
+# Locate repository
+# ============================================================
 
-# A CUDA build is not enough - it has to be a CUDA 12 one. CTranslate2
-# (faster-whisper's backend) dlopens libcublas.so.12 on the FIRST encode, and
-# torch >= 2.7 ships CUDA 13 wheels whose cuBLAS is libcublas.so.13. A hosted
-# image that already has a newer torch satisfies a bare `torch>=2.2.0`, so pip
-# leaves it in place and every render dies ~6s in with
-#
-#   RuntimeError: Library libcublas.so.12 is not found or cannot be loaded
-#
-# That is why this asks for the exact cu124 build and forces it over whatever
-# is already installed. 2.6.0 is the last release published for cu124.
-TORCH_PIN = ["torch==2.6.0+cu124", "torchaudio==2.6.0+cu124",
-             "torchvision==0.21.0+cu124"]
-TORCH_INDEX = "https://download.pytorch.org/whl/cu124"
+REPO_DIR = ''' + REPO_DIR_EXPR + '''
+
+os.chdir(REPO_DIR)
+
+print("Repository:", REPO_DIR)
+print("Python:", sys.version)
+print()
 
 
-def _cuda12_torch():
-    # Is a CUDA 12 torch importable? Probe in a subprocess: never import
-    # torch in this process first, because deleting it from sys.modules and
-    # re-importing it (Python 3.13) raises
-    #   RuntimeError: function '_has_torch_function' already has a docstring
-    # PyTorch's C-extensions cannot be safely reloaded in the same session.
-    probe = subprocess.run(
-        [sys.executable, "-c",
-         "import torch, sys;"
-         "sys.exit(0 if (torch.cuda.is_available()"
-         " and (torch.version.cuda or '').startswith('12')) else 1)"],
-        capture_output=True,
-    )
-    return probe.returncode == 0
+# ============================================================
+# Helpers
+# ============================================================
 
+def run(cmd, *, check=True, capture=False):
+    print("+", " ".join(cmd))
 
-# Decide whether a CUDA 12 torch is usable in this kernel. Probe in a
-# subprocess so we never import torch into this kernel first - on Python 3.13
-# unloading and re-importing PyTorch's C-extensions raises
-#   RuntimeError: function '_has_torch_function' already has a docstring
-cuda12 = False
-if "torch" in sys.modules:
-    # An earlier cell already imported torch in this kernel; check it directly
-    # rather than probing a subprocess that may not match.
-    import torch  # noqa: E402
-    cuda12 = bool(torch.cuda.is_available()
-                  and (torch.version.cuda or "").startswith("12"))
-else:
-    cuda12 = _cuda12_torch()
-
-if cuda12:
-    print("A CUDA 12 torch is already installed; skipping the reinstall")
-else:
-    subprocess.run(
-        [sys.executable, "-m", "pip", "install", "-q", *TORCH_PIN,
-         "--index-url", TORCH_INDEX, "--force-reinstall"],
-        check=True,
-    )
-    # pip installed CUDA 12 on disk, but if torch is already in sys.modules
-    # (imported by an earlier cell) it is still the stale non-CUDA-12 build.
-    # PyTorch's C-extensions cannot be unloaded and re-imported in the same
-    # process on Python 3.13, so the kernel cannot switch to the new build.
-    if "torch" in sys.modules:
-        raise SystemExit(
-            f"torch {{torch.__version__}} (CUDA {{torch.version.cuda}}) is already "
-            "loaded in this session. The CUDA 12 build was installed on disk, "
-            "but this kernel still holds the older build. Restart the runtime "
-            "and re-run this cell."
+    if capture:
+        return subprocess.run(
+            cmd,
+            text=True,
+            capture_output=True,
+            check=check,
         )
 
-# Make sure torch is bound before printing its version. If a CUDA 12 build
-# was detected by the subprocess probe, torch was never imported in this
-# kernel, so import it now. `import` is a no-op when the module is already
-# loaded, so this is safe in every branch.
-import torch  # noqa: E402
+    return subprocess.run(cmd, check=check)
 
-print("torch", torch.__version__, "| CUDA available:", torch.cuda.is_available())
-if not (torch.version.cuda or "").startswith("12"):
-    raise SystemExit(
-        f"torch {{torch.__version__}} is a CUDA {{torch.version.cuda}} build. "
-        "CTranslate2 needs CUDA 12 (libcublas.so.12), so transcription would "
-        "fail a few seconds into every render. Re-run this cell; if it keeps "
-        "happening, install " + " ".join(TORCH_PIN) + f" from {{TORCH_INDEX}} "
-        "by hand and read the pip output above."
+
+def stream(cmd):
+    print("+", " ".join(cmd))
+
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
     )
 
-cmd = [sys.executable, "-m", "pip", "install", "-r", "requirements.txt"]
-print("Installing:", " ".join(cmd))
+    for line in proc.stdout:
+        print(line, end="")
 
-# Stream pip to the notebook so a failure shows which package died.
-proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                        text=True, bufsize=1)
-for line in proc.stdout:
-    print(line, end="")
-proc.wait()
+    proc.wait()
 
-if proc.returncode != 0:
-    print()
-    print("=" * 62)
-    print("INSTALL FAILED. The real cause is in the pip output above.")
-    print("=" * 62)
-    raise SystemExit("The install failed; see the pip output above this line.")
+    if proc.returncode != 0:
+        raise RuntimeError(
+            "Command failed with exit code %d: %s"
+            % (proc.returncode, " ".join(cmd))
+        )
 
-# IndicF5's own f5_tts fork. pip installed an `f5_tts` above too, but the
-# checkpoint was trained with this fork and the release generates the wrong
-# words, so the voice engine refuses to run against it. Not on PyPI, so it is
-# fetched here once (~2 MB).
-print()
-print("Fetching IndicF5's f5_tts fork...")
-subprocess.run([sys.executable, "scripts/vendor_f5_tts.py"], check=False)
 
-# The two optional extras. Both are heavy, both are off unless asked for, and
-# neither being absent stops a dub - so a failure here is reported and the
-# notebook carries on.
+# ============================================================
+# Required Torch stack
+# ============================================================
 #
-#   pyannote -> multi-speaker detection: one cloned voice per actor
-#   demucs   -> background preservation: the film's own music and SFX survive
-#
-# Demucs pulls `dora-search`, which pins `omegaconf<2.2`; the install is done
-# with `--no-deps` for that one package if the resolver objects, because the
-# only thing it is used for here is a CLI.
-print()
-print("Installing the optional extras (multi-speaker, background)...")
-for label, spec in (
-    ("pyannote (multi-speaker)", "pyannote.audio>=3.3.2"),
-    ("demucs (background)", "demucs>=4.0.0"),
-):
-    proc = subprocess.run(
-        [sys.executable, "-m", "pip", "install", "-q", spec],
-        capture_output=True, text=True,
-    )
-    if proc.returncode == 0:
-        print(f"  ok   {{label}}")
-    else:
-        print(f"  --   {{label}} did not install; the feature will be off")
-        tail = (proc.stderr or "").strip().splitlines()[-3:]
-        for line in tail:
-            print("       ", line)
+# A CUDA build is not enough - it has to be a CUDA 12 one. CTranslate2
+# (faster-whisper's backend) dlopens libcublas.so.12 on the FIRST encode, and
+# torch >= 2.7 ships CUDA 13 wheels whose cuBLAS is libcublas.so.13. 2.6.0 is
+# the last release published for cu124.
 
-# Demucs needs its own weights on first use; it fetches them itself, but
-# warming it here turns a slow first render into a slow cell.
+TORCH_INDEX = "https://download.pytorch.org/whl/cu124"
+
+TORCH_PACKAGES = [
+    "torch==2.6.0+cu124",
+    "torchaudio==2.6.0+cu124",
+    "torchvision==0.21.0+cu124",
+]
+
+
+# ============================================================
+# Check the COMPLETE Torch stack
+# ============================================================
+
+TORCH_PROBE = r"""
+import sys
+
 try:
-    import demucs  # noqa: F401
-    print("  demucs importable")
-except Exception as exc:
-    print(f"  demucs not importable ({{exc}}); background preservation is off")
+    import torch
+    import torchaudio
+    import torchvision
 
-# Re-assert the pins a manual `pip install -U` breaks. These are silent
-# until boot, where the voice model or NLLB simply fails to import:
+    print("torch      :", torch.__version__)
+    print("torchaudio :", torchaudio.__version__)
+    print("torchvision:", torchvision.__version__)
+    print("CUDA       :", torch.version.cuda)
+    print("GPU        :", torch.cuda.is_available())
+
+    ok = (
+        torch.__version__.startswith("2.6.0")
+        and torchaudio.__version__.startswith("2.6.0")
+        and torchvision.__version__.startswith("0.21.0")
+        and (torch.version.cuda or "").startswith("12.4")
+        and torch.cuda.is_available()
+    )
+
+    sys.exit(0 if ok else 1)
+
+except Exception as exc:
+    print("Torch stack probe failed:", repr(exc))
+    sys.exit(1)
+"""
+
+
+print("=" * 70)
+print("CHECKING PYTORCH / CUDA STACK")
+print("=" * 70)
+
+probe = subprocess.run(
+    [sys.executable, "-c", TORCH_PROBE],
+    text=True,
+    capture_output=True,
+)
+
+print(probe.stdout)
+
+if probe.stderr:
+    print(probe.stderr)
+
+
+if probe.returncode != 0:
+
+    print()
+    print("Installing the exact CUDA 12.4 PyTorch stack...")
+
+    # Remove potentially mismatched binaries first.
+    subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pip",
+            "uninstall",
+            "-y",
+            "torch",
+            "torchaudio",
+            "torchvision",
+        ],
+        check=False,
+    )
+
+    run(
+        [
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            "--no-cache-dir",
+            "--force-reinstall",
+            *TORCH_PACKAGES,
+            "--index-url",
+            TORCH_INDEX,
+        ]
+    )
+
+    print()
+    print("=" * 70)
+    print("PYTORCH WAS REPLACED")
+    print("=" * 70)
+    print()
+    print(
+        "IMPORTANT: restart the Colab/Kaggle Python runtime NOW, "
+        "then run this cell again."
+    )
+
+    raise SystemExit(
+        "PyTorch binaries changed. Runtime restart required before continuing."
+    )
+
+
+print("Exact PyTorch 2.6.0 / CUDA 12.4 stack is already usable.")
+print()
+
+
+# ============================================================
+# Install main application requirements
+# ============================================================
+
+print("=" * 70)
+print("INSTALLING APPLICATION REQUIREMENTS")
+print("=" * 70)
+
+stream(
+    [
+        sys.executable,
+        "-m",
+        "pip",
+        "install",
+        "--no-cache-dir",
+        "-r",
+        "requirements.txt",
+    ]
+)
+
+
+# ============================================================
+# IndicF5 vendored implementation
+# ============================================================
+
+print()
+print("=" * 70)
+print("FETCHING INDICF5 F5-TTS FORK")
+print("=" * 70)
+
+result = subprocess.run(
+    [sys.executable, "scripts/vendor_f5_tts.py"]
+)
+
+if result.returncode != 0:
+    raise RuntimeError(
+        "Failed to fetch IndicF5's vendored f5_tts implementation."
+    )
+
+
+# ============================================================
+# Demucs
+# ============================================================
 #
-#   NumPy  - numba (librosa's audio loader, used by the voice engine AND by
-#            Wav2Lip) refuses anything newer than 2.2:
-#                "Numba needs NumPy 2.2 or less. Got NumPy 2.5."
-#   transformers - 5.x cannot be installed next to the hub pin below, and the
-#            symptom is "cannot import name 'GenerationMixin'".
-#   torchcodec - f5-tts pulls >=0.11.0 which only has CUDA 13 wheels;
-#            the app needs 0.10.0 for CUDA 12 compatibility.
-PROBE = ("import sys, numpy, numba, transformers, huggingface_hub, torchcodec;"
-         "print(numpy.__version__);"
-         "print(transformers.__version__);"
-         "print(huggingface_hub.__version__);"
-         "print(torchcodec.__version__);"
-         "ok = (numpy.__version__.startswith('2.2') or numpy.__version__.startswith('2.1')"
-         " or numpy.__version__.startswith('2.0') or numpy.__version__.startswith('1.'))"
-         " and transformers.__version__.startswith('4.')"
-         " and huggingface_hub.__version__.startswith('0.')"
-         " and torchcodec.__version__.startswith('0.10.');"
-         "print('OK' if ok else 'FAIL'); sys.exit(0 if ok else 1)")
-REPAIR = ["numpy==2.2.6", "transformers>=4.49,<5",
-          "huggingface-hub>=0.30,<1.0", "torchcodec==0.10.0"]
+# pyannote is NOT installed here anymore. It is pinned in requirements.txt:
+#
+#     pyannote.audio==3.3.2
+#
+# so pip resolves it together with the core environment, and a job never ends
+# up with pyannote 4.x pulling a newer torch.
+#
+# Demucs is intentionally installed without dependencies because its old
+# dependency tree must not rewrite Torch, NumPy, Hydra, OmegaConf, etc.
+
+print()
+print("=" * 70)
+print("INSTALLING OPTIONAL BACKGROUND ENGINE")
+print("=" * 70)
+
+demucs = subprocess.run(
+    [
+        sys.executable,
+        "-m",
+        "pip",
+        "install",
+        "--no-cache-dir",
+        "--no-deps",
+        "demucs==4.0.1",
+    ],
+    text=True,
+    capture_output=True,
+)
+
+if demucs.returncode == 0:
+    print("ok   demucs 4.0.1 installed")
+else:
+    print("--   demucs installation failed")
+    print(demucs.stdout)
+    print(demucs.stderr)
+
+
+# ============================================================
+# Restore the pins a dependency can move
+# ============================================================
+#
+# requirements.txt pins these, but a resolver can still move them:
+#
+#   NumPy      - numba (librosa's audio loader, used by the voice engine AND
+#                by Wav2Lip) refuses anything newer than 2.2.
+#   transformers/hub - 5.x and hub 1.x cannot live next to each other, and the
+#                symptom is "cannot import name 'GenerationMixin'".
+#
+# These are only repaired when the probe says they moved, so a clean install
+# pays nothing for them.
+
+PROBE = (
+    "import sys, numpy, numba, transformers, huggingface_hub;"
+    "print(numpy.__version__);"
+    "print(transformers.__version__);"
+    "print(huggingface_hub.__version__);"
+    "ok = (numpy.__version__.startswith('2.2') or numpy.__version__.startswith('2.1')"
+    " or numpy.__version__.startswith('2.0') or numpy.__version__.startswith('1.'))"
+    " and transformers.__version__.startswith('4.')"
+    " and huggingface_hub.__version__.startswith('0.');"
+    "print('OK' if ok else 'FAIL'); sys.exit(0 if ok else 1)"
+)
+REPAIR = [
+    "numpy>=1.26.0,<2.3",
+    "transformers==4.57.6",
+    "huggingface-hub==0.36.2",
+]
 
 probe = subprocess.run([sys.executable, "-c", PROBE],
                        capture_output=True, text=True)
+
 if probe.returncode != 0:
-    print("  NumPy or transformers/huggingface-hub is out of range; restoring the pins...")
+    print("  NumPy / transformers is out of range; restoring the pins...")
     subprocess.run([sys.executable, "-m", "pip", "install", "-q", *REPAIR],
                    check=False)
     probe = subprocess.run([sys.executable, "-c", PROBE],
                            capture_output=True, text=True)
+
 print("  numpy", (probe.stdout or "?").strip(),
       "(the voice model needs it at 2.2 or less)")
 
+
+# ============================================================
+# Final dependency verification
+# ============================================================
+
 print()
-print("Install complete. Run the Verify cell next.")
-""")
+print("=" * 70)
+print("VERIFYING CRITICAL DEPENDENCIES")
+print("=" * 70)
+
+VERIFY = r"""
+import sys
+
+errors = []
+
+
+def check(name, fn):
+    try:
+        value = fn()
+        print(f"ok   {name:<22} {value}")
+    except Exception as exc:
+        print(f"FAIL {name:<22} {exc!r}")
+        errors.append((name, exc))
+
+
+# ------------------------------------------------------------
+# Torch
+# ------------------------------------------------------------
+
+def check_torch():
+    import torch
+
+    assert torch.__version__.startswith("2.6.0"), torch.__version__
+    assert (torch.version.cuda or "").startswith("12.4"), torch.version.cuda
+    assert torch.cuda.is_available()
+
+    return f"{torch.__version__} CUDA={torch.version.cuda}"
+
+
+check("torch", check_torch)
+
+
+# ------------------------------------------------------------
+# Torchaudio
+# ------------------------------------------------------------
+
+def check_torchaudio():
+    import torchaudio
+
+    assert torchaudio.__version__.startswith("2.6.0"), torchaudio.__version__
+
+    return torchaudio.__version__
+
+
+check("torchaudio", check_torchaudio)
+
+
+# ------------------------------------------------------------
+# Torchvision
+# ------------------------------------------------------------
+
+def check_torchvision():
+    import torchvision
+
+    assert torchvision.__version__.startswith("0.21.0"), torchvision.__version__
+
+    return torchvision.__version__
+
+
+check("torchvision", check_torchvision)
+
+
+# ------------------------------------------------------------
+# NumPy / Numba
+# ------------------------------------------------------------
+
+def check_numpy():
+    import numpy
+    import numba
+
+    assert numpy.__version__ == "2.2.6", numpy.__version__
+
+    return f"numpy={numpy.__version__}, numba={numba.__version__}"
+
+
+check("numpy/numba", check_numpy)
+
+
+# ------------------------------------------------------------
+# Transformers / NLLB imports
+# ------------------------------------------------------------
+
+def check_transformers():
+    import transformers
+    import huggingface_hub
+
+    from transformers import (
+        AutoModelForSeq2SeqLM,
+        AutoTokenizer,
+    )
+
+    assert transformers.__version__ == "4.57.6", transformers.__version__
+    assert huggingface_hub.__version__ == "0.36.2", huggingface_hub.__version__
+
+    return (
+        f"transformers={transformers.__version__}, "
+        f"hub={huggingface_hub.__version__}"
+    )
+
+
+check("NLLB/transformers", check_transformers)
+
+
+# ------------------------------------------------------------
+# SentencePiece
+# ------------------------------------------------------------
+
+def check_sentencepiece():
+    import sentencepiece
+
+    return sentencepiece.__version__
+
+
+check("sentencepiece", check_sentencepiece)
+
+
+# ------------------------------------------------------------
+# faster-whisper
+# ------------------------------------------------------------
+
+def check_whisper():
+    import faster_whisper
+    import ctranslate2
+    import av
+
+    av_major = int(av.__version__.split(".")[0])
+
+    assert av_major < 18, av.__version__
+
+    return (
+        f"faster-whisper={getattr(faster_whisper, '__version__', '?')}, "
+        f"ctranslate2={ctranslate2.__version__}, "
+        f"av={av.__version__}"
+    )
+
+
+check("faster-whisper", check_whisper)
+
+
+# ------------------------------------------------------------
+# Pyannote
+# ------------------------------------------------------------
+
+def check_pyannote():
+    import pyannote.audio
+
+    from pyannote.audio import Pipeline
+
+    version = getattr(pyannote.audio, "__version__", "?")
+
+    assert version.startswith("3.3.2"), version
+
+    return version
+
+
+check("pyannote", check_pyannote)
+
+
+# ------------------------------------------------------------
+# IndicF5 dependencies
+# ------------------------------------------------------------
+
+def check_f5():
+    import vocos
+    import torchdiffeq
+    import x_transformers
+
+    return "imports successful"
+
+
+check("IndicF5 dependencies", check_f5)
+
+
+# ------------------------------------------------------------
+# Librosa
+# ------------------------------------------------------------
+
+def check_librosa():
+    import librosa
+
+    return librosa.__version__
+
+
+check("librosa", check_librosa)
+
+
+print()
+if errors:
+    print("=" * 70)
+    print("ENVIRONMENT VERIFICATION FAILED")
+    print("=" * 70)
+
+    for name, exc in errors:
+        print(f"{name}: {exc!r}")
+
+    sys.exit(1)
+
+
+print("=" * 70)
+print("CORE ENVIRONMENT VERIFIED")
+print("=" * 70)
+"""
+
+verify = subprocess.run(
+    [sys.executable, "-c", VERIFY],
+    text=True,
+    capture_output=True,
+)
+
+print(verify.stdout)
+
+if verify.stderr:
+    print(verify.stderr)
+
+if verify.returncode != 0:
+    raise SystemExit(
+        "Dependency verification failed. Do NOT start the server."
+    )
+
+
+# ============================================================
+# pip check
+# ============================================================
+
+print()
+print("=" * 70)
+print("PIP DEPENDENCY CHECK")
+print("=" * 70)
+
+pip_check = subprocess.run(
+    [sys.executable, "-m", "pip", "check"],
+    text=True,
+    capture_output=True,
+)
+
+print(pip_check.stdout)
+
+if pip_check.stderr:
+    print(pip_check.stderr)
+
+# Colab itself contains many unrelated preinstalled packages. Therefore
+# pip check may report conflicts belonging to the base notebook
+# environment. Critical VideoTrans packages were already validated
+# explicitly above.
+
+if pip_check.returncode != 0:
+    print()
+    print(
+        "WARNING: pip check found conflicts. Review them above. "
+        "If they only belong to unrelated Colab packages, they can "
+        "usually be ignored. VideoTrans critical packages passed "
+        "their dedicated verification."
+    )
+
+
+print()
+print("=" * 70)
+print("INSTALL COMPLETE")
+print("=" * 70)
+print()
+print("Torch / CUDA       : verified")
+print("TorchAudio ABI     : verified")
+print("NumPy / Numba      : verified")
+print("NLLB / Transformers: verified")
+print("faster-whisper     : verified")
+print("pyannote 3.3.2     : verified")
+print("IndicF5 deps       : verified")
+print()
+print("You can now run the Verify/Download Models cell.")
+''')
 
 MODELS_MD = md("""
 ## 6. Fetch the models
