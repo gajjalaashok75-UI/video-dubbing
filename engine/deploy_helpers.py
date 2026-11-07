@@ -45,6 +45,7 @@ from pathlib import Path
 __all__ = [
     "ServerHandle",
     "configure_runtime",
+    "constraints_path",
     "default_runtime_root",
     "detect_platform",
     "ensure_ffmpeg",
@@ -59,6 +60,7 @@ __all__ = [
     "server_log_path",
     "stale_modules",
     "start_server",
+    "stray_cuda13_packages",
     "wait_until_ready",
 ]
 
@@ -153,6 +155,19 @@ def repo_dir(platform: str | None = None) -> Path:
     """
     platform = platform or detect_platform()
     return Path(_REPO_DIRS.get(platform, Path.cwd()))
+
+
+def constraints_path(root: str | Path | None = None) -> Path:
+    """
+    The constraints file the notebook passes to the optional-engine installs.
+
+    Lives in the checkout (`deploy/constraints.txt`), next to `requirements.txt`,
+    so a `-c` flag can name it the same way on Colab and Kaggle. Returns the
+    path whether or not it exists; the caller decides how to react to a missing
+    file, because a checkout that predates the file should still install.
+    """
+    base = Path(root) if root is not None else repo_dir()
+    return base / "deploy" / "constraints.txt"
 
 
 def runtime_dirs(root: str | Path | None = None) -> dict[str, Path]:
@@ -320,6 +335,51 @@ def hardware_report() -> dict:
 # stale kernel) - and numba refuses it, so the voice model and lip sync fail.
 _WATCHED = ("torch", "torchaudio", "torchvision", "numpy", "numba",
             "transformers", "huggingface_hub")
+
+# The CUDA 12.4 wheels torch 2.6.0+cu124 ships with. A CUDA 13 build instead
+# installs the `-cu13` twins, and having both on the path is what makes
+# `import torch` fail with "undefined symbol: ncclCommResume": libtorch_cuda.so
+# was linked against the CUDA 12 NCCL, but the dynamic linker can resolve a
+# symbol from the CUDA 13 one first.
+_CUDA13_STRAY = (
+    "nvidia-nccl-cu13",
+    "nvidia-cublas-cu13",
+    "nvidia-cuda-runtime-cu13",
+    "nvidia-cuda-nvrtc-cu13",
+    "nvidia-cufft-cu13",
+    "nvidia-curand-cu13",
+    "nvidia-cusolver-cu13",
+    "nvidia-cusparse-cu13",
+    "nvidia-cudnn-cu13",
+    "nvidia-cusparselt-cu13",
+)
+
+
+def stray_cuda13_packages() -> list[str]:
+    """Installed `nvidia-*-cu13` distributions that must not be next to torch 2.6.
+
+    torch 2.6.0+cu124 depends on the `-cu12` NVIDIA wheels. If anything pulled a
+    CUDA 13 build of torch (or of a dependency) in, pip left the `-cu13` wheels
+    behind, and `import torch` then dies with
+
+        ImportError: libtorch_cuda.so: undefined symbol: ncclCommResume
+
+    because the loader binds the CUDA 13 NCCL ahead of the CUDA 12 one. Removing
+    them is what lets the CUDA 12 build import again; it is safe because nothing
+    in this stack asks for a `-cu13` wheel.
+    """
+    import importlib.metadata as md
+
+    found: list[str] = []
+    for name in _CUDA13_STRAY:
+        try:
+            md.version(name)
+        except md.PackageNotFoundError:
+            continue
+        except Exception:                             # noqa: BLE001
+            continue
+        found.append(name)
+    return found
 
 
 def stale_modules() -> dict:

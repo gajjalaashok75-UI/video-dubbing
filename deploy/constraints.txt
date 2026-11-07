@@ -1,0 +1,34 @@
+# Constraints for the OPTIONAL engines the notebook installs after
+# requirements.txt - pyannote.audio (multi-speaker) and demucs (background).
+#
+# They are installed with `pip install -c deploy/constraints.txt <pkg>`, because
+# their dependency chains are free to move the two packages the whole pipeline
+# depends on:
+#
+#   torch  - pyannote.audio pulls speechbrain and pytorch-metric-learning, and on
+#            a hosted image the versions already present there ask for a NEWER
+#            torch. pip then replaces the CUDA 12.4 build (2.6.0+cu124) with a
+#            CUDA 13 one. That breaks CTranslate2 (libcublas.so.12 is gone) and
+#            leaves the CUDA 13 NCCL next to the CUDA 12 one, so `import torch`
+#            dies with "undefined symbol: ncclCommResume".
+#   numpy  - numba (librosa's loader, used by the voice engine and Wav2Lip)
+#            refuses anything newer than 2.2.
+#
+# A constraint, unlike a requirement, does not install anything: it only says
+# "if this package is already here, keep it at this version". So a clean
+# environment pays nothing for these lines.
+#
+# `==2.6.0` matches the `2.6.0+cu124` local build: PEP 440 ignores the local
+# segment when the specifier has none, so the exact wheel the install cell put
+# on disk is left untouched.
+
+torch==2.6.0
+torchaudio==2.6.0
+torchvision==0.21.0
+
+numpy>=1.26.0,<2.3
+
+# pyannote's chain also drags these forward; requirements.txt pins them for the
+# same reason ("cannot import name 'GenerationMixin'").
+transformers==4.57.6
+huggingface-hub==0.36.2

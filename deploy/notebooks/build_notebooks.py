@@ -95,6 +95,10 @@ GET_CODE_MD = md("""
 
 Colab and Kaggle both give a writable working directory. We clone the
 repository there and install FFmpeg, which every render shells out to.
+
+If the code is already at that path - for example you unzipped a copy of the
+repository instead of cloning it - this cell uses it as it is and does not
+overwrite it with a fresh clone.
 """)
 
 GET_CODE = code(f"""
@@ -105,14 +109,50 @@ import subprocess
 REPO_URL = "{REPO_URL}"
 REPO_DIR = {REPO_DIR_EXPR}
 
-if not os.path.isdir(os.path.join(REPO_DIR, ".git")):
-    print("Cloning the repository...")
-    subprocess.run(["git", "clone", "--depth", "1", REPO_URL, REPO_DIR], check=True)
+# A checkout is recognised by requirements.txt, not by `.git`: a copy delivered
+# as a zip has no `.git`, and treating it as "absent" would clone the remote
+# over the top of it and silently discard the copy the user actually has.
+def _is_checkout(path):
+    return os.path.isfile(os.path.join(path, "requirements.txt"))
+
+
+# The copy the user unzipped may not be exactly at REPO_DIR, so also look at the
+# working directory and its parents before falling back to a clone. Without
+# this, an unzip one directory off sends the session back to the remote code.
+if not _is_checkout(REPO_DIR):
+    here = os.path.abspath(os.getcwd())
+    while True:
+        if _is_checkout(here):
+            REPO_DIR = here
+            break
+        parent = os.path.dirname(here)
+        if parent == here:
+            break
+        here = parent
+
+HAVE_CODE = _is_checkout(REPO_DIR)
+
+if HAVE_CODE:
+    print("Using the repository already present at", REPO_DIR)
+    if os.path.isdir(os.path.join(REPO_DIR, ".git")):
+        print("Updating it from origin (best effort)...")
+        fetched = subprocess.run(
+            ["git", "-C", REPO_DIR, "fetch", "--depth", "1", "origin", "main"],
+            check=False)
+        if fetched.returncode == 0:
+            subprocess.run(
+                ["git", "-C", REPO_DIR, "reset", "--hard", "FETCH_HEAD"],
+                check=False)
+        else:
+            print("  update skipped; using the checkout as it is")
+    else:
+        print("  not a git checkout; leaving it untouched")
 else:
-    print("Repository already present; updating...")
-    subprocess.run(["git", "-C", REPO_DIR, "fetch", "--depth", "1", "origin", "main"],
-                   check=False)
-    subprocess.run(["git", "-C", REPO_DIR, "reset", "--hard", "FETCH_HEAD"], check=False)
+    print("Cloning the repository...")
+    # `git clone` refuses a non-empty target; clear a half-finished one first.
+    if os.path.isdir(REPO_DIR) and os.listdir(REPO_DIR):
+        shutil.rmtree(REPO_DIR)
+    subprocess.run(["git", "clone", "--depth", "1", REPO_URL, REPO_DIR], check=True)
 
 if not shutil.which("ffmpeg"):
     print("Installing FFmpeg...")
@@ -338,6 +378,17 @@ def stream(cmd):
         )
 
 
+def _installed(dist):
+    """True when pip can see `dist`, whatever its version."""
+    import importlib.metadata as md
+
+    try:
+        md.version(dist)
+    except Exception:
+        return False
+    return True
+
+
 # ============================================================
 # Required Torch stack
 # ============================================================
@@ -354,6 +405,12 @@ TORCH_PACKAGES = [
     "torchaudio==2.6.0+cu124",
     "torchvision==0.21.0+cu124",
 ]
+
+# Constraints for the OPTIONAL installs below (pyannote, demucs). Passed as
+# `-c` so those dependency chains cannot move torch off the CUDA 12.4 build or
+# NumPy past numba's cap. `==2.6.0` matches the `2.6.0+cu124` local build:
+# PEP 440 ignores the local segment when the specifier has none.
+CONSTRAINTS = os.path.join(REPO_DIR, "deploy", "constraints.txt")
 
 
 # ============================================================
@@ -426,6 +483,28 @@ if probe.returncode != 0:
         check=False,
     )
 
+    # A CUDA 13 build leaves its `nvidia-*-cu13` wheels behind, and having them
+    # beside the CUDA 12 ones makes `import torch` die with
+    # "libtorch_cuda.so: undefined symbol: ncclCommResume". torch alone cannot
+    # clear them, so the loop would never end: purge every `-cu13` wheel first.
+    strays = [d for d in (
+        "nvidia-nccl-cu13", "nvidia-cublas-cu13", "nvidia-cuda-runtime-cu13",
+        "nvidia-cuda-nvrtc-cu13", "nvidia-cufft-cu13", "nvidia-curand-cu13",
+        "nvidia-cusolver-cu13", "nvidia-cusparse-cu13", "nvidia-cudnn-cu13",
+        "nvidia-cusparselt-cu13",
+    ) if _installed(d)]
+    if strays:
+        print("Removing the CUDA 13 wheels a previous install left behind:")
+        for name in strays:
+            print("  -", name)
+        subprocess.run(
+            [sys.executable, "-m", "pip", "uninstall", "-y", *strays],
+            check=False,
+        )
+
+    # Reinstall with dependencies: torch's own metadata names the CUDA 12
+    # `nvidia-*-cu12` wheels, so this also replaces any `-cu13` dependency a
+    # previous CUDA 13 build pulled in.
     run(
         [
             sys.executable,
@@ -440,19 +519,66 @@ if probe.returncode != 0:
         ]
     )
 
+    # Re-probe: a replacement that did not take must stop here with the real
+    # error rather than ask for a restart that cannot fix it.
+    after = subprocess.run(
+        [sys.executable, "-c", TORCH_PROBE],
+        text=True,
+        capture_output=True,
+    )
+    print(after.stdout)
+    if after.stderr:
+        print(after.stderr)
+
+    if after.returncode != 0:
+        raise SystemExit(
+            "The CUDA 12.4 PyTorch stack still does not import after a forced "
+            "reinstall. Read the probe output above; if it still names\\n"
+            "  undefined symbol: ncclCommResume\\n"
+            "run `pip uninstall -y nvidia-nccl-cu13` (and the other -cu13 "
+            "wheels) and re-run this cell."
+        )
+
+    # Only now is a restart both needed and sufficient. torch was just
+    # replaced on disk; if this kernel had already imported it, the server
+    # thread would keep the old module. If it never imported torch, nothing is
+    # stale and the cell can continue straight through - which is what stops
+    # the old behaviour of asking for a restart on every single run.
     print()
     print("=" * 70)
     print("PYTORCH WAS REPLACED")
     print("=" * 70)
     print()
-    print(
-        "IMPORTANT: restart the Colab/Kaggle Python runtime NOW, "
-        "then run this cell again."
-    )
 
-    raise SystemExit(
-        "PyTorch binaries changed. Runtime restart required before continuing."
-    )
+    try:
+        if REPO_DIR not in sys.path:
+            sys.path.insert(0, REPO_DIR)
+        from engine import deploy_helpers as runtime  # noqa: E402
+
+        stale_torch = {k: v for k, v in runtime.stale_modules().items()
+                       if k in ("torch", "torchaudio", "torchvision")}
+    except Exception as exc:  # noqa: BLE001
+        stale_torch = {}
+        print("  note: could not check for a stale torch:", exc)
+
+    if stale_torch:
+        for name, (loaded, installed) in sorted(stale_torch.items()):
+            print(f"  {name:<16} kernel has {loaded}, {installed} is on disk")
+        print()
+        print(
+            "This kernel imported the old PyTorch before pip replaced it, and "
+            "Python cannot swap an\\n"
+            "already-imported extension module. Restart the runtime NOW, then "
+            "run this cell again."
+        )
+        raise SystemExit(
+            "PyTorch binaries changed. Runtime restart required before "
+            "continuing."
+        )
+
+    print("PyTorch replaced and re-probed clean; this kernel never imported "
+          "the old build, so no restart is needed.")
+    print()
 
 
 print("Exact PyTorch 2.6.0 / CUDA 12.4 stack is already usable.")
@@ -474,6 +600,8 @@ stream(
         "pip",
         "install",
         "--no-cache-dir",
+        "-c",
+        CONSTRAINTS,
         "-r",
         "requirements.txt",
     ]
@@ -527,6 +655,8 @@ pyannote = subprocess.run(
         "pip",
         "install",
         "--no-cache-dir",
+        "-c",
+        CONSTRAINTS,
         PYANNOTE,
     ],
     text=True,
@@ -562,6 +692,8 @@ demucs = subprocess.run(
         "pip",
         "install",
         "--no-cache-dir",
+        "-c",
+        CONSTRAINTS,
         "--no-deps",
         "demucs==4.0.1",
     ],

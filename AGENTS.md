@@ -284,9 +284,12 @@
   each cell a stable id (position + source hash), which nbformat 4.5 requires;
   editing a notebook by hand instead leaves cells without ids and the
   validator warns.
-- The notebooks' first cell runs `git fetch` + `git reset --hard FETCH_HEAD`
-  when the checkout already exists. Never run that cell against this working
-  copy: it discards uncommitted work.
+- The notebooks' first cell updates an existing checkout with `git fetch` +
+  `git reset --hard FETCH_HEAD`, but only when the directory is a git checkout.
+  A copy delivered as a zip has no `.git`, so the cell keys on `requirements.txt`
+  instead: without that it treated the copy as absent and cloned the remote over
+  it, silently discarding the code the user was given. Never run that cell
+  against this working copy: it discards uncommitted work.
 - Script intelligence (`engine/llm.py`) is a SEPARATE, OPTIONAL stage from the
   model downloads. Picking a provider there never replaces, skips or affects a
   downloaded model: it only rewrites one over-long line when the user presses
@@ -341,6 +344,22 @@
   REQUIRED` if the kernel is holding a version that is no longer on disk. Do not
   move those imports back into the kernel: a compiled extension cannot be swapped
   once imported, so the only correct answer is a restart.
+- The optional engines (pyannote for multi-speaker, demucs for background) are
+  installed with `-c deploy/constraints.txt`, never bare. `pyannote.audio==3.3.2`
+  pulls speechbrain and pytorch-metric-learning, and the versions already on a
+  hosted image ask for a NEWER torch; pip then replaces the CUDA 12.4 build with
+  a CUDA 13 one. That breaks CTranslate2 (`libcublas.so.12` is gone) and leaves
+  the CUDA 13 `nvidia-*-cu13` wheels beside the CUDA 12 ones, so `import torch`
+  dies with `libtorch_cuda.so: undefined symbol: ncclCommResume`. The constraints
+  file holds `torch==2.6.0` (`==` ignores the local `+cu124` segment), NumPy under
+  numba's cap, and the transformers/huggingface-hub pair.
+- The torch probe's install branch PURGES the `nvidia-*-cu13` wheels before it
+  reinstalls, then RE-PROBES. Without the purge, `pip install torch` cannot clear
+  the stray CUDA 13 wheels and the probe fails again on the next run; the old
+  cell then asked for a restart every time, an infinite loop. And the restart is
+  gated on `deploy_helpers.stale_modules()` for torch only: if the kernel never
+  imported torch, replacing it on disk needs no restart at all, so the cell
+  continues straight through.
 - Lip sync is non-fatal in both render paths: `NoFaceDetected` and any other
   `LipSyncError` mux the dub onto the untouched picture via
   `_deliver_without_lip_sync`. `no_face` in the job's `lip_sync` note is what
