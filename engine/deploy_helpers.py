@@ -442,18 +442,52 @@ def notebook_public_url(port: int, host: str = "0.0.0.0") -> str:
     through `PUBLIC_HOST`; without one the loopback URL is returned and the
     notebook tells the user it is only reachable inside the VM.
 
+    The Colab call is retried and its answer validated. `eval_js` returns
+    `None` when the frontend is busy - which it is right after `start_server`,
+    with a model loading - and a single unvalidated call then hands the user
+    `127.0.0.1:8000`, an address their browser cannot reach. Only an `https://`
+    URL that embeds the port counts as a proxy.
+
     Never raises: any failure falls back to `public_url`.
     """
     if detect_platform() == "colab":
-        try:
-            from google.colab import output  # type: ignore
-
-            proxy = output.eval_js(f"google.colab.kernel.proxyPort({port})")
-            if isinstance(proxy, str) and proxy.startswith("http"):
-                return proxy.rstrip("/")
-        except Exception:  # noqa: BLE001 - not Colab, or the API moved
-            pass
+        proxy = _colab_proxy_url(port)
+        if proxy is not None:
+            return proxy
     return public_url(port, host)
+
+
+def _colab_proxy_url(port: int, attempts: int = 3) -> str | None:
+    """
+    Colab's proxy URL for `port`, or None if it could not be obtained.
+
+    Kept apart from `notebook_public_url` so the retry and validation policy is
+    one unit that can be tested without a Colab frontend. A reply is accepted
+    only when it is an `https://` string that embeds the port; a `None`, a
+    loopback address, or an exception is treated as "try again", and after
+    `attempts` the caller falls back.
+    """
+    try:
+        from google.colab import output  # type: ignore
+    except Exception:  # noqa: BLE001 - not Colab, or the API moved
+        return None
+
+    script = f"google.colab.kernel.proxyPort({port})"
+    for attempt in range(attempts):
+        try:
+            try:
+                # Bound the wait: an unresponsive frontend must not hang the cell.
+                proxy = output.eval_js(script, timeout_sec=10)
+            except TypeError:
+                proxy = output.eval_js(script)  # older colabtools: no timeout_sec
+        except Exception:  # noqa: BLE001 - frontend gone, or the API changed
+            proxy = None
+        if (isinstance(proxy, str) and proxy.startswith("https://")
+                and str(port) in proxy):
+            return proxy.rstrip("/")
+        if attempt + 1 < attempts:
+            time.sleep(1.0)
+    return None
 
 
 def wait_until_ready(url: str, timeout: float = 120.0,

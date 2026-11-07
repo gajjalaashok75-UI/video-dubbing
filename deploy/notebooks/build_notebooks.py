@@ -1295,6 +1295,13 @@ print("=" * 62)
 print("  VideoTrans is running")
 print(f"  Open:  {url}/app/")
 print("=" * 62)
+if url.startswith(("http://127.0.0.1", "http://localhost")):
+    print()
+    print("That is the loopback address - reachable only from inside this")
+    print("VM. If this is Colab, the port proxy did not answer; re-run this")
+    print("cell, or open the app through Colab's own proxy with:")
+    print("  from google.colab.output import eval_js")
+    print(f"  eval_js('google.colab.kernel.proxyPort({PORT})')")
 print()
 print("Keep this notebook tab open while you use the app.")
 if server.log_file is not None:

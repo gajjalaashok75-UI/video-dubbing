@@ -274,6 +274,14 @@
 - `engine/deploy_helpers.py` is the shared runtime for Colab, Kaggle and Docker:
   `detect_platform`, `configure_runtime`, `hardware_report`, `start_server`,
   `notebook_public_url`. Keep the notebooks thin — the logic belongs here.
+- `notebook_public_url()` prefers Colab's port proxy (`_colab_proxy_url`, via
+  `google.colab.output.eval_js`), then `PUBLIC_HOST` (the Kaggle cloudflared
+  tunnel), then loopback. The proxy call is retried and validated: `eval_js`
+  returns `None` when the frontend is busy — which it is right after
+  `start_server`, with a model loading — and a single unvalidated call printed
+  `http://127.0.0.1:8000`, unreachable from the user's browser. Only an
+  `https://` reply that embeds the port counts as a proxy. The server cell also
+  warns when it can only show loopback, so the failure is visible.
 - `configure_runtime()` sets `VIDEOTRANS_UPLOAD_DIR` / `VIDEOTRANS_OUTPUT_DIR` and MUST
   run before `app` is imported: `engine/app.py` snapshots `UPLOAD_DIR` at import.
   It also pins `HF_HOME` to `<runtime>/hf` via `setdefault`, so weights land on
