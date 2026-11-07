@@ -659,6 +659,7 @@ class CacheTests(unittest.TestCase):
         self._fake_root = os.path.join(self.tmp, "fakemod")
         os.makedirs(self._fake_root, exist_ok=True)
         fake.install(self._fake_root)
+        self._fake = fake
         return fake
 
     def _uninstall(self):

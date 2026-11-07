@@ -39,8 +39,12 @@ torchvision==0.21.0
 
 ffmpeg-python==0.2.0
 
-# NumPy 2.5 broke numba/librosa/Wav2Lip in the Colab image.
-numpy==2.2.6
+# Numba (through librosa, which the voice engine and Wav2Lip both load audio
+# with) refuses NumPy newer than 2.2:
+#     "Numba needs NumPy 2.2 or less. Got NumPy 2.5."
+# IndicF5 then fails at boot and lip sync's warmup fails with it, so the dub
+# never gets a voice. Unpinned, a fresh install takes the newest NumPy.
+numpy>=1.26.0,<2.3
 
 librosa==0.11.0
 soundfile>=0.12,<1
@@ -55,10 +59,14 @@ opencv-python>=4.8,<5
 faster-whisper==1.2.1
 ctranslate2>=4.0,<5
 
-# faster-whisper 1.2.1 still uses av.open(metadata_errors=...).
-# Keep PyAV below 18 until a released faster-whisper version
-# containing the newer PyAV compatibility fix is adopted.
-av>=11,<18
+# PyAV is faster-whisper's audio decoder and its one unpinned dependency: it
+# declares `av>=11` with no ceiling, so a fresh install takes the newest. PyAV
+# 19.0.0 (2026-09-29) REMOVED the `metadata_errors` argument to av.open() that
+# faster-whisper 1.2.1 still passes, and every transcription then dies in
+# decode_audio with "TypeError: open() got an unexpected keyword argument
+# 'metadata_errors'" before a single frame is decoded. Held below 19 until
+# faster-whisper stops passing it.
+av>=11,<19
 
 safetensors>=0.4,<1
 tqdm>=4.66,<5
@@ -126,30 +134,46 @@ fonttools>=4.40,<5
 # Multi-speaker diarization
 # ============================================================
 #
-# IMPORTANT:
-# DO NOT use:
+# pyannote is GATED, exactly like IndicF5: accept the licence on the model page
+# and HF_TOKEN in .env covers it. Without it the pipeline runs single-speaker,
+# which is what it did before this existed - the stage is never fatal.
+#   https://huggingface.co/pyannote/speaker-diarization-3.1
+#   https://huggingface.co/pyannote/segmentation-3.0
 #
-#   pyannote.audio>=3.3.2
+# Set HF_TOKEN to a Hugging Face token whose account has accepted both licences
+# above; the diarization stage reports the missing access and continues
+# single-speaker rather than failing the render.
 #
-# because that allows pip to select pyannote 4.x and pull a newer
-# Torch ecosystem.
+# Kept out of the default install: it is a heavy optional extra and most videos
+# are one speaker. Install with:  pip install "pyannote.audio==3.3.2"
 #
-# speaker-diarization-3.1 is the pipeline used by this project.
-
-pyannote.audio==3.3.2
+# Pinned to 3.3.2 rather than >=3.3.2 on purpose. pyannote 4.x requires
+# torch>=2.8 and torchcodec>=0.7, which would replace the CUDA-12 torch 2.6
+# build the rest of the stack is built against - and CTranslate2 then dies on
+# the first encode with "Library libcublas.so.12 is not found or cannot be
+# loaded". speaker-diarization-3.1 is the pipeline this project uses.
+# pyannote.audio==3.3.2
 
 
 # ============================================================
 # Background preservation
 # ============================================================
 #
-# Demucs is optional at runtime, but Colab/Kaggle installs it.
-# Keep it outside the main resolver so its old dependency tree
-# cannot rewrite the application's core ML environment.
+# Demucs splits the original soundtrack into speech and everything else, so the
+# film's music, sound effects and ambience survive under the new dialogue
+# instead of being replaced by it. Off by default; turn it on per render in the
+# studio, or set VIDEOTRANS_PRESERVE_BACKGROUND=1.
 #
-# Installed separately by the notebook with --no-deps.
+# Heavy and slow: roughly realtime or worse on CPU, and it downloads a ~300 MB
+# checkpoint on first use. Audio is separated in 10-minute chunks so peak memory
+# stays bounded on a full-length film.
 #
-# demucs==4.0.1
+# To enable:  pip install "demucs>=4.0.0"
+#
+# Colab/Kaggle install demucs==4.0.1 with --no-deps and then name its import
+# chain (lameenc, julius, openunmix, dora-search, omegaconf, ...) explicitly,
+# so its old dependency tree cannot rewrite Torch, NumPy, Hydra or OmegaConf.
+# demucs>=4.0.0
 
 
 # ============================================================

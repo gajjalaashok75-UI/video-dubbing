@@ -330,6 +330,17 @@
   NumPy 2.2 or less". Unpinned, IndicF5 fails to load at boot and Wav2Lip's
   warmup fails with it. The notebook re-asserts the pin after the optional
   extras, since `pip install -U transformers` can pull a newer NumPy in.
+- The pin only works if the KERNEL actually runs the new NumPy. The Check cell
+  imports torch and numpy to print the machine report, and the install cell then
+  `pip install`s the pinned NumPy in a SUBPROCESS. The subprocess sees 2.2.6, but
+  the kernel keeps the image's 2.5.4 in `sys.modules`, and the server (a thread
+  of that kernel) inherits it — numba refuses it and the voice model plus lip
+  sync fail at boot while every check above passed. So the Check cell's probe
+  runs in a SUBPROCESS and never imports torch/numpy into the kernel, and the
+  install cell calls `deploy_helpers.stale_modules()` and raises `RESTART
+  REQUIRED` if the kernel is holding a version that is no longer on disk. Do not
+  move those imports back into the kernel: a compiled extension cannot be swapped
+  once imported, so the only correct answer is a restart.
 - Lip sync is non-fatal in both render paths: `NoFaceDetected` and any other
   `LipSyncError` mux the dub onto the untouched picture via
   `_deliver_without_lip_sync`. `no_face` in the job's `lip_sync` note is what

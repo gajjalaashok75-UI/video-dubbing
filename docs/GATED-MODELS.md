@@ -92,7 +92,9 @@ if any of them is not granted to the same account the token belongs to.
 3. <https://huggingface.co/pyannote/wespeaker-voxceleb-resnet34-LM> (open, no
    licence — listed because it is downloaded alongside the other two)
 
-`pip install 'pyannote.audio>=3.3.2'` is still needed; the licence grants the
+`pip install 'pyannote.audio==3.3.2'` is still needed (pinned: pyannote
+4.x requires torch>=2.8 and would replace the CUDA-12 torch build the rest of
+the stack needs); the licence grants the
 weights, not the package. With both in place a conversation is dubbed with one
 cloned voice per actor, and the log says
 `[DIAR] N turns, 2 speaker(s)` instead of `Speaker diarization unavailable`.

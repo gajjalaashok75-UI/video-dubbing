@@ -132,12 +132,30 @@ quality preset. This cell is quick - it downloads nothing.
 
 CHECK = code(f"""
 import os
+import subprocess
 import sys
 
 REPO_DIR = {REPO_DIR_EXPR}
 if REPO_DIR not in sys.path:
     sys.path.insert(0, REPO_DIR)
 os.chdir(REPO_DIR)
+
+# deploy_helpers has no heavy imports at module level, so importing it here is
+# free and the runtime cell below reuses it.
+from engine import deploy_helpers as runtime
+
+# The machine report and the readiness snapshot both import torch, numpy and
+# numba. They run in a SUBPROCESS on purpose: the install cell replaces those
+# packages on disk, and a version this kernel had already imported would stay in
+# sys.modules - the server, which is a thread of this kernel, would then inherit
+# the OLD NumPy that numba refuses, and the voice model and lip sync would fail
+# at boot. Keeping the kernel free of them is what lets the notebook run
+# top-to-bottom without a restart.
+PROBE = r'''
+import os
+import sys
+
+sys.path.insert(0, os.getcwd())
 
 from engine import deploy_helpers as runtime
 
@@ -146,7 +164,7 @@ print("Python:  ", sys.version.split()[0])
 
 report = runtime.hardware_report()
 if report["cuda_available"]:
-    print(f"GPU:      {{report['gpu_name']}} ({{report['vram_gb']}} GB VRAM)")
+    print("GPU:      %s (%s GB VRAM)" % (report["gpu_name"], report["vram_gb"]))
 else:
     print("GPU:      none - renders run on CPU and are slow")
 print("Device:  ", report["device"])
@@ -156,10 +174,8 @@ for note in report["notes"]:
 
 print("FFmpeg:  ", "ready" if runtime.ensure_ffmpeg() else "NOT available")
 
-# The same readiness the studio shows. Every probe is an import spec or a file
-# check, so this is instant and loads no model.
 sys.path.insert(0, "engine")
-import readiness  # noqa: E402
+import readiness
 
 snapshot = readiness.snapshot()
 print()
@@ -169,6 +185,14 @@ for line in readiness.summarize(snapshot):
 print()
 print("A missing OPTIONAL feature is a reduced dub, not a broken install.")
 print("Run the Verify cell after the install to see the full picture.")
+'''
+
+probe = subprocess.run([sys.executable, "-c", PROBE],
+                       text=True, capture_output=True)
+
+print(probe.stdout, end="")
+if probe.stderr:
+    print(probe.stderr, end="")
 """)
 
 RUNTIME_MD = md("""
@@ -476,23 +500,44 @@ if result.returncode != 0:
 
 
 # ============================================================
-# Demucs
+# Optional extras: multi-speaker + background
 # ============================================================
 #
-# pyannote is NOT installed here anymore. It is pinned in requirements.txt:
+# pyannote is NOT installed by requirements.txt (it is commented out there and
+# gated behind the model licence), so the notebook installs it here, pinned.
 #
-#     pyannote.audio==3.3.2
-#
-# so pip resolves it together with the core environment, and a job never ends
-# up with pyannote 4.x pulling a newer torch.
+# The pin matters: pyannote 4.x requires torch>=2.8, which would replace the
+# CUDA-12 torch 2.6 build and break CTranslate2's libcublas.so.12 on the first
+# encode. 3.3.2 is the release whose torch requirement (>=2.0) the pinned stack
+# already satisfies, so the resolver leaves torch alone.
 #
 # Demucs is intentionally installed without dependencies because its old
 # dependency tree must not rewrite Torch, NumPy, Hydra, OmegaConf, etc.
 
 print()
 print("=" * 70)
-print("INSTALLING OPTIONAL BACKGROUND ENGINE")
+print("INSTALLING OPTIONAL ENGINES (MULTI-SPEAKER, BACKGROUND)")
 print("=" * 70)
+
+PYANNOTE = "pyannote.audio==3.3.2"
+pyannote = subprocess.run(
+    [
+        sys.executable,
+        "-m",
+        "pip",
+        "install",
+        "--no-cache-dir",
+        PYANNOTE,
+    ],
+    text=True,
+    capture_output=True,
+)
+if pyannote.returncode == 0:
+    print(f"ok   {PYANNOTE} installed (multi-speaker detection)")
+else:
+    print(f"--   {PYANNOTE} did not install; dubbing continues single-speaker")
+    for line in (pyannote.stderr or pyannote.stdout or "").strip().splitlines()[-3:]:
+        print("       ", line)
 
 # Demucs' own import chain, installed alongside it with --no-deps for the same
 # reason: `pip check` reported dora-search, lameenc and openunmix missing, which
@@ -608,6 +653,50 @@ if probe.returncode != 0:
 
 print("  numpy", (probe.stdout or "?").strip(),
       "(the voice model needs it at 2.2 or less)")
+
+
+# ============================================================
+# The interpreter must agree with what was just installed
+# ============================================================
+#
+# Every check above runs in a fresh subprocess, so it sees the files pip just
+# wrote. The kernel does not: if an earlier cell already imported numpy or torch
+# (the Check cell imports both), the kernel keeps that module object in
+# sys.modules and a later `import numpy` returns the OLD version. The server
+# runs in a thread of this kernel, so it inherits the stale NumPy, numba refuses
+# it, and the voice model plus lip sync fail at boot while the verification
+# above reported everything fine.
+#
+# A compiled extension cannot be swapped in a running interpreter, so the only
+# correct answer is a restart - the same one the torch replacement asks for.
+
+try:
+    if REPO_DIR not in sys.path:
+        sys.path.insert(0, REPO_DIR)
+    from engine import deploy_helpers as runtime  # noqa: E402
+    stale = runtime.stale_modules()
+except Exception as exc:  # noqa: BLE001 - never let the guard break the install
+    stale = {}
+    print("  note: could not check for stale modules:", exc)
+
+if stale:
+    print()
+    print("=" * 70)
+    print("RESTART REQUIRED")
+    print("=" * 70)
+    for name, (loaded, installed) in sorted(stale.items()):
+        print(f"  {name:<16} kernel has {loaded}, {installed} is installed on disk")
+    print()
+    print("This kernel imported the old versions before pip replaced them, and")
+    print("Python cannot swap an already-imported extension module. Starting the")
+    print("server here would run the OLD NumPy - which numba refuses - so the")
+    print("voice model and lip sync would fail even though the checks above pass.")
+    print()
+    print("  Runtime -> Restart session  (Kaggle: Run -> Restart session),")
+    print("  then re-run from the FIRST cell.")
+    print("=" * 70)
+    raise SystemExit(
+        "Restart the runtime, then re-run the notebook from cell 1.")
 
 
 # ============================================================
@@ -1229,7 +1318,8 @@ TROUBLE = md("""
 | `The server did not become ready ...` | Re-run the install cell; a partial install is the usual cause. Read `server.log` (path printed by the server cell), or run the log cell. |
 | `ModuleNotFoundError: No module named 'torch'` | The CUDA install cell did not finish. Re-run it and read its output. |
 | `Library libcublas.so.12 is not found or cannot be loaded` | torch is a CUDA 13 build. CTranslate2 (faster-whisper) needs CUDA 12. Re-run the install cell: it force-installs `torch==2.6.0+cu124` whenever the torch it finds is not a CUDA 12 one. |
-| `Numba needs NumPy 2.2 or less. Got NumPy 2.5.` | Something installed a newer NumPy after the install cell (a manual `pip install -U transformers` does it). Re-run the install cell; it restores the `numpy<2.3` pin. |
+| `Numba needs NumPy 2.2 or less. Got NumPy 2.5.` | Something installed a newer NumPy after the install cell (a manual `pip install -U transformers` does it). Re-run the install cell; it restores the `numpy<2.3` pin. If the message persists, the kernel imported the old NumPy before it was replaced - restart the session and re-run from cell 1. |
+| `RESTART REQUIRED` (after the install) | The kernel imported NumPy or torch before the install replaced them, and Python cannot swap an already-imported extension module. Restart the session (Runtime/Run -> Restart session) and re-run from cell 1. This is the guard that stops a server booting on a NumPy numba refuses. |
 | `cannot import name 'GenerationMixin'` | transformers 5.x was installed over the pinned 4.x. Re-run the install cell; it restores the `transformers<5` pin. Do not `pip install -U transformers` in this runtime. |
 | `GPU: none - renders run on CPU` | The runtime is not a GPU one. Change it (see the top) and re-run from cell 1. |
 | `Still missing N required model(s)` | The model cell did not finish. Re-run it; it is resumable. Check the disk-space line it prints. |

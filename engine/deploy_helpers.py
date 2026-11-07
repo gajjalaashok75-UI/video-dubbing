@@ -57,6 +57,7 @@ __all__ = [
     "repo_dir",
     "runtime_dirs",
     "server_log_path",
+    "stale_modules",
     "start_server",
     "wait_until_ready",
 ]
@@ -308,6 +309,49 @@ def hardware_report() -> dict:
         "No CUDA GPU. Renders will run on CPU: correct, but slow. Select a GPU "
         "runtime (Runtime/Accelerator menu) to speed this up.")
     return report
+
+
+# The packages a hosted image ships at one version and the pinned install then
+# changes on disk. Each is a compiled extension that Python cannot swap once it
+# has been imported: `pip install` in a subprocess rewrites the files, but the
+# running kernel keeps the old module object in `sys.modules` and every later
+# `import numpy` returns it. That is why a session can verify `numpy==2.2.6`
+# (the fresh subprocess) and then start a server that reports NumPy 2.5 (the
+# stale kernel) - and numba refuses it, so the voice model and lip sync fail.
+_WATCHED = ("torch", "torchaudio", "torchvision", "numpy", "numba",
+            "transformers", "huggingface_hub")
+
+
+def stale_modules() -> dict:
+    """Packages this process imported at a version that is no longer on disk.
+
+    Returns `{name: (loaded, installed)}` for the watched packages that are
+    already in `sys.modules` AND whose on-disk distribution now differs. An
+    empty dict means the interpreter is consistent with what was installed, so
+    it is safe to start the server in this process.
+
+    This is the check that a `--version` probe cannot make: the probe runs in a
+    fresh subprocess and always sees the new files, while the server inherits
+    the kernel's stale modules. Only the kernel's own `sys.modules` can answer
+    "will the server see the version I just installed".
+    """
+    import importlib.metadata as md
+
+    stale: dict = {}
+    for name in _WATCHED:
+        module = sys.modules.get(name)
+        if module is None:
+            continue                                  # not imported: nothing stale
+        loaded = getattr(module, "__version__", None)
+        try:
+            installed = md.version(name)
+        except md.PackageNotFoundError:
+            continue                                  # not a distribution here
+        except Exception:                             # noqa: BLE001
+            continue
+        if loaded and installed and loaded != installed:
+            stale[name] = (loaded, installed)
+    return stale
 
 
 def public_url(port: int, host: str = "127.0.0.1") -> str:

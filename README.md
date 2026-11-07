@@ -301,7 +301,7 @@ heavy, both are off unless asked for, and neither being absent stops a dub.
 
 | Extra | Install | Enables | Without it |
 |---|---|---|---|
-| pyannote | `pip install 'pyannote.audio>=3.3.2'` + `HF_TOKEN` | Multi-speaker detection, one cloned voice per actor | One voice for the whole video, exactly as before |
+| pyannote | `pip install 'pyannote.audio==3.3.2'` + `HF_TOKEN` | Multi-speaker detection, one cloned voice per actor | One voice for the whole video, exactly as before |
 | Demucs | `pip install 'demucs>=4.0.0'` | Keeping the film's own music, sound effects and ambience under the dub | The dub replaces the soundtrack |
 
 pyannote's weights are **gated**: accept the licence on the model page and put a
@@ -319,7 +319,7 @@ why — the studio shows it on the finished project, and
 - **Multi-speaker, when pyannote is installed.** Diarization finds who spoke
   when, each actor is cloned from their own cleanest window, and their phrases
   are spoken in that voice. It is an optional, gated extra
-  (`pip install 'pyannote.audio>=3.3.2'` plus `HF_TOKEN`); without it a video
+  (`pip install 'pyannote.audio==3.3.2'` plus `HF_TOKEN`); without it a video
   still gets one voice, exactly as before. Speakers with no clean audio are
   marked unresolved rather than given another actor's voice.
 - **Overlapping speakers are supported.** Two actors talking at once keep

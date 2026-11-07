@@ -106,8 +106,11 @@ fonttools>=4.40.0
 # without it the pipeline runs single-speaker, exactly as before.
 #   https://huggingface.co/pyannote/speaker-diarization-3.1
 #   https://huggingface.co/pyannote/segmentation-3.0
-# To enable:  pip install "pyannote.audio>=3.3.2"
-# pyannote.audio>=3.3.2
+#
+# Pinned to 3.3.2, not >=3.3.2: pyannote 4.x requires torch>=2.8, which would
+# replace the CUDA-12 torch build and break CTranslate2's libcublas.so.12.
+# To enable:  pip install "pyannote.audio==3.3.2"
+# pyannote.audio==3.3.2
 
 # Background preservation. Demucs splits the original soundtrack into speech and
 # everything else, so the film's music, sound effects and ambience survive under

@@ -240,7 +240,7 @@ Backward compatibility:
 
 ## 5. Recommended diarization backend
 
-**Default: `pyannote/speaker-diarization-3.1` via `pyannote.audio>=3.3.2`.
+**Default: `pyannote/speaker-diarization-3.1` via `pyannote.audio==3.3.2`.
 Optional: DiariZen (`BUT-FIT/diarizen-wavlm-large-s80-md-v2`) behind the same
 interface.**
 
@@ -495,7 +495,7 @@ New optional dependencies:
 | Package | Purpose | Notes |
 |---|---|---|
 | `demucs>=4` | source separation | ~300 MB checkpoint; optional extra, mirroring PolyDub's `[separate]` |
-| `pyannote.audio>=3.3.2` | default diarization | gated weights; reuses the existing `HF_TOKEN` path |
+| `pyannote.audio==3.3.2` | default diarization | gated weights; reuses the existing `HF_TOKEN` path |
 | DiariZen (git) + `lightning`, `speechbrain`, `torchmetrics`, `torch-audiomentations`, `torch-pitch-shift`, `diffq` | optional diarization | **conflicts with the repo's `torch`/`av` pins; keep strictly optional** |
 
 Both new stages must be added to `requirements.txt`, `deploy/docker/requirements.docker.txt`
