@@ -910,7 +910,14 @@ def check_numpy():
     import numpy
     import numba
 
-    assert numpy.__version__ == "2.2.6", numpy.__version__
+    # Match the requirement `numpy>=1.26.0,<2.3`, not one patch release: an
+    # exact `== "2.2.6"` fails on the next 2.2.x that pip may resolve, and
+    # numba accepts anything up to 2.2. Strip any suffix so "2.3.0rc1" still
+    # compares as (2, 3).
+    parts = tuple(int("".join(c for c in p if c.isdigit()) or 0)
+                  for p in numpy.__version__.split(".")[:2])
+
+    assert (1, 26) <= parts < (2, 3), numpy.__version__
 
     return f"numpy={numpy.__version__}, numba={numba.__version__}"
 
@@ -965,9 +972,13 @@ def check_whisper():
     import ctranslate2
     import av
 
+    # `av>=11,<19` in requirements.txt is the real contract. PyAV 19.0.0
+    # removed the `metadata_errors` kwarg faster-whisper passes, and 18.1.0 is
+    # the last release that still has it - so 18.1.0 must PASS. The old check
+    # asserted `av_major < 18` and failed the one version the pin allows.
     av_major = int(av.__version__.split(".")[0])
 
-    assert av_major < 18, av.__version__
+    assert av_major < 19, av.__version__
 
     return (
         f"faster-whisper={getattr(faster_whisper, '__version__', '?')}, "

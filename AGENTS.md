@@ -259,6 +259,12 @@
   agreeing on the platform, the vendored f5_tts fork, lip sync streaming (a
   fake model and detector render a synthetic clip and the bytes are compared
   with the old in-memory algorithm), and `/videos/` listing a run in progress.
+- The Verify cell's assertions must agree with `requirements.txt`. A check that
+  contradicts a pin blocks a session that is actually correct, which is how
+  `assert av_major < 18` failed every run: the pin is `av>=11,<19` and 18.1.0 is
+  the last release with `metadata_errors`, so the check must accept it and
+  reject only 19+. Same for NumPy: assert the range `>=1.26,<2.3`, not one patch
+  release, or the next 2.2.x that pip resolves fails the cell.
 - End-to-end: `VIDEOTRANS_URL=http://127.0.0.1:12000 ./venv/bin/python
   scripts/selftest.py [clip.mp4]`. With no clip it runs 38 checks; with a clip
   it adds the render, editor, export and voice-over checks.
