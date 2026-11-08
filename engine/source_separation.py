@@ -85,8 +85,15 @@ _STEMS = dict  # {"vocals": path, "background": path, "sample_rate": int, ...}
 # `dora-search` provides the `dora` module; lameenc and julius are separate
 # wheels. Demucs itself is installed with `--no-deps` so its old tree cannot
 # rewrite torch or numpy, which is exactly why these have to be named here.
+#
+# `sphn` is the one that bit hardest: it is a hard `import` at the top of
+# `demucs.api`, but it is NOT one of the modules `find_spec("demucs")` implies,
+# so a Colab install that named only the obvious dora-search chain reported
+# background preservation ready while `python -m demucs.separate` died on
+# `import sphn` — the render then dropped the soundtrack with no error. `einops`
+# and `pyyaml` are Demucs' other import-time requirements for the same reason.
 REQUIRED_MODULES = ("demucs.separate", "lameenc", "julius", "openunmix", "dora",
-                    "omegaconf", "tqdm")
+                    "omegaconf", "tqdm", "sphn", "einops", "yaml")
 
 
 def missing_deps() -> list:

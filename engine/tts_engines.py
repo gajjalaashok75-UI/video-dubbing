@@ -356,22 +356,49 @@ class IndicF5Engine:
         return t, sr
 
     def natural_duration(self, text: str, ref_path: str, ref_text: str,
-                         lang: str = "hi") -> float:
+                         lang: str = "hi", source_lang: str = None) -> float:
         """
         How long F5 will make this utterance if left alone, in seconds.
 
-        Mirrors the model's own internal heuristic exactly (utils_infer:
+        Mirrors the model's own internal heuristic (utils_infer:
         `duration = ref_audio_len + ref_audio_len / ref_text_len * gen_text_len`,
-        byte-counted). Asking for a duration that matches what the model already
-        wants means it never has to internally compress or pad — which is what
-        makes the difference between natural delivery and a rushed, garbled one.
+        byte-counted) when no source language is known, because then the byte
+        count is the only signal available and it is the previous behaviour.
+
+        When the source language IS known it is replaced by a calibrated
+        estimate, because the byte mirror is only meaningful same-script and
+        actively harmful cross-script. The model scales generation by the
+        TARGET's UTF-8 byte count, so a Devanagari target against a Latin
+        reference is asked for ~3x the time its words need (3 bytes/char against
+        1). The timeline then overflows and the closing squeeze crushes every
+        phrase to fit — audible as a dub where words are mangled and whole lines
+        vanish. Measured on an English->Hindi clip: the byte mirror wanted 15.5s
+        of speech for a 9.0s video (a 1.7x squeeze); the calibrated estimate
+        wanted 6.7s (1.02x).
+
+        The calibrated form separates the two effects the byte count conflates,
+        the same way `dubbing.DurationModel` does: script density from the
+        target language's characters-per-second, speaker tempo from how fast
+        THIS reference talks relative to typical for the source language. For a
+        same-script pair the two agree to within the reference's own bytes-per-
+        character, so this does not regress a same-language re-voice.
         """
         rt = self._normalize_ref_text(ref_text)
         ref_bytes = max(1, len(rt.encode("utf-8")))
-        gen_bytes = len((text or "").strip().encode("utf-8"))
+        gen_text = (text or "").strip()
         spb = self._seconds_per_byte(ref_path, ref_bytes)
         spb = self._sanity_clamp(spb, rt, lang)
-        return spb * gen_bytes
+
+        # No source language: the speaker's pace cannot be told apart from the
+        # script's density, so keep the model's own byte mirror unchanged.
+        if not source_lang:
+            return spb * len(gen_text.encode("utf-8"))
+
+        ref_chars = max(1, len(rt.strip()))
+        ref_cps = ref_chars / max(1e-6, spb * ref_bytes)
+        tempo = L.chars_per_second(source_lang) / ref_cps if ref_cps > 0 else 1.0
+        tempo = min(1.7, max(0.6, tempo))
+        return (max(1, len(gen_text)) / L.chars_per_second(lang)) * tempo
 
     @staticmethod
     def _sanity_clamp(spb: float, ref_text: str, lang: str) -> float:
@@ -571,7 +598,8 @@ class XTTSEngine:
             torch.serialization.add_safe_globals(allowed)
 
     def natural_duration(self, text: str, ref_path: str = None,
-                         ref_text: str = None, lang: str = "en") -> float:
+                         ref_text: str = None, lang: str = "en",
+                         source_lang: str = None) -> float:
         """
         Estimated spoken length, so the planner treats XTTS like IndicF5.
 
@@ -580,6 +608,11 @@ class XTTSEngine:
         planner fell back to the generic characters-per-second model, whose
         targets could be far enough off to force overruns and cascading.
         XTTS's rate is stable enough that the language table is a fair proxy.
+
+        `source_lang` is accepted for interface parity with IndicF5 and ignored:
+        this estimate already counts TARGET characters against the target
+        language's rate, so it carries none of the cross-script byte error that
+        parameter exists to correct.
         """
         try:
             cps = L.chars_per_second(lang)

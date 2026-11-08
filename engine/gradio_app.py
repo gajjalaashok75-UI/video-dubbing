@@ -197,7 +197,8 @@ def run_pipeline(video_path, source_lang, target_lang, do_lip_sync,
             segments, translated, source_audio=stt_wav, video_duration=video_dur)
         _eng = tts_engines.get_engine(target_lang)
         _nat = (lambda t: _eng.natural_duration(t, reference["path"],
-                reference["text"], lang=L.synth_lang(target_lang))) \
+                reference["text"], lang=L.synth_lang(target_lang),
+                source_lang=resolved_src)) \
             if hasattr(_eng, "natural_duration") else None
         plan = dubbing.plan_timeline(units, unit_texts, dm, video_dur, natural_fn=_nat)
 

@@ -683,6 +683,12 @@ DEMUCS_DEPS = [
     "retrying",
     "submitit",
     "treetable",
+    # sphn is imported at the top of demucs.api but is NOT part of the
+    # dora-search chain, so --no-deps left it out and `python -m demucs.separate`
+    # died on `import sphn`. The render then dropped the soundtrack silently.
+    "sphn",
+    "einops",
+    "pyyaml",
 ]
 
 demucs = subprocess.run(

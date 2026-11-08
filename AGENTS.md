@@ -384,3 +384,30 @@
   `deploy/docker/Dockerfile.dockerignore` both trim it; keep them in sync with
   `.gitignore`. The build was verified: `docker build -f deploy/docker/Dockerfile .`
   then `docker run` answers `/api/health` and serves `/app/`.
+- The duration request to IndicF5 must be CALIBRATED across scripts, not a raw
+  byte count. F5's own heuristic (`ref_audio_len + ref_audio_len / ref_text_len *
+  gen_text_len`) counts `gen_text_len` in UTF-8 BYTES, so an English reference
+  conditioned on a Devanagari target is asked for ~3x the time its words need (3
+  bytes/char vs 1). The timeline then overflows and `plan_timeline`'s closing
+  squeeze compresses every phrase to fit — words mangle and whole lines vanish.
+  `IndicF5Engine.natural_duration` therefore takes `source_lang` and, when it is
+  known, splits the estimate the way `DurationModel` does: target
+  characters-per-second for script density, and the reference's own tempo
+  relative to the source language. Measured on an English->Hindi 9.0s clip:
+  before, 17.2s requested -> 1.59x squeeze and the opening line disappeared;
+  after, 8.0s -> 1.03x and all three lines round-trip. Keep the byte mirror only
+  as the no-`source_lang` fallback. Pinned by `tests/test_duration_calibration.py`.
+- pyannote 3.3.2 must load under the pinned huggingface_hub 2.x / torch 2.6, or
+  diarization silently fails and every job drops to single-speaker (a two-hander
+  comes back in one voice). `speaker_diarization._apply_compat_shims` translates
+  `use_auth_token=` to `token=` and restores `torch.load(weights_only=False)` for
+  pyannote's own checkpoint classes; both are narrow, idempotent, failure-safe,
+  and applied before any pyannote import. On the versions pyannote expects they
+  are no-ops.
+- Demucs' `--no-deps` install must name `sphn`, `einops`, and `pyyaml` as well
+  as the dora-search chain. `demucs.api` imports `sphn` at module load and it is
+  NOT implied by `find_spec("demucs")`, so a Colab install reported background
+  preservation ready while `python -m demucs.separate` died on `import sphn` and
+  the render silently dropped the soundtrack. Keep `REQUIRED_MODULES` in
+  `engine/source_separation.py` and `DEMUCS_DEPS` in
+  `deploy/notebooks/build_notebooks.py` in sync.

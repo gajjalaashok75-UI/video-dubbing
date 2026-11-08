@@ -30,6 +30,143 @@ import threading
 
 import speakers as SPK
 
+# ---------------------------------------------------------------------------
+# Version compatibility for pyannote 3.3.2
+# ---------------------------------------------------------------------------
+# pyannote 3.3.2 is pinned because pyannote 4.x would drag in torch>=2.8 and
+# break the CUDA-12 torch 2.6 build. But 3.3.2 was written against
+# huggingface_hub 0.x and torch 2.5, and two of those assumptions no longer
+# hold, so the pipeline raises on load and the whole job silently drops to
+# single-speaker mode — which is exactly why a two-hander comes back in one
+# voice:
+#
+#   * `hf_hub_download(use_auth_token=...)` — huggingface_hub 2.0 removed the
+#     `use_auth_token` keyword. pyannote still passes it, so every download
+#     dies with `unexpected keyword argument 'use_auth_token'`.
+#   * `torch.load` — torch 2.6 flipped the default of `weights_only` to True.
+#     pyannote's checkpoints hold `pyannote.audio.core.task.Specifications` and
+#     friends, which the safe unpickler refuses, so loading the weights raises
+#     `UnpicklingError: Weights only load failed`.
+#
+# Both are repaired here, once, before any pyannote import, and only when the
+# installed library actually needs it — on the versions pyannote was written
+# for this is a no-op. The shims are narrow: they translate one keyword and
+# restore one default, and touch nothing else.
+_SHIMS_APPLIED = False
+_SHIMS_LOCK = threading.Lock()
+
+
+def _apply_compat_shims() -> None:
+    """
+    Make pyannote 3.3.2 load on huggingface_hub 2.x and torch 2.6.
+
+    Idempotent and failure-safe: any problem here leaves the library untouched
+    and the caller falls back to the single-speaker path exactly as before.
+    """
+    global _SHIMS_APPLIED
+    with _SHIMS_LOCK:
+        if not _SHIMS_APPLIED:
+            _SHIMS_APPLIED = True
+            _shim_torch_load()
+        # The hub rebind runs on every call, not just the first: pyannote
+        # imports `hf_hub_download` at module load, so whichever import order
+        # the caller used, the already-imported pyannote modules must be
+        # pointed at the shim. Cheap, and it closes the ordering hole where a
+        # shim applied before pyannote was imported left pyannote holding the
+        # original function.
+        _shim_hf_hub_download()
+
+
+def _shim_hf_hub_download() -> None:
+    """
+    Translate `use_auth_token=` to `token=` for callers that still pass it.
+
+    huggingface_hub 2.0 renamed the argument. Only the download helpers
+    pyannote imports are wrapped, so the rest of the hub API is untouched.
+    """
+    try:
+        import inspect
+
+        import huggingface_hub
+        from huggingface_hub import hf_hub_download
+    except Exception:                                        # noqa: BLE001
+        return
+    try:
+        params = inspect.signature(hf_hub_download).parameters
+    except (TypeError, ValueError):
+        return
+    # Nothing to do on the versions that still accept the old name, or on a
+    # hub so old it has no `token` keyword to translate to.
+    if "use_auth_token" in params or "token" not in params:
+        return
+    if getattr(hf_hub_download, "_vt_hub_shim", False):
+        return
+
+    real = hf_hub_download
+
+    def shim(*args, **kwargs):
+        if "use_auth_token" in kwargs and "token" not in kwargs:
+            kwargs["token"] = kwargs.pop("use_auth_token")
+        return real(*args, **kwargs)
+
+    shim._vt_hub_shim = True
+    shim.__wrapped__ = real
+    huggingface_hub.hf_hub_download = shim
+    # pyannote does `from huggingface_hub import hf_hub_download` at module
+    # import time, so patching the hub package alone is not enough — those
+    # modules hold their own reference to the original function. Rebind every
+    # already-imported pyannote module that captured it.
+    import sys
+    for name, module in list(sys.modules.items()):
+        if not name.startswith("pyannote") or module is None:
+            continue
+        if getattr(module, "hf_hub_download", None) is real:
+            try:
+                module.hf_hub_download = shim
+            except Exception:                                # noqa: BLE001
+                pass
+    print("[DIAR] Patched huggingface_hub for pyannote 3.3.2 "
+          "(use_auth_token -> token)")
+
+
+def _shim_torch_load() -> None:
+    """
+    Restore `weights_only=False` for pyannote's checkpoint loader.
+
+    torch 2.6 made `weights_only=True` the default, which refuses the
+    `Specifications`/`TorchVersion` objects pyannote serialises into its
+    checkpoints. Lightning passes `weights_only` explicitly, so the value has
+    to be forced rather than defaulted. These are the project's own pinned,
+    licence-accepted checkpoints, so the trust assumption `weights_only=False`
+    encodes is satisfied.
+    """
+    try:
+        import inspect
+
+        import torch
+    except Exception:                                        # noqa: BLE001
+        return
+    try:
+        params = inspect.signature(torch.load).parameters
+    except (TypeError, ValueError):
+        return
+    if "weights_only" not in params:
+        return
+    if getattr(torch.load, "_vt_load_shim", False):
+        return
+
+    real = torch.load
+
+    def shim(*args, **kwargs):
+        kwargs["weights_only"] = False
+        return real(*args, **kwargs)
+
+    shim._vt_load_shim = True
+    shim.__wrapped__ = real
+    torch.load = shim
+    print("[DIAR] Patched torch.load for pyannote 3.3.2 "
+          "(weights_only=False)")
+
 # The repo's default. pyannote 3.1 is what `video-dubbing-system` and
 # `Ai-Vedio-Dubbing` both use, and it is the one whose output shape the
 # reference implementations already handle.
@@ -112,6 +249,11 @@ class PyannoteDiarizer(Diarizer):
                 return self._pipeline
             from pyannote.audio import Pipeline
 
+            # Apply the pyannote-3.3.2 compatibility shims BEFORE the pipeline
+            # touches huggingface_hub or torch.load. Without them the load
+            # raises and the job silently dubs a conversation in one voice.
+            _apply_compat_shims()
+
             token = self._token()
             if not token:
                 raise RuntimeError(
@@ -164,9 +306,16 @@ class PyannoteDiarizer(Diarizer):
         try:
             return Pipeline.from_pretrained(self.model, use_auth_token=token)
         except TypeError as e:
-            if "use_auth_token" not in str(e):
+            if "use_auth_token" not in str(e) and "token" not in str(e):
                 raise
-            return Pipeline.from_pretrained(self.model, token=token)
+            # The shim above normally makes the old spelling work. If a hub
+            # version still refuses both, the newer spelling is the last try;
+            # if that also fails, re-raise the original so the real cause (a
+            # gated-model 401/403, not the keyword) is what gets reported.
+            try:
+                return Pipeline.from_pretrained(self.model, token=token)
+            except TypeError:
+                raise e
 
     def _explain_load_failure(self, exc: Exception) -> str:
         """

@@ -2564,7 +2564,9 @@ async def fit_segment(job_id: str, index: int, body: dict = Body(default={})):
     ref = job["reference"]
     lang = L.synth_lang(job["target_language"])
     slot = float(unit["duration"])
-    measure = lambda t: engine.natural_duration(t, ref["path"], ref["text"], lang=lang)
+    measure = lambda t: engine.natural_duration(
+        t, ref["path"], ref["text"], lang=lang,
+        source_lang=job.get("source_language"))
 
     # A little headroom: landing exactly on the slot still leaves the fitter
     # shaving the tail off the last word.

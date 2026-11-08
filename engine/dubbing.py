@@ -931,7 +931,7 @@ def build_dubbed_track(segments: list, translated_texts: list, reference: dict,
                     ref = entry["reference"]
                     break
             return engine.natural_duration(text, ref["path"], ref.get("text", ""),
-                                           lang=_lang)
+                                           lang=_lang, source_lang=source_lang)
 
     plan = plan_timeline(units, texts, dm, video_duration, natural_fn=natural_fn,
                          speakers=speakers, duration_models=models,
