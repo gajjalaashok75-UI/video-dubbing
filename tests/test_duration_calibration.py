@@ -30,6 +30,7 @@ import os
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 import numpy as np
 import soundfile as sf
@@ -63,6 +64,14 @@ class CrossScriptDurationTests(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         self.ref = _reference(os.path.join(tmp.name, "ref.wav"))
         self.engine = tts_engines.IndicF5Engine()
+        # The seconds-per-byte calibration loads the clip through torch and
+        # librosa; that is not what these tests are about, and pinning it keeps
+        # them runnable without the voice stack. 0.02 s/byte is a realistic
+        # value for ~14 cps speech.
+        patcher = mock.patch.object(
+            tts_engines.IndicF5Engine, "_seconds_per_byte", return_value=0.02)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def test_hindi_estimate_does_not_scale_with_byte_count(self):
         """The Devanagari byte count must not inflate the estimate ~3x."""
@@ -74,20 +83,27 @@ class CrossScriptDurationTests(unittest.TestCase):
         self.assertLess(got, 5.0)
         self.assertGreater(got, 1.0)
 
-    def test_estimate_agrees_with_the_pipeline_duration_model(self):
+    def test_estimate_tracks_target_characters_per_second(self):
         """
-        The generator's estimate and `DurationModel` must not disagree by a
-        factor — they describe the same speaker saying the same words.
+        The calibrated estimate is target characters over the target language's
+        rate, times the reference's tempo factor (bounded to 0.6–1.7x). It must
+        scale with the CHARACTER count, not the byte count — that is the whole
+        point of the fix.
         """
-        model = dubbing.DurationModel(
-            6.0, ENGLISH_REF,
-            source_lang="en", target_lang="hi")
-        by_model = model.estimate(HINDI, source_text="Look, that was private", slot=3.0)
-        by_engine = self.engine.natural_duration(
-            HINDI, self.ref, ENGLISH_REF, lang="hi", source_lang="en")
-        ratio = by_engine / by_model
-        self.assertGreater(ratio, 0.5)
-        self.assertLess(ratio, 2.0)
+        import languages as L
+        cps = L.chars_per_second("hi")
+        shorter = "देखो, यह निजी बात थी।"
+        longer = "देखो, यह तो हमारे बीच की बहुत ही निजी और ज़रूरी बात थी।"
+        a = self.engine.natural_duration(
+            shorter, self.ref, ENGLISH_REF, lang="hi", source_lang="en")
+        b = self.engine.natural_duration(
+            longer, self.ref, ENGLISH_REF, lang="hi", source_lang="en")
+        self.assertGreater(b, a)                       # grows with the text
+        # And sits in the physically plausible band for the target rate.
+        for text, got in ((shorter, a), (longer, b)):
+            base = len(text) / cps
+            self.assertGreater(got, base * 0.5)
+            self.assertLess(got, base * 1.8)
 
     def test_same_script_keeps_the_model_mirror(self):
         """

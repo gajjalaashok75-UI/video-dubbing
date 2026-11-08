@@ -411,3 +411,15 @@
   the render silently dropped the soundtrack. Keep `REQUIRED_MODULES` in
   `engine/source_separation.py` and `DEMUCS_DEPS` in
   `deploy/notebooks/build_notebooks.py` in sync.
+- Diarization must be given AUDIO, never the uploaded video. pyannote reads
+  through libsndfile, which opens wav/flac/ogg but not an mp4/mkv container, so
+  `diarize(input_path, ...)` on the raw upload raised "Format not recognised",
+  `diarize` swallowed it (it must never fail a render) and returned [], and the
+  job silently fell back to ONE voice — a male/female clip came back entirely in
+  the first speaker's voice, and the frontend showed a single reference lane and
+  no timeline because there was only one speaker. `app.py` now passes the 16 kHz
+  mono `stt_audio` it already extracted for Whisper, and
+  `speaker_diarization._readable_audio` decodes any unreadable path to a
+  temporary wav as a last-resort repair (a failed decode passes the original
+  path through, so test/mock backends that never read the file are unaffected).
+  Pinned by `tests/test_diarization_input.py`.

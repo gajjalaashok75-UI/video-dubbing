@@ -594,9 +594,17 @@ def process_video_task(job_id: str, input_path: str, original_language: str,
                 # Diarization shares the one GPU with the voice model, so it
                 # queues behind a render like every other heavy stage, and the
                 # model is dropped again before TTS loads.
+                #
+                # Feed it `stt_audio`, the 16 kHz mono wav already extracted for
+                # Whisper — NOT `input_path`. pyannote reads through libsndfile,
+                # which cannot open an mp4 container, so passing the video raised
+                # "Format not recognised", diarization returned [], and the job
+                # silently fell back to a single voice: a male/female clip came
+                # back entirely in the female voice. `diarize` now also decodes a
+                # video as a fallback, but the correct audio is already here.
                 with _HEAVY:
                     diarization = speaker_diarization.diarize(
-                        input_path,
+                        stt_audio,
                         min_speakers=int(engines.tunable("DIAR_MIN_SPEAKERS")),
                         max_speakers=int(engines.tunable("DIAR_MAX_SPEAKERS")))
                 speaker_diarization.release()

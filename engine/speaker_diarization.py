@@ -448,6 +448,53 @@ def available(name: str = None) -> bool:
         return False
 
 
+def _readable_audio(path: str):
+    """
+    `(audio_path, cleanup)` pyannote's loader can actually read.
+
+    pyannote reads through libsndfile, which understands wav/flac/ogg but NOT
+    an mp4/mkv container. Handed the source video it raises "Format not
+    recognised", `diarize` swallows that and returns [], and the whole job
+    silently falls back to a single voice — which is exactly how a two-hander
+    gets dubbed entirely in the first speaker's voice. Callers are expected to
+    pass extracted audio, but this is the last line of defence: if the path is
+    not readable as sound, decode it to a temporary wav with ffmpeg and report
+    it for deletion afterwards.
+
+    `cleanup` is the temporary file to remove, or None when the input was
+    already usable (the common case, so nothing is copied for it).
+
+    A failed decode is NOT fatal: the original path is handed back so the
+    backend can try it (a test backend needs no real file, and a real one will
+    raise into `diarize`'s handler either way). This is a repair, not a gate.
+    """
+    try:
+        import soundfile as sf
+        sf.info(path)
+        return path, None
+    except Exception:                                        # noqa: BLE001
+        pass
+
+    import tempfile
+    fd, tmp = tempfile.mkstemp(suffix=".wav", prefix="diar_")
+    os.close(fd)
+    try:
+        # 16 kHz mono is what pyannote resamples to internally anyway, so this
+        # is not a quality compromise — it is the same signal, one decode
+        # earlier, from a container ffmpeg reads and libsndfile does not.
+        import av_sync
+        av_sync.extract_audio(path, tmp, 16000, 1)
+    except Exception:                                        # noqa: BLE001
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        return path, None
+    print(f"[DIAR] Decoded {os.path.basename(path)} to audio for diarization "
+          f"(pyannote cannot read a video container directly)")
+    return tmp, tmp
+
+
 def diarize(audio_path: str, min_speakers: int = 1, max_speakers: int = 10,
             backend: str = None) -> list:
     """
@@ -457,6 +504,8 @@ def diarize(audio_path: str, min_speakers: int = 1, max_speakers: int = 10,
     turns" and "diarization is unavailable" identically, as one implicit
     speaker. That is what keeps a failed diarization from failing a render.
     """
+    working = audio_path
+    cleanup = None
     try:
         impl = get_backend(backend)
         if not impl.available():
@@ -467,7 +516,8 @@ def diarize(audio_path: str, min_speakers: int = 1, max_speakers: int = 10,
                   "       The job will continue in single-speaker mode.\n"
                   "       Install with:  pip install 'pyannote.audio>=3.3.2'")
             return []
-        turns = impl.diarize(audio_path, min_speakers=min_speakers,
+        working, cleanup = _readable_audio(audio_path)
+        turns = impl.diarize(working, min_speakers=min_speakers,
                              max_speakers=max_speakers)
         print(f"[DIAR] {len(turns)} turns, "
               f"{len({t['speaker'] for t in turns})} speaker(s)")
@@ -480,6 +530,12 @@ def diarize(audio_path: str, min_speakers: int = 1, max_speakers: int = 10,
               f"       {e}\n"
               f"       The job will continue in single-speaker mode.")
         return []
+    finally:
+        if cleanup:
+            try:
+                os.unlink(cleanup)
+            except OSError:
+                pass
 
 
 # ---------------------------------------------------------------------------
