@@ -182,6 +182,20 @@ TOLERANCE = 0.20
 # them keeps a two-hander from being reported as a six-hander.
 MIN_TURN = 0.20
 
+# A detected speaker with less attributed speech than this is a blip rather than
+# a cast member, and is folded into their nearest neighbour. Set generously low:
+# a real speaker who says one short line still clears it, while a cough or a
+# music sting does not. The operator tunable DIAR_MIN_SPEAKER_SPEECH overrides
+# this; 0 disables the fold.
+MIN_SPEAKER_SPEECH = 1.0
+
+# ...but only if they are also a negligible SHARE of the speech. A short clip
+# where two people split the audio has two speakers, not two blips, even though
+# each falls under the 1s floor. A real speaker in a two-hander holds tens of
+# percent of the audio; a cough holds single digits. A speaker must be under the
+# absolute floor AND under this share of the total to be folded away.
+MIN_SPEAKER_SHARE = 0.15
+
 # When the top two speakers in a window are this close, the window is a real
 # overlap and picking one is a coin flip. Refusing to guess is the point: a
 # confidently wrong speaker is worse than an unresolved one, because it clones
@@ -208,7 +222,7 @@ class Diarizer:
         return False
 
     def diarize(self, audio_path: str, min_speakers: int = 1,
-                max_speakers: int = 10) -> list:
+                max_speakers: int = None) -> list:
         raise NotImplementedError
 
 
@@ -363,11 +377,19 @@ class PyannoteDiarizer(Diarizer):
         return f"Could not load {self.model}: {first}"
 
     def diarize(self, audio_path: str, min_speakers: int = 1,
-                max_speakers: int = 10) -> list:
+                max_speakers: int = None) -> list:
         pipeline = self._load()
+        # Only pass the bounds that were actually set. pyannote's own default
+        # is "find as many as you hear", so an unset ceiling is omitted rather
+        # than guessed at — a ceiling is what turns a three-hander into a
+        # two-voice dub.
+        hints = {}
+        if min_speakers is not None:
+            hints["min_speakers"] = int(min_speakers)
+        if max_speakers is not None:
+            hints["max_speakers"] = int(max_speakers)
         try:
-            output = pipeline(audio_path, min_speakers=min_speakers,
-                              max_speakers=max_speakers)
+            output = pipeline(audio_path, **hints)
         except TypeError:
             # Older builds do not take the speaker-count hints.
             output = pipeline(audio_path)
@@ -389,6 +411,22 @@ class PyannoteDiarizer(Diarizer):
 _BACKENDS = {"pyannote": PyannoteDiarizer}
 _INSTANCES: dict = {}
 _LOCK = threading.Lock()
+
+# The reason the most recent `diarize()` returned nothing, or None when it
+# succeeded. `diarize` must never raise (a dub cannot fail because the speaker
+# detector did), so this is how the caller — and the per-step log — learns WHY
+# a conversation collapsed to one voice instead of only that it did.
+_LAST_ERROR: str | None = None
+
+
+def _set_last_error(message: str | None) -> None:
+    global _LAST_ERROR
+    _LAST_ERROR = message
+
+
+def last_error() -> str | None:
+    """Why the last `diarize()` produced no turns, or None if it worked."""
+    return _LAST_ERROR
 
 
 def get_backend(name: str = None) -> Diarizer:
@@ -495,7 +533,7 @@ def _readable_audio(path: str):
     return tmp, tmp
 
 
-def diarize(audio_path: str, min_speakers: int = 1, max_speakers: int = 10,
+def diarize(audio_path: str, min_speakers: int = 1, max_speakers: int = None,
             backend: str = None) -> list:
     """
     Speaker turns for an audio file, or [] if anything at all goes wrong.
@@ -515,12 +553,14 @@ def diarize(audio_path: str, min_speakers: int = 1, max_speakers: int = 10,
                   "       pyannote.audio is not installed.\n"
                   "       The job will continue in single-speaker mode.\n"
                   "       Install with:  pip install 'pyannote.audio>=3.3.2'")
+            _set_last_error("pyannote.audio is not installed")
             return []
         working, cleanup = _readable_audio(audio_path)
         turns = impl.diarize(working, min_speakers=min_speakers,
                              max_speakers=max_speakers)
         print(f"[DIAR] {len(turns)} turns, "
               f"{len({t['speaker'] for t in turns})} speaker(s)")
+        _set_last_error(None)
         return turns
     except Exception as e:                                   # noqa: BLE001
         # The message from `_load` already says which of the four cases it is
@@ -529,6 +569,7 @@ def diarize(audio_path: str, min_speakers: int = 1, max_speakers: int = 10,
         print(f"[DIAR] Speaker diarization unavailable:\n"
               f"       {e}\n"
               f"       The job will continue in single-speaker mode.")
+        _set_last_error(str(e))
         return []
     finally:
         if cleanup:
@@ -844,6 +885,122 @@ def speaker_spans(segments: list) -> dict:
     for entry in out.values():
         entry["total_speech"] = round(entry["total_speech"], 3)
     return out
+
+
+def merge_spurious_speakers(segments: list, turns: list,
+                            min_speech: float = MIN_SPEAKER_SPEECH,
+                            keep_min: int = 1):
+    """
+    Fold speakers with almost no speech into their nearest real neighbour.
+
+    A diarizer does not only miss speakers — it invents them. A cough, a door, a
+    burst of music, or a breath between two lines comes back as its own label,
+    and a monologue with one such blip is suddenly a "two-speaker" video: the
+    multi-speaker path runs, the studio shows a phantom voice, and a handful of
+    words are spoken in a voice that is not the speaker's. The blip itself is
+    harmless (it is never cloned — `build_references` finds no usable window and
+    marks it unresolved rather than borrowing another actor), but the
+    classification flip and the phantom entry are not.
+
+    Every label whose attributed speech is under `min_speech` seconds is a blip.
+    Its segments and turns are reassigned to the temporally nearest KEPT
+    speaker, so a stray syllable lands in the voice that was actually talking.
+    `keep_min` is a floor on how many speakers survive — a genuinely quiet
+    speaker is not deleted to satisfy the rule — so a clip where EVERY label is
+    a blip keeps its dominant one rather than collapsing to nothing.
+
+    Returns `(segments, turns, merged)` where `merged` maps each dropped label
+    to the label that absorbed it, for the log.
+
+    `min_speech <= 0` disables the fold entirely.
+    """
+    segments = list(segments or [])
+    turns = list(turns or [])
+    if min_speech <= 0 or not turns:
+        return segments, turns, {}
+
+    spans = speaker_spans(segments)
+    if len(spans) <= max(1, int(keep_min)):
+        return segments, turns, {}
+
+    # A blip is small in absolute terms AND a negligible share of the speech.
+    # The share test protects a short clip: on a 5s two-hander each speaker
+    # holds ~50% of the audio, so neither is a blip even though both are under
+    # the 1s floor, while a 0.3s cough in a 20s clip is both.
+    total_speech = sum(e["total_speech"] for e in spans.values())
+
+    def _is_blip(entry: dict) -> bool:
+        seconds = entry["total_speech"]
+        if seconds >= min_speech:
+            return False
+        share = (seconds / total_speech) if total_speech > 0 else 0.0
+        return share < MIN_SPEAKER_SHARE
+
+    # Order labels by speech, richest first, so the ones we KEEP are the real
+    # speakers and the floor protects the richest when everything is a blip.
+    ranked = sorted(spans.items(), key=lambda kv: kv[1]["total_speech"],
+                    reverse=True)
+    keep = max(1, int(keep_min))
+    kept = [label for label, _ in ranked[:keep]]
+    for label, entry in ranked[keep:]:
+        if not _is_blip(entry):
+            kept.append(label)
+    kept_set = set(kept)
+
+    dropped = [label for label, _ in ranked if label not in kept_set]
+    if not dropped:
+        return segments, turns, {}
+
+    # Where each kept speaker sits in time, for nearest-neighbour resolution.
+    centres: dict = {}
+    for seg in segments:
+        label = SPK.label_of(seg)
+        if label in kept_set:
+            try:
+                mid = (float(seg.get("start", 0.0)) + float(seg.get("end", 0.0))) / 2.0
+            except (TypeError, ValueError):
+                continue
+            centres.setdefault(label, []).append(mid)
+
+    def _nearest(when: float) -> str | None:
+        best, best_gap = None, None
+        for label, mids in centres.items():
+            gap = min(abs(when - m) for m in mids)
+            if best_gap is None or gap < best_gap:
+                best, best_gap = label, gap
+        return best or (kept[0] if kept else None)
+
+    merged: dict = {}
+    for label in dropped:
+        segs = spans.get(label, {}).get("segments") or []
+        if not segs:
+            continue
+        mids = [(float(s.get("start", 0.0)) + float(s.get("end", 0.0))) / 2.0
+                for s in segs]
+        target = _nearest(sum(mids) / len(mids))
+        if target:
+            merged[label] = target
+
+    if not merged:
+        return segments, turns, {}
+
+    out_segments = []
+    for seg in segments:
+        label = SPK.label_of(seg)
+        if label in merged:
+            out_segments.append({**seg, "speaker": merged[label]})
+        else:
+            out_segments.append(seg)
+
+    out_turns = []
+    for turn in turns:
+        label = str(turn.get("speaker"))
+        if label in merged:
+            out_turns.append({**turn, "speaker": merged[label]})
+        else:
+            out_turns.append(turn)
+
+    return out_segments, out_turns, merged
 
 
 def summarize(segments: list, turns: list) -> str:

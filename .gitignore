@@ -99,3 +99,11 @@ Thumbs.db
 .vscode/
 .idea/
 .ipynb_checkpoints/
+
+# =========================
+# Vendored, fetched at setup
+# =========================
+# IndicF5's own f5_tts fork is pulled by `python scripts/vendor_f5_tts.py` into
+# engine/vendor/f5_tts (wav2lip is committed; this one is not). Leaving it
+# untracked keeps a 2 MB third-party tree out of the repository.
+engine/vendor/f5_tts/

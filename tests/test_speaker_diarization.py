@@ -317,5 +317,121 @@ class SummarizeTests(unittest.TestCase):
         self.assertIn("1 segment(s) unresolved", text)
 
 
+class MergeSpuriousSpeakersTests(unittest.TestCase):
+    """
+    A diarizer invents speakers as readily as it misses them.
+
+    A cough, a door, or a music sting comes back as its own label; a monologue
+    with one such blip becomes a "two-speaker" video and a phantom voice appears
+    in the studio. `merge_spurious_speakers` folds those blips into the nearest
+    real speaker so the count is a cast list, not a list of noises.
+    """
+
+    @staticmethod
+    def _seg(start, end, speaker, text="x"):
+        return {"start": start, "end": end, "text": text, "speaker": speaker,
+                "words": []}
+
+    def test_a_blip_is_folded_into_its_nearest_neighbour(self):
+        segments = [self._seg(0.0, 4.0, "SPEAKER_00"),
+                    self._seg(4.0, 4.3, "SPEAKER_01"),   # 0.3s cough
+                    self._seg(5.0, 9.0, "SPEAKER_00")]
+        turns = [{"start": 0.0, "end": 4.0, "speaker": "SPEAKER_00"},
+                 {"start": 4.0, "end": 4.3, "speaker": "SPEAKER_01"},
+                 {"start": 5.0, "end": 9.0, "speaker": "SPEAKER_00"}]
+        segs, tns, merged = SD.merge_spurious_speakers(segments, turns,
+                                                       min_speech=1.0)
+        self.assertEqual(merged, {"SPEAKER_01": "SPEAKER_00"})
+        self.assertEqual([s["speaker"] for s in segs],
+                         ["SPEAKER_00", "SPEAKER_00", "SPEAKER_00"])
+        self.assertEqual({t["speaker"] for t in tns}, {"SPEAKER_00"})
+
+    def test_a_blip_between_two_real_speakers_picks_the_nearer(self):
+        segments = [self._seg(0.0, 6.0, "SPEAKER_00"),
+                    self._seg(10.0, 16.0, "SPEAKER_01"),
+                    self._seg(15.6, 15.9, "SPEAKER_02")]  # blip next to 01
+        turns = [{"start": 0.0, "end": 6.0, "speaker": "SPEAKER_00"},
+                 {"start": 10.0, "end": 16.0, "speaker": "SPEAKER_01"},
+                 {"start": 15.6, "end": 15.9, "speaker": "SPEAKER_02"}]
+        segs, tns, merged = SD.merge_spurious_speakers(segments, turns,
+                                                       min_speech=1.0)
+        self.assertEqual(merged, {"SPEAKER_02": "SPEAKER_01"})
+
+    def test_two_real_speakers_are_untouched(self):
+        segments = [self._seg(0.0, 6.0, "SPEAKER_00"),
+                    self._seg(7.0, 13.0, "SPEAKER_01")]
+        turns = [{"start": 0.0, "end": 6.0, "speaker": "SPEAKER_00"},
+                 {"start": 7.0, "end": 13.0, "speaker": "SPEAKER_01"}]
+        segs, tns, merged = SD.merge_spurious_speakers(segments, turns,
+                                                       min_speech=1.0)
+        self.assertEqual(merged, {})
+        self.assertEqual(segs, segments)
+        self.assertEqual(tns, turns)
+
+    def test_a_single_speaker_is_never_touched(self):
+        segments = [self._seg(0.0, 3.0, "SPEAKER_00")]
+        turns = [{"start": 0.0, "end": 3.0, "speaker": "SPEAKER_00"}]
+        segs, tns, merged = SD.merge_spurious_speakers(segments, turns)
+        self.assertEqual(merged, {})
+        self.assertEqual(segs, segments)
+
+    def test_all_blips_keep_the_dominant_speaker(self):
+        # A noisy clip where EVERY label is both tiny and a negligible share
+        # (a room full of coughs) must not collapse to nothing: keep_min keeps
+        # the richest so the render still has a voice.
+        segments, turns = [], []
+        for i in range(30):
+            label = f"SPEAKER_{i:02d}"
+            segments.append(self._seg(i * 0.1, i * 0.1 + 0.03, label))
+            turns.append({"start": i * 0.1, "end": i * 0.1 + 0.03,
+                          "speaker": label})
+        segs, tns, merged = SD.merge_spurious_speakers(segments, turns,
+                                                       min_speech=1.0)
+        self.assertEqual(len(merged), 29)
+        self.assertEqual({s["speaker"] for s in segs}, {"SPEAKER_00"})
+
+    def test_a_short_two_hander_keeps_both_speakers(self):
+        # A 3s clip where each person holds ~half the audio is two speakers,
+        # not two blips, even though each is under the 1s absolute floor. The
+        # share guard is what stops a short clip being flattened to one voice.
+        segments = [self._seg(0.0, 1.2, "SPEAKER_00"),
+                    self._seg(1.3, 2.2, "SPEAKER_01")]
+        turns = [{"start": 0.0, "end": 1.2, "speaker": "SPEAKER_00"},
+                 {"start": 1.3, "end": 2.2, "speaker": "SPEAKER_01"}]
+        segs, tns, merged = SD.merge_spurious_speakers(segments, turns,
+                                                       min_speech=1.0)
+        self.assertEqual(merged, {})
+        self.assertEqual({s["speaker"] for s in segs},
+                         {"SPEAKER_00", "SPEAKER_01"})
+
+    def test_keep_min_protects_a_quiet_speaker(self):
+        # A genuinely quiet second speaker is kept when the caller asks for two.
+        segments = [self._seg(0.0, 10.0, "SPEAKER_00"),
+                    self._seg(10.0, 10.5, "SPEAKER_01")]
+        turns = [{"start": 0.0, "end": 10.0, "speaker": "SPEAKER_00"},
+                 {"start": 10.0, "end": 10.5, "speaker": "SPEAKER_01"}]
+        segs, tns, merged = SD.merge_spurious_speakers(segments, turns,
+                                                       min_speech=1.0, keep_min=2)
+        self.assertEqual(merged, {})
+        self.assertEqual({s["speaker"] for s in segs},
+                         {"SPEAKER_00", "SPEAKER_01"})
+
+    def test_a_floor_of_zero_disables_the_fold(self):
+        segments = [self._seg(0.0, 4.0, "SPEAKER_00"),
+                    self._seg(4.0, 4.3, "SPEAKER_01")]
+        turns = [{"start": 0.0, "end": 4.0, "speaker": "SPEAKER_00"},
+                 {"start": 4.0, "end": 4.3, "speaker": "SPEAKER_01"}]
+        segs, tns, merged = SD.merge_spurious_speakers(segments, turns,
+                                                       min_speech=0.0)
+        self.assertEqual(merged, {})
+        self.assertEqual(segs, segments)
+
+    def test_no_turns_is_a_no_op(self):
+        segments = [self._seg(0.0, 4.0, "SPEAKER_00")]
+        segs, tns, merged = SD.merge_spurious_speakers(segments, [])
+        self.assertEqual(merged, {})
+        self.assertEqual(segs, segments)
+
+
 if __name__ == "__main__":
     unittest.main()

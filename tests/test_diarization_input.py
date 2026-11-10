@@ -169,5 +169,95 @@ class DiarizeOrchestrationTests(unittest.TestCase):
             self.assertEqual(turns, [])          # graceful single-speaker
 
 
+class DiarizationFailureIsReportedTests(unittest.TestCase):
+    """
+    A collapse to one voice must be explainable after the fact.
+
+    `diarize` never raises, so the only way a caller (or the per-step log) can
+    learn WHY a conversation came back single-speaker is `last_error()`. The
+    reason has to survive the return and clear on the next success.
+    """
+
+    def setUp(self):
+        SD._set_last_error(None)
+
+    def test_a_missing_backend_records_a_reason(self):
+        class _Absent(_RecordingDiarizer):
+            def available(self):
+                return False
+
+        with mock.patch.object(SD, "get_backend", return_value=_Absent()):
+            turns = SD.diarize("/tmp/whatever.wav")
+        self.assertEqual(turns, [])
+        self.assertIn("not installed", SD.last_error())
+
+    def test_a_backend_exception_records_its_message(self):
+        class _Broken(_RecordingDiarizer):
+            def diarize(self, audio_path, min_speakers=1, max_speakers=None):
+                raise RuntimeError("Gated repo: accept the licence")
+
+        with mock.patch.object(SD, "get_backend", return_value=_Broken()):
+            turns = SD.diarize("/tmp/whatever.wav")
+        self.assertEqual(turns, [])
+        self.assertIn("Gated repo", SD.last_error())
+
+    def test_a_success_clears_the_previous_reason(self):
+        SD._set_last_error("stale failure")
+        with mock.patch.object(SD, "get_backend",
+                               return_value=_RecordingDiarizer()), \
+             mock.patch.object(SD, "_readable_audio",
+                               return_value=("/tmp/a.wav", None)):
+            turns = SD.diarize("/tmp/a.wav")
+        self.assertEqual(len(turns), 2)
+        self.assertIsNone(SD.last_error())
+
+
+class SpeakerCeilingIsOptionalTests(unittest.TestCase):
+    """
+    No ceiling by default: the diarizer finds as many speakers as it hears.
+
+    A wrong `max_speakers` merges extra actors into the kept ones, which is a
+    silent wrong number of voices. The default must therefore be "unset", and
+    an unset ceiling must not be sent to pyannote as `max_speakers=None`.
+    """
+
+    def _pipeline(self, record):
+        class _Annotation:
+            def itertracks(self, yield_label=True):
+                return iter(())
+
+        class _Pipeline:
+            def __call__(self, path, **kwargs):
+                record.update(kwargs)
+                return _Annotation()
+
+        return _Pipeline()
+
+    def test_an_unset_ceiling_is_not_passed(self):
+        import speaker_diarization as sd
+        record = {}
+        d = sd.PyannoteDiarizer()
+        with mock.patch.object(d, "_load",
+                               return_value=self._pipeline(record)):
+            d.diarize("/tmp/a.wav", min_speakers=1, max_speakers=None)
+        self.assertEqual(record, {"min_speakers": 1})
+
+    def test_a_set_ceiling_is_passed(self):
+        import speaker_diarization as sd
+        record = {}
+        d = sd.PyannoteDiarizer()
+        with mock.patch.object(d, "_load",
+                               return_value=self._pipeline(record)):
+            d.diarize("/tmp/a.wav", min_speakers=2, max_speakers=4)
+        self.assertEqual(record, {"min_speakers": 2, "max_speakers": 4})
+
+    def test_the_tunable_default_is_no_ceiling(self):
+        import engines
+        self.assertIsNone(engines.TUNABLES["DIAR_MAX_SPEAKERS"][0])
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("DIAR_MAX_SPEAKERS", None)
+            self.assertIsNone(engines.tunable("DIAR_MAX_SPEAKERS"))
+
+
 if __name__ == "__main__":
     unittest.main()

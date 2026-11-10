@@ -1339,6 +1339,69 @@ else:
         print("\\nStopped following. The server is still running.")
 """)
 
+STAGES_MD = md("""
+## 7b. Per-step results (debug)
+
+Every stage of every render writes what it produced to
+`<runtime root>/logs/stages/<job_id>.jsonl`, and a readable version beside it.
+Run this cell after a render to see, stage by stage, what happened:
+
+* **diarize** - how many speakers were found, and how much each one spoke
+* **separate_audio** - whether the background was preserved, and why not if not
+* **select_reference** - which speaker each voice reference came from
+* **translate** - each line, source and target, with its speaker
+* **synthesize** - which voice spoke which phrase, and the timing plan
+* **verify** / **source_vs_final** - sync check, voice match, and how the
+  delivered audio compares to the original (length, loudness, background)
+
+This is the cell to run when a dub comes out wrong: it says which stage
+produced the wrong thing, rather than leaving you to guess.
+""")
+
+STAGES = code('''
+import json
+import os
+
+log_dir = runtime.server_log_path().parent / "stages"
+print("Stage logs:", log_dir)
+if not log_dir.is_dir():
+    print("  none yet - run a render first.")
+else:
+    runs = sorted(log_dir.glob("*.jsonl"), key=os.path.getmtime, reverse=True)
+    if not runs:
+        print("  none yet - run a render first.")
+    for path in runs[:3]:
+        records = []
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = line.strip()
+            if line:
+                try:
+                    records.append(json.loads(line))
+                except ValueError:
+                    pass
+        print()
+        print("=" * 68)
+        print(f"JOB {path.stem}  ({len(records)} stage records)")
+        print("=" * 68)
+        for rec in records:
+            name = rec.get("stage", "?")
+            if "event" in rec:
+                print(f"  {name:16} :: {rec['event']}")
+                continue
+            bits = []
+            for key in ("speaker_count", "speakers", "turn_count",
+                        "segment_count", "word_count", "multi_speaker",
+                        "separated", "background_preserved", "sync_ok",
+                        "duration_drift_s", "source_duration_s",
+                        "final_duration_s", "phrases", "voices",
+                        "empty_translations", "detected_language", "ran",
+                        "reason", "error"):
+                if key in rec and rec[key] not in (None, [], {}):
+                    bits.append(f"{key}={rec[key]}")
+            print(f"  {name:16} " + ("  ".join(bits) if bits else "(recorded)"))
+        print("  full JSON:", path)
+''')
+
 USE_MD = md("""
 ## Use it
 
@@ -1502,7 +1565,7 @@ TROUBLE = md("""
 SHARED = [TITLE, GET_CODE_MD, GET_CODE, CHECK_MD, CHECK, RUNTIME_MD, RUNTIME,
           TOKEN_MD, TOKEN, INSTALL_MD, INSTALL, MODELS_MD, MODELS,
           VERIFY_MD, VERIFY,
-          SERVER_MD, SERVER, LOG_MD, LOG, USE_MD]
+          SERVER_MD, SERVER, LOG_MD, LOG, STAGES_MD, STAGES, USE_MD]
 
 COLAB = SHARED + [STOP_MD, STOP, TROUBLE]
 KAGGLE = SHARED + [TUNNEL_MD, TUNNEL, STOP_MD, STOP, TROUBLE]

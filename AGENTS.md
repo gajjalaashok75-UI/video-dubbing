@@ -109,6 +109,17 @@
   token, a crash, zero turns - so a render never fails because the speaker
   detector did. `release()` drops the model before IndicF5 loads; they share one
   GPU and the diarizer is idle once the turns are known.
+- `speaker_diarization.merge_spurious_speakers(segments, turns, min_speech,
+  keep_min)` folds a label with almost no speech into its temporally nearest
+  real speaker. A diarizer INVENTS speakers as readily as it misses them: a
+  cough, a door, a music sting becomes a label, and a monologue with one such
+  blip becomes a "two-speaker" video with a phantom voice in the studio. A label
+  is a blip only when it is under BOTH the absolute floor (1s,
+  `DIAR_MIN_SPEAKER_SPEECH`) and `MIN_SPEAKER_SHARE` (5%) of the speech, so a
+  short 50/50 two-hander keeps both speakers. `keep_min` (wired from
+  `DIAR_MIN_SPEAKERS`) is a floor on survivors, so a clip where everything is a
+  blip keeps its richest rather than collapsing to nothing. Wired in `app.py`
+  right after `assign_segments`, before the count is treated as a cast list.
 - `reference_audio.build_references()` cuts one reference per speaker. The
   fallback ladder is 6-12s same-speaker -> stitched short windows -> 2-6s with a
   warning -> generic voice -> unresolved. It must NEVER use another detected
@@ -423,3 +434,20 @@
   temporary wav as a last-resort repair (a failed decode passes the original
   path through, so test/mock backends that never read the file are unaffected).
   Pinned by `tests/test_diarization_input.py`.
+- The diarizer's speaker CEILING must default to unset, not 10. pyannote
+  treats `max_speakers=N` as "merge anything beyond N into the N it keeps", so a
+  wrong ceiling is a silently wrong number of voices; leaving it unset lets the
+  pipeline find as many speakers as it hears. `DIAR_MAX_SPEAKERS` is now `None`
+  by default and `PyannoteDiarizer.diarize` omits any bound that was not set
+  rather than sending `max_speakers=None` through. Set the tunable only to stop
+  background chatter becoming characters.
+- Every stage's result must be written to the runtime logs, one JSON record per
+  stage, so a wrong dub is diagnosable after the fact instead of only audible.
+  `engine/stage_log.py` writes `<runtime logs>/stages/<job_id>.jsonl` (plus a
+  human-readable `.log`) and is wired into `app.py` for run_start, probe,
+  extract_audio, transcribe, diarize, separate_audio, select_reference,
+  translate, synthesize, verify, source_vs_final, failed and cancelled. `verify`
+  plus `source_vs_final` are what answer "is this still my film?": they record
+  the sync check, the voice match, and the delivered vs original duration,
+  loudness and background. Read them in the notebook's "7b. Per-step results"
+  cell or at `GET /jobs/{job_id}/stages`. Never let a log write fail a render.

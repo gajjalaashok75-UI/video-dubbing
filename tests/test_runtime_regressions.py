@@ -136,8 +136,10 @@ class DemucsProbeTests(unittest.TestCase):
 
     def test_a_missing_dependency_makes_it_unavailable(self):
         import source_separation
-        present = {"demucs.separate", "julius", "openunmix", "dora",
-                   "omegaconf", "tqdm"}
+        # Derive the "present" set from REQUIRED_MODULES so adding a module
+        # Demucs imports (sphn, einops, yaml were all added this way) does not
+        # leave this test asserting against a list that is no longer the truth.
+        present = set(source_separation.REQUIRED_MODULES) - {"lameenc"}
         with mock.patch("importlib.util.find_spec",
                         side_effect=lambda name, *a, **k:
                         object() if name in present else None):

@@ -56,6 +56,7 @@ import run_summary
 import source_separation
 import speaker_diarization
 import speakers as SPK
+import stage_log
 import tts_engines
 # Imported as modules as well as functions: applying a model change without a
 # restart means calling refresh() on the module that owns each stage.
@@ -314,6 +315,89 @@ def _voice_match(ref_path: str, dub_path: str, source_path: str):
         return None
 
 
+def _measure_audio(path: str) -> dict:
+    """
+    Cheap, model-free facts about a track: duration and loudness.
+
+    Uses ffmpeg's `ebur128` and `volumedetect` filters, so it needs nothing
+    beyond the ffmpeg the pipeline already requires, and it never loads a
+    model. Returns {} when ffmpeg cannot read the file, which keeps it safe to
+    call on the request path.
+    """
+    if not path or not os.path.exists(path):
+        return {}
+    try:
+        loud = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-nostats", "-i", path,
+             "-af", "ebur128=peak=true", "-f", "null", "-"],
+            capture_output=True, text=True, timeout=300)
+        text = (loud.stderr or "") + (loud.stdout or "")
+        integrated = None
+        for line in text.splitlines():
+            if "I:" in line and "LUFS" in line:
+                try:
+                    integrated = float(line.split("I:")[1].split("LUFS")[0].strip())
+                except (ValueError, IndexError):
+                    pass
+        peak = None
+        for line in text.splitlines():
+            if "Peak:" in line and "dBFS" in line:
+                try:
+                    peak = float(line.split("Peak:")[1].split("dBFS")[0].strip())
+                except (ValueError, IndexError):
+                    pass
+        probe = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries",
+             "format=duration", "-of", "default=nw=1:nk=1", path],
+            capture_output=True, text=True, timeout=60)
+        duration = None
+        try:
+            duration = round(float((probe.stdout or "").strip()), 3)
+        except (ValueError, AttributeError):
+            pass
+        return {"duration_s": duration,
+                "integrated_lufs": (round(integrated, 2)
+                                    if integrated is not None else None),
+                "true_peak_dbfs": round(peak, 2) if peak is not None else None}
+    except Exception as e:                                   # noqa: BLE001
+        return {"error": str(e)[:200]}
+
+
+def _stage_source_vs_final(job_id: str, input_path: str, output_video_path: str,
+                           dub_path: str, stems: dict, video_dur: float):
+    """
+    Record what the source sounded like against what was delivered.
+
+    The question a user asks about a finished dub — "is this still my film?" —
+    has a measurable answer: how long each track is, how loud it is, and
+    whether the original background survived. Written to the run's log so the
+    before/after is on file rather than only audible.
+    """
+    try:
+        source = _measure_audio(input_path)
+        final = _measure_audio(output_video_path)
+        dialogue = _measure_audio(dub_path)
+        background = _measure_audio((stems or {}).get("background"))
+        drift = None
+        if source.get("duration_s") and final.get("duration_s"):
+            drift = round(final["duration_s"] - source["duration_s"], 3)
+        stage_log.stage(
+            job_id, "source_vs_final",
+            source_duration_s=source.get("duration_s"),
+            final_duration_s=final.get("duration_s"),
+            duration_drift_s=drift,
+            source_loudness_lufs=source.get("integrated_lufs"),
+            final_loudness_lufs=final.get("integrated_lufs"),
+            final_true_peak_dbfs=final.get("true_peak_dbfs"),
+            dialogue_loudness_lufs=dialogue.get("integrated_lufs"),
+            background_loudness_lufs=background.get("integrated_lufs"),
+            background_preserved=bool(background.get("duration_s")),
+            video_duration_s=round(video_dur, 3))
+    except Exception as e:                                   # noqa: BLE001
+        stage_log.event(job_id, "source_vs_final",
+                        "measurement failed", error=str(e)[:200])
+
+
 # What the splash screen reports while the window is still closed. These are
 # the real model loads, in the order they happen, not a progress animation.
 BOOT = {"stage": "Starting", "index": 0, "total": 4, "ready": False, "notes": []}
@@ -486,6 +570,15 @@ def process_video_task(job_id: str, input_path: str, original_language: str,
 
     try:
         _set(job_id, status="processing", step="validating")
+        stage_log.stage(
+            job_id, "run_start",
+            filename=filename, kind=kind,
+            original_language=original_language, target_language=target_language,
+            preserve_background=preserve_background,
+            trim=(None if trim_start is None and trim_end is None
+                  else [trim_start, trim_end]),
+            music=bool(music_path),
+            diarization_enabled=_diarization_enabled())
 
         if not os.path.exists(input_path) or os.path.getsize(input_path) < 1000:
             raise ValueError("Uploaded file is missing or too small")
@@ -524,11 +617,26 @@ def process_video_task(job_id: str, input_path: str, original_language: str,
         print(f"[APP] {filename}: {video_dur:.2f}s, "
               f"{info['video']['width']}x{info['video']['height']} @ "
               f"{info['video']['fps']:.3f}fps -> {L.display_name(target_language)}")
+        stage_log.stage(job_id, "probe",
+                        filename=filename, duration_s=round(video_dur, 3),
+                        width=info["video"]["width"],
+                        height=info["video"]["height"],
+                        fps=round(info["video"]["fps"], 3),
+                        target_language=target_language, kind=kind)
 
         # ── 1. Audio for STT (16 kHz mono is what Whisper wants) ──
         _set(job_id, step="extracting_audio")
         stt_audio = av_sync.extract_audio(
             input_path, os.path.join(workdir, f"{stem}_stt.wav"), 16000, 1)
+        # One extract serves both consumers: it is a clean ffmpeg decode of the
+        # source, NOT Whisper's own filtered output, so pyannote gets the
+        # un-smeared signal it keys on. What it must never get is the mp4
+        # container itself — libsndfile cannot open one, and diarization then
+        # fails silently and collapses the dub to a single voice.
+        diar_audio = stt_audio
+        stage_log.stage(job_id, "extract_audio",
+                        stt_audio=os.path.basename(stt_audio),
+                        diar_audio=os.path.basename(diar_audio))
 
         # ── 2. Transcribe with word timestamps ──
         # Or take a sibling's, if this project already transcribed this clip.
@@ -542,6 +650,9 @@ def process_video_task(job_id: str, input_path: str, original_language: str,
                  reused_from=sibling.get("job_id") or "sibling")
             print(f"[APP] Job {job_id} reused the transcript from a sibling "
                   f"({len(segments)} segments), skipping transcription")
+            stage_log.stage(job_id, "transcribe", reused=True,
+                            segments=len(segments),
+                            reused_from=sibling.get("job_id") or "sibling")
         else:
             sibling = None
             _set(job_id, step="transcribing")
@@ -554,6 +665,20 @@ def process_video_task(job_id: str, input_path: str, original_language: str,
             # speed-up coming back unexplained next time.
             if speech_to_text_v2.fallback_reason():
                 _set(job_id, stt_fallback=speech_to_text_v2.fallback_reason())
+            stage_log.stage(
+                job_id, "transcribe", reused=False,
+                detected_language=result.get("language"),
+                segment_count=len(segments),
+                word_count=sum(len(sg.get("words") or []) for sg in segments),
+                duration_s=round(sum(float(sg.get("end", 0)) -
+                                     float(sg.get("start", 0))
+                                     for sg in segments), 3),
+                fallback=speech_to_text_v2.fallback_reason(),
+                text=original_text[:2000],
+                segments=[{"start": round(float(sg.get("start", 0)), 3),
+                           "end": round(float(sg.get("end", 0)), 3),
+                           "text": (sg.get("text") or "").strip()}
+                          for sg in segments])
 
         if not segments:
             raise RuntimeError(
@@ -575,15 +700,23 @@ def process_video_task(job_id: str, input_path: str, original_language: str,
               f"(detected {detected}, requested {original_language})")
 
         # ── 2b. Who is speaking ──
-        # Runs on the ORIGINAL audio, not the 16 kHz mono ASR track: resampling
-        # and the ASR pipeline's own filtering both smear the cues pyannote
-        # keys on, and both `video-dubbing-system` and `Ai-Vedio-Dubbing` found
-        # the full-band signal gives better turns. Best effort throughout — no
-        # pyannote, no token, a crash, or zero turns all mean one implicit
-        # speaker, which is exactly the pipeline this project shipped before
-        # diarization existed.
+        # Best effort throughout — no pyannote, no token, a crash, or zero
+        # turns all mean one implicit speaker, which is exactly the pipeline
+        # this project shipped before diarization existed. What it must NEVER
+        # be given is the mp4 container: libsndfile cannot open one, the error
+        # is swallowed, and a conversation silently collapses to one voice.
+        # `diar_audio` is the extracted wav, so that cannot happen.
         diarization, diar_source = [], None
-        if kind in ("dub", "audio") and _diarization_enabled():
+        if kind not in ("dub", "audio"):
+            stage_log.stage(job_id, "diarize", ran=False,
+                            reason=f"not needed for kind={kind}")
+        elif not _diarization_enabled():
+            stage_log.stage(
+                job_id, "diarize", ran=False,
+                reason="disabled by VIDEOTRANS_DIARIZE, or pyannote is not "
+                       "installed",
+                pyannote_available=speaker_diarization.available())
+        else:
             if sibling and sibling.get("diarization"):
                 diarization = list(sibling["diarization"])
                 diar_source = "sibling"
@@ -595,24 +728,63 @@ def process_video_task(job_id: str, input_path: str, original_language: str,
                 # queues behind a render like every other heavy stage, and the
                 # model is dropped again before TTS loads.
                 #
-                # Feed it `stt_audio`, the 16 kHz mono wav already extracted for
-                # Whisper — NOT `input_path`. pyannote reads through libsndfile,
-                # which cannot open an mp4 container, so passing the video raised
-                # "Format not recognised", diarization returned [], and the job
-                # silently fell back to a single voice: a male/female clip came
-                # back entirely in the female voice. `diarize` now also decodes a
-                # video as a fallback, but the correct audio is already here.
+                # `diar_audio` is the extracted 16 kHz wav, NOT `input_path`.
+                # pyannote reads through libsndfile, which cannot open an mp4
+                # container, so passing the video raised "Format not
+                # recognised", diarization returned [], and a male/female clip
+                # came back entirely in one voice. The speaker-count bounds are
+                # the operator's tunables; the ceiling is UNSET by default, so
+                # nothing caps how many actors are found.
                 with _HEAVY:
                     diarization = speaker_diarization.diarize(
-                        stt_audio,
+                        diar_audio,
                         min_speakers=int(engines.tunable("DIAR_MIN_SPEAKERS")),
-                        max_speakers=int(engines.tunable("DIAR_MAX_SPEAKERS")))
+                        max_speakers=_diar_max_speakers())
                 speaker_diarization.release()
                 diar_source = "detected" if diarization else None
+            merged_labels: dict = {}
             if diarization:
                 segments = speaker_diarization.assign_segments(segments,
                                                                diarization)
+                # A diarizer invents speakers as readily as it misses them: a
+                # cough or a music sting becomes a label, a monologue turns into
+                # a "two-speaker" video, and a phantom voice appears in the
+                # studio. Fold those blips into the nearest real speaker before
+                # anything downstream treats the count as a cast list.
+                segments, diarization, merged_labels = (
+                    speaker_diarization.merge_spurious_speakers(
+                        segments, diarization,
+                        min_speech=float(engines.tunable(
+                            "DIAR_MIN_SPEAKER_SPEECH") or 0.0),
+                        keep_min=int(engines.tunable("DIAR_MIN_SPEAKERS"))))
+                if merged_labels:
+                    print(f"[DIAR] Folded {len(merged_labels)} blip speaker(s) "
+                          f"into their nearest neighbour: {merged_labels}")
                 print(speaker_diarization.summarize(segments, diarization))
+
+            labels = sorted({str(t["speaker"]) for t in diarization})
+            speech_by_speaker = {}
+            for label in labels:
+                speech_by_speaker[label] = round(sum(
+                    t["end"] - t["start"] for t in diarization
+                    if str(t["speaker"]) == label), 2)
+            assigned = {}
+            for sg in segments:
+                label = SPK.label_of(sg)
+                if label:
+                    assigned[label] = assigned.get(label, 0) + 1
+            stage_log.stage(
+                job_id, "diarize", ran=True, source=diar_source,
+                audio=os.path.basename(diar_audio),
+                turn_count=len(diarization), speaker_count=len(labels),
+                speakers=labels, speech_seconds=speech_by_speaker,
+                segments_per_speaker=assigned,
+                merged_speakers=merged_labels,
+                unavailable_reason=(speaker_diarization.last_error()
+                                    if not diarization else None),
+                turns=[{"start": round(float(t["start"]), 3),
+                        "end": round(float(t["end"]), 3),
+                        "speaker": str(t["speaker"])} for t in diarization])
 
         seg_rows = [{"start": float(sg.get("start", 0.0)),
                      "end": float(sg.get("end", 0.0)),
@@ -651,7 +823,8 @@ def process_video_task(job_id: str, input_path: str, original_language: str,
         # extractions coexist because ASR still falls back to the 16 kHz one.
         stems = None
         speech_source = input_path
-        if kind in ("dub", "audio") and _preserve_background(preserve_background):
+        sep_requested = kind in ("dub", "audio") and _preserve_background(preserve_background)
+        if sep_requested:
             reuse = (sibling.get("stems") if sibling else None) or {}
             if reuse.get("vocals") and os.path.exists(reuse["vocals"]):
                 stems = dict(reuse)
@@ -667,6 +840,26 @@ def process_video_task(job_id: str, input_path: str, original_language: str,
                 if stems:
                     speech_source = stems["vocals"]
                 print(source_separation.summarize(stems))
+            stage_log.stage(
+                job_id, "separate_audio", ran=True, available=True,
+                model=getattr(source_separation, "MODEL", None),
+                separated=bool(stems),
+                reused=bool(stems and sibling and
+                            (sibling.get("stems") or {}).get("vocals") ==
+                            (stems or {}).get("vocals")),
+                vocals=os.path.basename(stems["vocals"]) if stems else None,
+                background=os.path.basename(stems["background"]) if stems else None,
+                note=(source_separation.summarize(stems) if stems else
+                      "no stems; the dub replaces the original soundtrack"))
+        elif kind in ("dub", "audio"):
+            missing = source_separation.missing_deps()
+            stage_log.stage(
+                job_id, "separate_audio", ran=False,
+                available=source_separation.available(),
+                missing_deps=missing,
+                reason=("background preservation is off for this render"
+                        if not missing else
+                        "Demucs cannot run here; missing " + ", ".join(missing)))
         common["stems"] = stems
         common["speech_source"] = speech_source
 
@@ -721,6 +914,28 @@ def process_video_task(job_id: str, input_path: str, original_language: str,
             common["word_segments"] = segments
             common["speakers"] = SPK.build(seg_rows, common["speakers"])
             print(SPK.summarize(common["speakers"], seg_rows))
+            stage_log.stage(
+                job_id, "select_reference",
+                source=("separated vocals" if ref_is_audio else "original audio"),
+                multi_speaker=multi,
+                detected_speakers=detected_labels,
+                global_reference={
+                    "path": os.path.basename(reference["path"]),
+                    "start": round(float(reference.get("start", 0.0)), 2),
+                    "duration": round(float(reference.get("duration", 0.0)), 2),
+                    "text": (reference.get("text") or "")[:400]},
+                per_speaker=[
+                    {"speaker": e.get("label"),
+                     "status": e.get("status"),
+                     "fallback": e.get("fallback"),
+                     "total_speech": e.get("total_speech"),
+                     "segment_count": e.get("segment_count"),
+                     "reference": ((e.get("reference") or {}).get("path") or
+                                   "").rsplit("/", 1)[-1] or None,
+                     "reference_seconds": (e.get("reference") or {}).get("duration"),
+                     "warning": e.get("warning")}
+                    for e in SPK.describe_all(
+                        SPK.normalize_speakers(common["speakers"]))])
 
         # ── 4. Translate segment by segment ──
         # Text that is only read goes into the language's own script; text
@@ -745,6 +960,15 @@ def process_video_task(job_id: str, input_path: str, original_language: str,
             from translation_v2 import fix_code_switching
             translated = fix_code_switching(translated, target_language)
         _set(job_id, translated_text=" ".join(t for t in translated if t).strip())
+        stage_log.stage(
+            job_id, "translate",
+            source_language=source_language, target_language=target_language,
+            segment_count=len(translated),
+            empty_translations=sum(1 for t in translated if not (t or "").strip()),
+            pairs=[{"speaker": SPK.label_of(sg),
+                    "source": (sg.get("text") or "").strip(),
+                    "target": (t or "").strip()}
+                   for sg, t in zip(segments, translated)])
 
         if not any(t.strip() for t in translated):
             raise RuntimeError("Translation produced no text")
@@ -816,6 +1040,25 @@ def process_video_task(job_id: str, input_path: str, original_language: str,
                 source_lang=source_language, progress=tts_progress,
                 source_audio=stt_audio, cache_dir=units_dir,
                 speakers=common["speakers"])
+            stage_log.stage(
+                job_id, "synthesize",
+                phrases=len(plan or []),
+                voices=sorted({str(u.get("speaker") or "?")
+                               for u in (plan or [])}),
+                phrases_per_voice={v: sum(1 for u in (plan or [])
+                                          if str(u.get("speaker") or "?") == v)
+                                   for v in sorted({str(u.get("speaker") or "?")
+                                                    for u in (plan or [])})},
+                dub_path=os.path.basename(dub_path),
+                plan=[{"index": u.get("index"),
+                       "speaker": str(u.get("speaker") or "?"),
+                       "start": round(float(u.get("start", 0.0)), 3),
+                       "duration": round(float(u.get("duration", 0.0)), 3),
+                       "natural": round(float(u.get("natural", 0.0)), 3),
+                       "rate": round(float(u.get("rate", 1.0)), 3),
+                       "ref_index": u.get("ref_index"),
+                       "text": (u.get("text") or "")[:200]}
+                      for u in (plan or [])])
 
             if kind == "audio":
                 # The bed belongs in the delivered file when there is no
@@ -830,6 +1073,14 @@ def process_video_task(job_id: str, input_path: str, original_language: str,
                     job_id, delivered,
                     os.path.splitext(_safe_name(filename))[0].replace(f"{job_id}_", ""),
                     target_language)
+                stage_log.stage(
+                    job_id, "verify",
+                    dialogue_track=os.path.basename(dub_path),
+                    background_mixed=bool(mixed),
+                    background_track=(os.path.basename(mixed) if mixed else None),
+                    note="audio-only render")
+                _stage_source_vs_final(job_id, input_path, delivered, dub_path,
+                                       stems, video_dur)
                 _set(job_id, status="done", step="complete",
                      dub_path=delivered, filed_at=filed,
                      plan=plan, units_dir=units_dir,
@@ -919,6 +1170,20 @@ def process_video_task(job_id: str, input_path: str, original_language: str,
         if per_speaker:
             _set(job_id, speaker_voice_match=per_speaker)
 
+        stage_log.stage(
+            job_id, "verify",
+            sync_ok=check["ok"], sync_reason=check["reason"],
+            voice_match=match,
+            per_speaker_voice_match=per_speaker,
+            dialogue_track=os.path.basename(dub_path),
+            background_mixed=bool(mixed),
+            background_track=(os.path.basename(mixed) if mixed else None),
+            note=("the dub replaces the original soundtrack"
+                  if not mixed else
+                  "the original background is preserved under the new dialogue"))
+        _stage_source_vs_final(job_id, input_path, output_video_path, dub_path,
+                               stems, video_dur)
+
         # ── 8. Publish ──
         # The render stays where it was written; this is the URL that serves it.
         _set(job_id, step="uploading_result")
@@ -997,11 +1262,19 @@ def process_video_task(job_id: str, input_path: str, original_language: str,
 
     except JobCancelled:
         print(f"[APP] Job {job_id} cancelled by the user")
+        stage_log.stage(job_id, "cancelled",
+                        step=(jobs.get(job_id) or {}).get("step"))
         jobs.get(job_id, {}).update(
             {"status": "cancelled", "step": "cancelled",
              "error": "Cancelled before it finished."})
     except Exception as e:
         traceback.print_exc()
+        # The whole traceback goes into the run's log, not just the last line:
+        # "which stage threw, and where" is the question the log exists for.
+        stage_log.stage(job_id, "failed",
+                        error=str(e),
+                        step=(jobs.get(job_id) or {}).get("step"),
+                        traceback=traceback.format_exc()[-8000:])
         _set(job_id, status="failed", step="error", error=str(e))
 
     finally:
@@ -1255,6 +1528,24 @@ async def get_run_summary(job_id: str):
     summary = run_summary.build(job)
     return JSONResponse({"summary": summary,
                          "text": run_summary.render(summary)})
+
+
+@app.get("/jobs/{job_id}/stages")
+async def get_stage_log(job_id: str):
+    """
+    Every stage's recorded result for a run, oldest first.
+
+    The same records written to `<runtime logs>/stages/<job_id>.jsonl`, served
+    here so the studio (and anyone debugging) can read what each stage produced
+    without opening a file on the runtime. Works for a run that is still going.
+    """
+    if job_id not in jobs and not stage_log.read(job_id):
+        raise HTTPException(status_code=404, detail="Job not found")
+    return JSONResponse({
+        "job_id": job_id,
+        "log_path": stage_log.path_for(job_id),
+        "stages": stage_log.read(job_id),
+    })
 
 
 @app.patch("/jobs/{job_id}/speakers/{label}")
@@ -1671,6 +1962,26 @@ def _diarization_enabled() -> bool:
     if setting in ("1", "true", "yes", "on"):
         return True
     return speaker_diarization.available()
+
+
+def _diar_max_speakers():
+    """
+    The diarizer's speaker ceiling, or None for no ceiling.
+
+    Unset by default. A ceiling is a promise that the video has no more actors
+    than the number, and the diarizer merges the extras into the ones it kept —
+    so a wrong ceiling is a wrong number of voices, silently. Left to the
+    diarizer, which finds as many as it hears, unless the operator sets
+    DIAR_MAX_SPEAKERS on purpose.
+    """
+    value = engines.tunable("DIAR_MAX_SPEAKERS")
+    if value in (None, "", 0):
+        return None
+    try:
+        value = int(value)
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
 
 
 def _preserve_background(requested: bool = None) -> bool:

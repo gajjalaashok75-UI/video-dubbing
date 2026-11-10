@@ -243,9 +243,18 @@ TUNABLES = {
     "DIAR_MIN_SPEAKERS": (1, "int", "Minimum speakers",
                           "A hint to the diarizer. 1 lets it find as many as "
                           "it hears; raise it when a video under-counts.", None),
-    "DIAR_MAX_SPEAKERS": (10, "int", "Maximum speakers",
-                          "A hint to the diarizer. A ceiling keeps background "
-                          "chatter from becoming extra characters.", None),
+    "DIAR_MAX_SPEAKERS": (None, "int", "Maximum speakers",
+                          "A ceiling on the speakers found. Empty means NO "
+                          "ceiling: the diarizer finds as many as it hears. "
+                          "Set it only to stop background chatter from "
+                          "becoming extra characters.", None),
+    "DIAR_MIN_SPEAKER_SPEECH": (1.0, "float", "Speaker floor (seconds)",
+                                "A detected speaker with less speech than this "
+                                "is treated as a blip - a cough, a door, a "
+                                "mis-detection - and their few words are folded "
+                                "into the nearest real speaker instead of "
+                                "becoming a phantom voice. 0 disables folding.",
+                                None),
     # Phase 4: keep the film's own music, ambience and sound effects.
     "PRESERVE_BACKGROUND": (False, "bool", "Preserve original background",
                             "Run Demucs to keep the film's music and sound "
