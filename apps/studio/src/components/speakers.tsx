@@ -25,7 +25,7 @@ import { Sub, Tool, Row, Lamp } from "./console";
 import { cx } from "@/lib/cx";
 import {
   chooseReference, getReferenceWindows, renameSpeaker, speakerStatusLabel,
-  artifactUrl,
+  speakerAudioUrl,
   type ReferenceWindow, type SpeakerProfile,
 } from "@/lib/api";
 
@@ -187,7 +187,7 @@ export function Speakers({
                   className="h-[22px] min-w-0 flex-1"
                   controls
                   preload="none"
-                  src={artifactUrl(jobId, `speaker:${s.label}`)}
+                  src={speakerAudioUrl(jobId, s.label)}
                   aria-label={`${s.name} reference preview`}
                 />
               )}

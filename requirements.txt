@@ -161,8 +161,8 @@ fonttools>=4.40,<5
 #
 # Demucs splits the original soundtrack into speech and everything else, so the
 # film's music, sound effects and ambience survive under the new dialogue
-# instead of being replaced by it. Off by default; turn it on per render in the
-# studio, or set VIDEOTRANS_PRESERVE_BACKGROUND=1.
+# instead of being replaced by it. On by default; turn it off per render in the
+# studio, or set VIDEOTRANS_PRESERVE_BACKGROUND=0.
 #
 # Heavy and slow: roughly realtime or worse on CPU, and it downloads a ~300 MB
 # checkpoint on first use. Audio is separated in 10-minute chunks so peak memory

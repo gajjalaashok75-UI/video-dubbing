@@ -91,9 +91,23 @@ export function Settings({ onClose }: { onClose: () => void }) {
       // Stage choices decide which knobs apply, so the knobs have to be
       // re-read rather than left describing the previous model.
       setAdv(await getAdvanced());
-      setNote(res?.takes_effect_after_current_job
-        ? "Saved. It applies to the next job — one is rendering now."
-        : "Saved and applied.");
+      // Switching to a model that is not on disk yet used to leave the user
+      // with a choice that would fail on the next render. Fetch it now, the
+      // moment it is chosen, and show the same progress bar as the button.
+      const chosen = res.stages?.[stage]?.options.find((o) => o.id === id);
+      const downloadId = res.stages?.[stage]?.download_ids?.[id];
+      if (chosen && !chosen.ready && downloadId && !prog?.running) {
+        try {
+          setProg(await downloadModels([downloadId]));
+          setNote(`Downloading ${chosen.label}…`);
+        } catch (err) {
+          setError((err as Error).message);
+        }
+      } else {
+        setNote(res?.takes_effect_after_current_job
+          ? "Saved. It applies to the next job — one is rendering now."
+          : "Saved and applied.");
+      }
     } catch (err) {
       setError((err as Error).message);
     }
@@ -161,6 +175,12 @@ export function Settings({ onClose }: { onClose: () => void }) {
                   </option>
                 ))}
               </select>
+              {!spec.options.find((o) => o.id === spec.current)?.ready
+                && spec.download_ids?.[spec.current] && (
+                <p className="pt-0.5 text-[10px] leading-relaxed text-c-warn">
+                  Not on this machine yet. Choosing it starts the download.
+                </p>
+              )}
             </div>
           ))}
 

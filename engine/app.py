@@ -363,8 +363,26 @@ def _measure_audio(path: str) -> dict:
         return {"error": str(e)[:200]}
 
 
+def _dialogue_coverage(input_path: str, plan: list) -> dict:
+    """
+    Where the source speaks but the dub is silent, measured against the plan.
+
+    Detection lives in `speech_activity.uncovered_speech`; this wrapper only
+    reads the source audio and hands it over. A failure here must never fail
+    the render — the coverage number is a diagnostic, so an unreadable file or
+    a missing librosa degrades to an error string in the log.
+    """
+    try:
+        import speech_activity
+        runs = speech_activity.detect_speech_runs(input_path)
+        return speech_activity.uncovered_speech(runs, plan)
+    except Exception as e:                                   # noqa: BLE001
+        return {"error": str(e)[:200]}
+
+
 def _stage_source_vs_final(job_id: str, input_path: str, output_video_path: str,
-                           dub_path: str, stems: dict, video_dur: float):
+                           dub_path: str, stems: dict, video_dur: float,
+                           plan: list = None) -> dict:
     """
     Record what the source sounded like against what was delivered.
 
@@ -372,6 +390,10 @@ def _stage_source_vs_final(job_id: str, input_path: str, output_video_path: str,
     has a measurable answer: how long each track is, how loud it is, and
     whether the original background survived. Written to the run's log so the
     before/after is on file rather than only audible.
+
+    Returns the dialogue-coverage dict so the caller can store it on the job
+    and the run summary can warn about it. A measurement failure is recorded in
+    the log and returns an empty dict — this never raises.
     """
     try:
         source = _measure_audio(input_path)
@@ -381,6 +403,11 @@ def _stage_source_vs_final(job_id: str, input_path: str, output_video_path: str,
         drift = None
         if source.get("duration_s") and final.get("duration_s"):
             drift = round(final["duration_s"] - source["duration_s"], 3)
+        coverage = _dialogue_coverage(input_path, plan)
+        if coverage.get("uncovered_s"):
+            print(f"[APP] Job {job_id}: {coverage['uncovered_s']}s of original "
+                  f"speech has no dubbed phrase over it: "
+                  f"{[(u['start'], u['end']) for u in coverage['uncovered']]}")
         stage_log.stage(
             job_id, "source_vs_final",
             source_duration_s=source.get("duration_s"),
@@ -392,10 +419,13 @@ def _stage_source_vs_final(job_id: str, input_path: str, output_video_path: str,
             dialogue_loudness_lufs=dialogue.get("integrated_lufs"),
             background_loudness_lufs=background.get("integrated_lufs"),
             background_preserved=bool(background.get("duration_s")),
+            dialogue_coverage=coverage,
             video_duration_s=round(video_dur, 3))
+        return coverage
     except Exception as e:                                   # noqa: BLE001
         stage_log.event(job_id, "source_vs_final",
                         "measurement failed", error=str(e)[:200])
+        return {}
 
 
 # What the splash screen reports while the window is still closed. These are
@@ -574,7 +604,13 @@ def process_video_task(job_id: str, input_path: str, original_language: str,
             job_id, "run_start",
             filename=filename, kind=kind,
             original_language=original_language, target_language=target_language,
+            # The request AND what it resolves to. A log that records only the
+            # request shows `null` for a render that never passed the flag, and
+            # reads as "the user turned it off" when the truth is "the default
+            # was used" — which is how a render with the score preserved and one
+            # without look identical on the page.
             preserve_background=preserve_background,
+            preserve_background_resolved=_preserve_background(preserve_background),
             trim=(None if trim_start is None and trim_end is None
                   else [trim_start, trim_end]),
             music=bool(music_path),
@@ -960,11 +996,22 @@ def process_video_task(job_id: str, input_path: str, original_language: str,
             from translation_v2 import fix_code_switching
             translated = fix_code_switching(translated, target_language)
         _set(job_id, translated_text=" ".join(t for t in translated if t).strip())
+        # A segment with source text but no translation is a dropped clause —
+        # the "Nice to meet you." that never reached the dub. It is not the
+        # same as a segment that was empty to begin with, so it is counted and
+        # named separately and made loud, rather than hidden in a total.
+        dropped = [i for i, (sg, t) in enumerate(zip(segments, translated))
+                   if (sg.get("text") or "").strip() and not (t or "").strip()]
+        if dropped:
+            print(f"[APP] Job {job_id}: {len(dropped)} segment(s) had source "
+                  f"text but no translation: {dropped}")
         stage_log.stage(
             job_id, "translate",
             source_language=source_language, target_language=target_language,
             segment_count=len(translated),
             empty_translations=sum(1 for t in translated if not (t or "").strip()),
+            dropped_translations=len(dropped),
+            dropped_segments=dropped,
             pairs=[{"speaker": SPK.label_of(sg),
                     "source": (sg.get("text") or "").strip(),
                     "target": (t or "").strip()}
@@ -1080,7 +1127,7 @@ def process_video_task(job_id: str, input_path: str, original_language: str,
                     background_track=(os.path.basename(mixed) if mixed else None),
                     note="audio-only render")
                 _stage_source_vs_final(job_id, input_path, delivered, dub_path,
-                                       stems, video_dur)
+                                       stems, video_dur, plan)
                 _set(job_id, status="done", step="complete",
                      dub_path=delivered, filed_at=filed,
                      plan=plan, units_dir=units_dir,
@@ -1181,8 +1228,10 @@ def process_video_task(job_id: str, input_path: str, original_language: str,
             note=("the dub replaces the original soundtrack"
                   if not mixed else
                   "the original background is preserved under the new dialogue"))
-        _stage_source_vs_final(job_id, input_path, output_video_path, dub_path,
-                               stems, video_dur)
+        coverage = _stage_source_vs_final(job_id, input_path, output_video_path,
+                                          dub_path, stems, video_dur, plan)
+        if coverage:
+            _set(job_id, dialogue_coverage=coverage)
 
         # ── 8. Publish ──
         # The render stays where it was written; this is the URL that serves it.
@@ -1605,6 +1654,43 @@ async def list_speakers(job_id: str):
     })
 
 
+@app.get("/jobs/{job_id}/speakers/{label}/audio")
+async def get_speaker_audio(job_id: str, label: str, download: bool = False):
+    """
+    The clip one speaker's voice was cloned from.
+
+    The A1 lane plays the job's video-wide reference. With two actors that is a
+    single person's voice standing in for the whole cast, so the lane reads as
+    if everyone were cloned from one clip. This serves each speaker's own
+    reference, so the lane can play the voice that was actually cloned for each.
+    """
+    job = jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    registry = SPK.normalize_speakers(job.get("speakers"))
+    if not registry and job.get("reference"):
+        registry = SPK.implicit_speaker(job["reference"])
+    entry = next((e for e in registry if e.get("label") == label), None)
+    if entry is None:
+        raise HTTPException(status_code=404,
+                            detail=f"No speaker {label} in this project")
+    path = (entry.get("reference") or {}).get("path")
+    # An older job recorded a bare filename; resolve it against the workdir.
+    if path and not os.path.isabs(path) and not os.path.isfile(path):
+        candidate = os.path.join(job.get("workdir") or "", path)
+        if os.path.isfile(candidate):
+            path = candidate
+    if not path or not os.path.isfile(path):
+        raise HTTPException(
+            status_code=404,
+            detail=f"No reference audio is on disk for {label}.")
+    from fastapi.responses import FileResponse
+    if not download:
+        return FileResponse(path, media_type="audio/wav")
+    return FileResponse(path, media_type="audio/wav",
+                        filename=f"{_download_name(job_id)}_{label}.wav")
+
+
 @app.get("/jobs/{job_id}/artifact/{name}")
 async def get_artifact(job_id: str, name: str):
     """
@@ -1755,6 +1841,9 @@ async def get_job_status(job_id: str):
         response["reference_text"] = job.get("reference_text")
         response["reference_seconds"] = job.get("reference_seconds")
         response["voice_match"] = job.get("voice_match")
+        # Where the source speaks and the dub does not. The studio surfaces
+        # this so a dropped clause is visible without listening for it.
+        response["dialogue_coverage"] = job.get("dialogue_coverage")
         response["voiceover_seconds"] = job.get("voiceover_seconds")
         response["has_transcript"] = bool(job.get("segments"))
         response["editable"] = bool(job.get("plan"))
@@ -1991,12 +2080,14 @@ def _preserve_background(requested: bool = None) -> bool:
     Resolution order, most specific first:
 
       1. `requested` — the per-render choice the studio sends.
-      2. `VIDEOTRANS_PRESERVE_BACKGROUND` — an operator turning it on or off for
+      2. `VIDEOTRANS_PRESERVE_BACKGROUND` — an operator pinning it on or off for
          a whole deployment.
-      3. the `PRESERVE_BACKGROUND` tunable, off by default.
+      3. the `PRESERVE_BACKGROUND` tunable, on by default.
 
-    Demucs is minutes per film on CPU and a heavy optional dependency, so the
-    default has to be the cheap path.
+    On by default because a dub that drops the score is a different film: the
+    music and the sound effects are part of the work. The default is only
+    reachable when nothing more specific was chosen, and the studio always
+    sends its own value, so this is the headless/API path.
 
     The package is not checked here: `source_separation.separate` does that, so
     a machine with the setting on but Demucs missing gets one clear log line and

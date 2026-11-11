@@ -510,6 +510,22 @@ class RunSummaryHonestyTests(unittest.TestCase):
         joined = " ".join(summary["warnings"])
         self.assertIn("not preserved", joined)
 
+    def test_dropped_dialogue_is_warned_about_with_its_timestamps(self):
+        # The "Nice to meet you." case: the track is the right length, so no
+        # sync or duration check catches it — only the coverage number does.
+        summary = RS.build(job(dialogue_coverage={
+            "source_speech_s": 6.5, "dubbed_s": 3.3, "uncovered_s": 3.2,
+            "uncovered": [{"start": 2.5, "end": 5.7, "gap_s": 3.2}]}))
+        joined = " ".join(summary["warnings"])
+        self.assertIn("3.2s", joined)
+        self.assertIn("2.5-5.7s", joined)
+
+    def test_a_fully_covered_dub_is_not_warned_about(self):
+        summary = RS.build(job(dialogue_coverage={
+            "source_speech_s": 6.5, "dubbed_s": 6.5, "uncovered_s": 0.0,
+            "uncovered": []}))
+        self.assertNotIn("no dubbed line", " ".join(summary["warnings"]))
+
     def test_silent_phrases_are_warned_about(self):
         summary = RS.build(job(missing_units=[3, 7]))
         self.assertIn("2 phrase(s)", " ".join(summary["warnings"]))

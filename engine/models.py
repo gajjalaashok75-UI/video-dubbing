@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import shutil
 import threading
 import urllib.error
@@ -128,6 +129,15 @@ def cache_root() -> str:
 # entry, where there is no exact filename to check for.
 _WEIGHT_SUFFIXES = (".bin", ".safetensors", ".pth", ".pt", ".ckpt", ".onnx",
                     ".gguf")
+
+# `owner/name`, the shape of a Hub repo id. A weight path in this repo
+# (`engine/vendor/.../x.pth`) never matches: it has no dot-free second segment.
+_REPO_ID = re.compile(r"^[A-Za-z0-9][\w.\-]*/[\w.\-]+$")
+
+
+def _is_repo_id(value: str) -> bool:
+    """Whether an id names a Hub repo rather than a path in this repo."""
+    return bool(value) and "/" in value and bool(_REPO_ID.match(value))
 
 
 def snapshot_root(repo_id: str) -> str:
@@ -414,6 +424,12 @@ def run(ids: list[str] | None = None) -> bool:
     Fetch the named models, or everything missing. Returns False if a run is
     already in flight, because two downloads writing the same .part file would
     corrupt each other.
+
+    An id that is not in the manifest is still fetched when it names a Hub
+    repo: the engine catalogue offers lighter Whisper and NLLB alternatives
+    that setup does not need, so they are not listed as required, but choosing
+    one in the studio asks for its repo by id. Without this they were silently
+    dropped from `todo` and the download finished having fetched nothing.
     """
     with _lock:
         if _state["running"]:
@@ -426,7 +442,17 @@ def run(ids: list[str] | None = None) -> bool:
         try:
             todo = [r for r in inventory() if not r["present"]]
             if ids:
+                known = {r["id"] for r in todo}
                 todo = [r for r in todo if r["id"] in ids]
+                # An id the manifest does not name, e.g. a lighter Whisper or
+                # NLLB that the engine catalogue offers: treat it as an
+                # ungated Hub snapshot so the fetch actually happens.
+                for wanted in ids:
+                    if wanted not in known and _is_repo_id(wanted):
+                        todo.append({
+                            "id": wanted, "label": wanted, "kind": "hub",
+                            "gated": False, "present": False,
+                        })
             _set(total=len(todo))
             weights = {w[1]: w for w in WEIGHTS}
 

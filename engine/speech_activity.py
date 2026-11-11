@@ -268,6 +268,48 @@ def build_phrase_units(segments: list, translated: list, speech_runs: list,
     return units
 
 
+def uncovered_speech(runs: list, plan: list, min_hole: float = 0.5) -> dict:
+    """
+    Where the source speaks but no dubbed phrase was placed.
+
+    `runs` is `detect_speech_runs` output; `plan` is the dubbing timeline, each
+    item carrying `start` and `duration`. A dropped clause does not announce
+    itself — the assembled track is still exactly the video's length, so the
+    length check passes and the failure is only audible. Measured against the
+    plan, though, it is plain: a stretch of the original where someone was
+    talking and no phrase covers it is a hole.
+
+    A hole shorter than `min_hole` is normal breath between lines, not a dropped
+    clause, so it is not named — naming those would drown the signal.
+
+    Pure, so it is testable without librosa or a rendered dub.
+    """
+    covered = sorted(
+        (float(u.get("start", 0.0)),
+         float(u.get("start", 0.0)) + float(u.get("duration", 0.0)))
+        for u in (plan or []) if float(u.get("duration", 0.0)) > 0.0)
+
+    def covered_seconds(a: float, b: float) -> float:
+        total = 0.0
+        for s, e in covered:
+            total += max(0.0, min(b, e) - max(a, s))
+        return total
+
+    uncovered = []
+    for a, b in runs:
+        gap = (b - a) - covered_seconds(a, b)
+        if gap >= min_hole:
+            uncovered.append({"start": round(a, 2), "end": round(b, 2),
+                              "gap_s": round(gap, 2)})
+
+    return {
+        "source_speech_s": round(sum(b - a for a, b in runs), 2),
+        "dubbed_s": round(sum(e - s for s, e in covered), 2),
+        "uncovered_s": round(sum(u["gap_s"] for u in uncovered), 2),
+        "uncovered": uncovered,
+    }
+
+
 def summarize(units: list, segments: list, total_duration: float) -> str:
     speech = sum(u["end"] - u["start"] for u in units)
     return (f"[VAD] {len(segments)} segments -> {len(units)} phrase units; "

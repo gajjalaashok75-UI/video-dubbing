@@ -88,6 +88,14 @@
 - Two invariants must survive any port: `dubbing.assemble` returns exactly
   `video_duration` seconds, and per-phrase audio stays cached in
   `<workdir>/units/` so one edit re-synthesizes one phrase.
+- `translation_v2.translate_segments` translates ONE SENTENCE PER CALL, then
+  retries any chunk that came back empty, then falls back to translating the
+  whole segment. NLLB handed two sentences can translate the first and drop the
+  rest — that is how "Nice to meet you." vanished from "Hi, my name is John.
+  Nice to meet you.", leaving a hole in the dub. Do not batch a segment's
+  sentences into one call to save time; that reintroduces the dropped clause.
+  The `translate` stage log records `dropped_translations` and `dropped_segments`
+  so a regression is visible without listening to the output.
 
 ## Multi-speaker dubbing (Phases 1-3 done)
 
@@ -146,11 +154,12 @@
 
 - `engine/source_separation.py` splits the original soundtrack with Demucs
   `htdemucs --two-stems vocals`. The `no_vocals` stem is the bed; the `vocals`
-  stem is what ASR and the voice references are read from. Off unless asked for
-  (`PRESERVE_BACKGROUND` tunable, `VIDEOTRANS_PRESERVE_BACKGROUND`, or the
-  per-render `preserve_background` query param). Every failure — no Demucs, no
-  weights, a crash, bad output, a timeout — returns `None` and leaves the
-  dialogue-only pipeline intact.
+  stem is what ASR and the voice references are read from. On by default, so a
+  dub keeps the film's score unless the user turns it off (`PRESERVE_BACKGROUND`
+  tunable, `VIDEOTRANS_PRESERVE_BACKGROUND`, or the per-render
+  `preserve_background` query param — most specific wins). Every failure — no
+  Demucs, no weights, a crash, bad output, a timeout — returns `None` and
+  leaves the dialogue-only pipeline intact.
 - The separation input is HQ stereo 44.1 kHz, NOT the 16 kHz mono ASR track.
   Demucs needs the full band and the stereo image; the two extractions coexist
   because ASR still falls back to the 16 kHz one.
@@ -451,3 +460,24 @@
   the sync check, the voice match, and the delivered vs original duration,
   loudness and background. Read them in the notebook's "7b. Per-step results"
   cell or at `GET /jobs/{job_id}/stages`. Never let a log write fail a render.
+- A dropped clause is invisible to every length and sync check: the assembled
+  track is still exactly the video's length, so `verify` passes and the hole is
+  only audible. `speech_activity.uncovered_speech(runs, plan)` measures the
+  source's speech runs against the dubbing plan and names every stretch the plan
+  does not cover (holes under 0.5s are breath, not a dropped clause).
+  `app._dialogue_coverage` reads the audio and calls it; `_stage_source_vs_final`
+  writes the result into the `source_vs_final` log record, the job stores it as
+  `dialogue_coverage`, `GET /jobs/{id}` returns it, and `run_summary.warnings`
+  turns it into a sentence with the timestamps. Pinned by
+  `tests/test_dialogue_coverage.py`. Translation is the stage that drops the
+  clause (NLLB, given two sentences, translates the first and silently discards
+  the rest), so `translation_v2._split_into_chunks` splits EVERY segment on
+  sentence boundaries, not only ones above the old 600-char cap, and retries any
+  chunk that comes back empty. The `translate` log records
+  `dropped_translations`/`dropped_segments` so the drop is visible even when the
+  retry cannot recover it.
+- The `run_start` log must record the RESOLVED `preserve_background`, not just
+  the request. The studio sends its own value, but the API/headless path sends
+  `null`, and a log that shows only `null` reads as "off" when the default
+  (on) is what actually ran. `preserve_background_resolved` is
+  `_preserve_background(preserve_background)` and is what to read.

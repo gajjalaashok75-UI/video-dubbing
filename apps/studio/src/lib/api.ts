@@ -52,6 +52,13 @@ export interface SyncReport {
   reason: string;
 }
 
+export interface DialogueCoverage {
+  source_speech_s: number;
+  dubbed_s: number;
+  uncovered_s: number;
+  uncovered: { start: number; end: number; gap_s: number }[];
+}
+
 export interface JobStatus {
   /** What the project is called. Falls back to the source file name. */
   name?: string;
@@ -90,6 +97,10 @@ export interface JobStatus {
   /** How close the dub sounds to the reference speaker, 0..1, normalised
       between a same-speaker ceiling and a different-speaker floor. */
   voice_match?: { score: number; cosine: number } | null;
+  /** Where the original speaks and the dub does not — a dropped clause. The
+      track is still the right length, so this is the only signal that a line
+      went unspoken. */
+  dialogue_coverage?: DialogueCoverage | null;
   /** Whether this run stored the timings that transcript export needs. */
   has_transcript?: boolean;
   /** Whether the phrase timeline was kept, so the script can be revised. */
@@ -697,6 +708,10 @@ export const renameSpeaker = (id: string, label: string, alias: string) =>
 export const artifactUrl = (id: string, name: string) =>
   `/jobs/${encodeURIComponent(id)}/artifact/${encodeURIComponent(name)}`;
 
+/** The clip one speaker's voice was cloned from, for the A1 lane. */
+export const speakerAudioUrl = (id: string, label: string) =>
+  `/jobs/${encodeURIComponent(id)}/speakers/${encodeURIComponent(label)}/audio`;
+
 /** What a change to one input would re-run. */
 export interface CacheState {
   present: Record<string, boolean>;
@@ -732,6 +747,12 @@ export interface EngineStage {
   /** Fixed by an environment variable; the UI cannot change it. */
   pinned: boolean;
   options: EngineOption[];
+  /**
+   * For each option id, the inventory row the studio must fetch to make it
+   * ready. A Hub model is its repo id; a checkpoint with a mirror is its path
+   * in the weights manifest. Missing an id means the option needs no download.
+   */
+  download_ids?: Record<string, string>;
 }
 
 export interface EngineSettings {

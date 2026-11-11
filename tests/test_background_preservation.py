@@ -108,8 +108,12 @@ class FakeDemucs:
         # `available()` asks whether the separation command's own imports
         # resolve, not just whether `demucs` exists: an install that skipped
         # them could not start (demucs is installed with --no-deps). A real
-        # install has these, so the fake one has them too.
-        for name in ("lameenc", "julius", "openunmix", "tqdm"):
+        # install has these, so the fake one has them too. This list must stay
+        # in step with `source_separation.REQUIRED_MODULES` — a name added there
+        # and not here makes every test below fail on a fixture gap, which
+        # looks exactly like a broken wrapper.
+        for name in ("lameenc", "julius", "openunmix", "tqdm",
+                     "sphn", "einops", "yaml"):
             with open(os.path.join(tmp, name + ".py"), "w", encoding="utf-8") as f:
                 f.write("")
         for name in ("dora", "omegaconf"):

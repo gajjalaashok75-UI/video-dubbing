@@ -6,17 +6,21 @@ Drop-in replacement for translation.py with:
   - Standard HuggingFace API (no indictrans_toolkit dependency)
   - CTranslate2-compatible for further speedup
 
-Requires: transformers<4.55, sentencepiece, torch>=2.2
+Requires: transformers (4.x), sentencepiece, torch>=2.2
 
-Root cause note — why the pin:
-  transformers >= 4.55 restructured the M2M100 model module. The class that
-  loaded NLLB used to live at transformers.models.m2m_100.M2M100ForConditionalGeneration;
-  in some versions it was moved or the auto class resolution changed the path
-  that from_pretrained() walks, and the import chain broke with a name-missing
-  error inside torch._utils. Pinning to <4.55 keeps the old layout. The lazy
-  import below keeps app.py importable on hosts where torch._utils is already
-  broken (Colab CUDA-12 torch 2.6 on Python 3.13) so the error surfaces only
-  when someone actually renders a dub, not when the server starts.
+Root cause note — why the deferred import:
+  An earlier revision pinned transformers<4.55 because a reshuffle of the
+  M2M100 module broke the import chain with a name-missing error inside
+  torch._utils. The loader below uses the version-stable auto classes
+  (AutoModelForSeq2SeqLM / AutoTokenizer) and does not reach into
+  transformers.models.m2m_100 directly, so it works on the 4.57.x the rest of
+  the stack pins. What still matters is that importing transformers at module
+  level can fail — transformers → model_debugging_utils →
+  torch.distributed.tensor._ops → torch._utils._maybe_view_chunk_cat raises on
+  Colab with the CUDA-12 torch build on some Python 3.13 numpy/torchaudio
+  combos. The lazy import below keeps app.py importable on hosts where
+  torch._utils is already broken, so the error surfaces only when someone
+  actually renders a dub, not when the server starts.
 """
 
 from __future__ import annotations
@@ -429,56 +433,73 @@ def translate_text(text: str, source_lang: str, target_lang: str) -> str:
 _SENTENCE_SPLIT = _re.compile(r"(?<=[" + "!.?।" + r"])\s+", _re.U)
 _MAX_TOKENS_PER_CHUNK = 420
 
+# The longest text we hand the model in one call. Only a single sentence longer
+# than this is broken further, on commas.
+_MAX_CHUNK_CHARS = 600
 
-def _split_into_chunks(text: str) -> list[str]:
-    """Split a long segment into model-friendly chunks."""
-    text = text.strip()
-    if not text:
-        return []
-    if len(text) <= 600:
-        return [text]
+# A runaway guard only. It must not bind on real content: a segment with 30
+# short sentences becomes 30 chunks, and truncating that here would drop the
+# tail of the line — the very failure this function exists to prevent.
+_MAX_CHUNKS_PER_SEGMENT = 500
 
+
+# A chunk's identity: (segment index, position of the chunk in that segment).
+# The position is what lets a chunk that came back empty be retried on its own
+# and put back in the right place — counting successes cannot tell which chunk
+# the model dropped.
+_ChunkKey = tuple[int, int]
+
+
+def _split_long_sentence(sentence: str) -> list[str]:
+    """Break one over-long sentence on commas so no chunk exceeds the cap."""
+    if len(sentence) <= _MAX_CHUNK_CHARS:
+        return [sentence]
     chunks: list[str] = []
     buf: list[str] = []
     buf_len = 0
-
-    for sentence in _SENTENCE_SPLIT.split(text):
-        sentence = sentence.strip()
-        if not sentence:
+    for part in sentence.split(","):
+        part = part.strip()
+        if not part:
             continue
-        if buf_len + len(sentence) + 1 <= 600:
-            buf.append(sentence)
-            buf_len += len(sentence) + 1
+        if buf_len + len(part) + 2 <= _MAX_CHUNK_CHARS:
+            if buf:
+                part = "," + part
+            buf.append(part)
+            buf_len += len(part) + 2
         else:
             if buf:
-                chunks.append(" ".join(buf))
-            if len(sentence) <= 600:
-                buf = [sentence]
-                buf_len = len(sentence)
-            else:
-                # One sentence too long — split on commas.
-                sub: list[str] = []
-                sub_len = 0
-                for part in sentence.split(","):
-                    part = part.strip()
-                    if not part:
-                        continue
-                    if sub_len + len(part) + 2 <= 600:
-                        if sub:
-                            part = "," + part
-                        sub.append(part)
-                        sub_len += len(part) + 2
-                    else:
-                        if sub:
-                            chunks.append("".join(sub))
-                        sub = [part]
-                        sub_len = len(part)
-                if sub:
-                    buf = sub
-                    buf_len = sub_len
+                chunks.append("".join(buf))
+            buf = [part]
+            buf_len = len(part)
     if buf:
-        chunks.append(" ".join(buf))
-    return chunks
+        chunks.append("".join(buf))
+    return chunks or [sentence]
+
+
+def _split_into_chunks(text: str) -> list[str]:
+    """Split a segment into model-friendly chunks, one sentence at a time.
+
+    NLLB is a sentence-level model. Handed two sentences as a single input it
+    can translate the first and silently drop the rest — that is exactly how
+    "Nice to meet you." disappeared from "Hi, my name is John. Nice to meet
+    you.", leaving a hole in the dub where the phrase should have been spoken.
+    The old code only split a segment above 600 characters, so a short
+    two-sentence line went to the model whole and lost its ending.
+
+    A sentence translated on its own cannot lose a sentence, so every segment
+    is split on sentence boundaries. Only a single sentence longer than the
+    cap is broken further, on commas.
+    """
+    text = text.strip()
+    if not text:
+        return []
+    sentences = [s.strip() for s in _SENTENCE_SPLIT.split(text) if s.strip()]
+    if not sentences:
+        return []
+    chunks: list[str] = []
+    for sentence in sentences:
+        chunks.extend(_split_long_sentence(sentence))
+    return chunks[:_MAX_CHUNKS_PER_SEGMENT]
 
 
 def translate_segments(
@@ -525,49 +546,78 @@ def translate_segments(
     tok, model = _load()
     device = next(model.parameters()).device
 
-    # Build input rows: (output_index, text_or_None)
-    rows: list[tuple[int, Optional[str]]] = []
+    # Build input rows: (segment index, chunk position, text). The position is
+    # carried so a chunk that comes back empty can be identified and retried on
+    # its own — counting successes cannot tell which chunk was dropped.
+    rows: list[tuple[tuple[int, int], Optional[str]]] = []
     for i, seg in enumerate(segments):
         raw = seg.get("text", "") or ""
         if not raw.strip():
-            rows.append((i, None))
-        else:
-            for chunk in _split_into_chunks(raw)[: 40 if max_segment_chars > 600 else 20]:
-                rows.append((i, chunk if chunk.strip() else None))
+            continue
+        for pos, chunk in enumerate(_split_into_chunks(raw)):
+            if chunk.strip():
+                rows.append(((i, pos), chunk))
 
     # Translate each non-empty chunk, then reassemble per segment index.
-    out: dict[int, list[str]] = {i: [] for i in range(len(segments))}
+    out: dict[tuple[int, int], list[str]] = {}
 
     # Batch by device — on CPU we translate one at a time anyway because
     # the model is small and batching gives no win there; on CUDA we batch
     # as many chunks as fit in the context.
     if device.type == "cuda":
-        batch: list[tuple[int, str]] = []
-        for idx, txt in rows:
+        batch: list[tuple[tuple[int, int], str]] = []
+        for key, txt in rows:
             if txt is None:
                 continue
-            batch.append((idx, txt))
+            batch.append((key, txt))
             if len(batch) >= 8:
                 _flush_batch(batch, tok, model, src, tgt, out)
                 batch.clear()
         if batch:
             _flush_batch(batch, tok, model, src, tgt, out)
     else:
-        for idx, txt in rows:
+        for key, txt in rows:
             if txt is None:
                 continue
-            _translate_one(idx, txt, tok, model, device, src, tgt, out)
+            _translate_one(key, txt, tok, model, device, src, tgt, out)
 
-    return [(" ".join(out.get(i, [])).strip()) for i in range(len(segments))]
+    # Safety net. A chunk that comes back empty is a dropped clause, not a
+    # shorter sentence: the assembled segment silently loses whatever that
+    # chunk said, which is how "Nice to meet you." vanished from the dub. Retry
+    # every chunk that produced nothing, on its own. A single short sentence is
+    # where NLLB is strongest, so this recovers text a batched call dropped.
+    for key, txt in rows:
+        if txt is not None and not out.get(key):
+            _translate_one(key, txt, tok, model, device, src, tgt, out)
+
+    # Last resort for a segment still wholly empty: translate it whole. This is
+    # the pre-existing behaviour, kept so a segment the model refuses to
+    # translate in pieces is not left silent.
+    assembled: list[str] = []
+    for i, seg in enumerate(segments):
+        raw = (seg.get("text", "") or "").strip()
+        if not raw:
+            assembled.append("")
+            continue
+        text = " ".join(
+            " ".join(out.get((i, pos), []))
+            for pos in range(len(_split_into_chunks(raw)))
+            if out.get((i, pos))
+        ).strip()
+        if not text:
+            _translate_one((i, 0), raw, tok, model, device, src, tgt, out)
+            text = " ".join(out.get((i, 0), [])).strip()
+        assembled.append(text)
+    return assembled
 
 
 def _flush_batch(
-    batch: list[tuple[int, str]],
+    batch: list[tuple["_ChunkKey", str]],
     tok,
     model,
     src: str,
     tgt: str,
-    out: dict[int, list[str]],
+    out: dict["_ChunkKey", list[str]],
 ) -> None:
     tok.src_lang = src
     inputs = tok(
@@ -594,14 +644,14 @@ def _flush_batch(
 
 
 def _translate_one(
-    idx: int,
+    idx: "_ChunkKey",
     text: str,
     tok,
     model,
     device,
     src: str,
     tgt: str,
-    out: dict[int, list[str]],
+    out: dict["_ChunkKey", list[str]],
 ) -> None:
     tok.src_lang = src
     inputs = tok(

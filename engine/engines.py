@@ -39,6 +39,14 @@ CATALOG = {
             {"id": "small", "label": "Whisper small", "size": "500 MB",
              "repo": "Systran/faster-whisper-small",
              "note": "For quick tests. Transcription errors propagate into the dub."},
+            {"id": "base", "label": "Whisper base", "size": "150 MB",
+             "repo": "Systran/faster-whisper-base",
+             "note": "Very fast and very rough. Useful to check the plumbing, "
+                     "not to judge a dub."},
+            {"id": "tiny", "label": "Whisper tiny", "size": "75 MB",
+             "repo": "Systran/faster-whisper-tiny",
+             "note": "The smallest option. Mostly for a smoke test on a slow "
+                     "machine."},
             {"id": "distil-large-v3", "label": "Distil-Whisper large-v3", "size": "1.5 GB",
              "repo": "Systran/faster-distil-whisper-large-v3",
              "warn": "English only. Do not use it to transcribe Indian-language source."},
@@ -56,6 +64,11 @@ CATALOG = {
             {"id": "facebook/nllb-200-distilled-1.3B", "label": "NLLB-200 distilled 1.3B",
              "size": "5.5 GB", "repo": "facebook/nllb-200-distilled-1.3B",
              "note": "Better on long or formal sentences."},
+            {"id": "facebook/nllb-200-1.3B", "label": "NLLB-200 1.3B",
+             "size": "5.5 GB", "repo": "facebook/nllb-200-1.3B",
+             "note": "The non-distilled 1.3B model. Often better on Indian "
+                     "languages than the distilled pair; worth a try if a "
+                     "translation reads flat."},
             {"id": "facebook/nllb-200-3.3B", "label": "NLLB-200 3.3B",
              "size": "17 GB", "repo": "facebook/nllb-200-3.3B",
              "warn": "Heavy. Expect a slow first load and high memory use."},
@@ -256,10 +269,12 @@ TUNABLES = {
                                 "becoming a phantom voice. 0 disables folding.",
                                 None),
     # Phase 4: keep the film's own music, ambience and sound effects.
-    "PRESERVE_BACKGROUND": (False, "bool", "Preserve original background",
+    "PRESERVE_BACKGROUND": (True, "bool", "Preserve original background",
                             "Run Demucs to keep the film's music and sound "
-                            "effects under the new dialogue. Needs the demucs "
-                            "package and is slow on CPU.", None),
+                            "effects under the new dialogue. On by default: a "
+                            "dub that drops the score is a different film. "
+                            "Needs the demucs package; if it is missing the "
+                            "render continues dialogue-only and says so.", None),
     "BACKGROUND_LUFS": (-26.0, "float", "Background level (LUFS)",
                         "Loudness the preserved background is normalised to. "
                         "Lower buries the score further under the dialogue.",
@@ -397,13 +412,28 @@ def _hf_cached(repo: str) -> bool:
 
 def _downloadable(local: str) -> bool:
     """Whether models.py has a mirror for this checkpoint."""
+    return _weight_id(local) is not None
+
+
+def _weight_id(local: str) -> str:
+    """
+    The inventory id models.py uses for a checkpoint, or None.
+
+    The catalogue names a checkpoint relative to `engine/`, but the weights
+    manifest names it relative to the repo root (`engine/vendor/...`), and
+    `/api/models/download` keys on that manifest id. Returning the manifest id
+    rather than the catalogue path is what makes a download actually start:
+    the catalogue path matched no inventory row and was silently dropped.
+    """
     try:
         import models
     except ImportError:
-        return False
+        return None
     tail = local.replace("\\", "/").split("/")[-1]
-    return any(rel.replace("\\", "/").split("/")[-1] == tail
-               for _, rel, *_ in models.WEIGHTS)
+    for _, rel, *_ in models.WEIGHTS:
+        if rel.replace("\\", "/").split("/")[-1] == tail:
+            return rel
+    return None
 
 
 def catalog() -> dict:
@@ -434,6 +464,15 @@ def catalog() -> dict:
             "label": spec["label"], "why": spec["why"],
             "default": spec["default"], "current": current[stage],
             "pinned": bool(os.getenv(spec["env"])),
+            # Which inventory row the studio must fetch to make an option
+            # ready. A Hub option is its own repo id; a checkpoint with a
+            # mirror is named by its path in models.WEIGHTS, which is what
+            # /api/models/download expects.
+            "download_ids": {
+                o["id"]: (o["repo"] if o.get("repo") else _weight_id(o["local"]))
+                for o in spec["options"]
+                if o.get("repo") or (o.get("local") and _downloadable(o["local"]))
+            },
             "options": options,
         }
     return out

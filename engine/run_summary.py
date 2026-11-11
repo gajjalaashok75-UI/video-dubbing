@@ -301,6 +301,21 @@ def warnings(job: dict) -> list:
         out.append("The original music and sound effects were not preserved; "
                    "the dub is the only audio track.")
 
+    # Dialogue the dub does not speak. A dropped clause is inaudible in every
+    # length and sync check — the track is still exactly the video's length —
+    # so it is surfaced here, with the timestamps, rather than left for the
+    # user to notice a silence in the finished film.
+    coverage = job.get("dialogue_coverage") or {}
+    uncovered = coverage.get("uncovered") or []
+    if uncovered:
+        holes = ", ".join(f"{u['start']:.1f}-{u['end']:.1f}s"
+                          for u in uncovered[:4])
+        more = "" if len(uncovered) <= 4 else f" (+{len(uncovered) - 4} more)"
+        out.append(f"{coverage.get('uncovered_s', 0):.1f}s of the original "
+                   f"speech has no dubbed line over it ({holes}{more}); the dub "
+                   "is silent where someone was talking. Edit those lines and "
+                   "re-render.")
+
     note = job.get("lip_sync") or {}
     if note.get("skipped"):
         if note.get("no_face"):

@@ -24,11 +24,12 @@ import {
   downloadUrl, downloadAudioUrl, revealRender, getProjectOutputs, renameProject,
   type ProjectOutput,
   undoPhrase, fitOf,
-  getReferenceWindows, chooseReference, getSpeakers,
+  getReferenceWindows, chooseReference, getSpeakers, getAdvanced,
   EXPORTS, exportUrl, langName,
   type Language, type JobStatus, type Health, type Phrase,
   type ReferenceWindow,
   type SpeakerProfile,
+  speakerAudioUrl,
 } from "@/lib/api";
 import {
   Panel, Tool, Row, Sel, Sub, Stat, Lamp, TitleBar, StatusBar, PageBar,
@@ -165,8 +166,9 @@ export default function Studio() {
   const [music, setMusic] = useState<File | null>(null);
   const [musicGain, setMusicGain] = useState(-18);
   /* Keep the film's own soundtrack. Null means "follow the engine's
-     PRESERVE_BACKGROUND setting", which is off unless an operator
-     turned it on. */
+     PRESERVE_BACKGROUND setting", which is on by default; the mount effect
+     below reads that default so the toggle shows the truth instead of a
+     hard-coded off. */
   const [preserveBackground, setPreserveBackground] = useState<boolean | null>(null);
   /* Background level in LUFS, and whether the bed ducks under speech.
      Defaults reproduce the tested Phase 4 behaviour: -26 LUFS, no
@@ -295,6 +297,18 @@ export default function Studio() {
 
   // Object URLs leak one blob per pick unless the previous one is revoked.
   useEffect(() => () => { if (preview) URL.revokeObjectURL(preview); }, [preview]);
+
+  /* The background toggle must show what the engine will actually do. The
+     engine keeps the score by default, so a toggle that starts off is a lie
+     the user only discovers in the finished render. Read the setting once. */
+  useEffect(() => {
+    getAdvanced()
+      .then((a) => {
+        const t = a.tunables?.PRESERVE_BACKGROUND;
+        if (t) setPreserveBackground(Boolean(t.value));
+      })
+      .catch(() => { /* engine not up yet; leave the toggle as-is */ });
+  }, []);
 
   /* --- transport ---------------------------------------------------------- */
 
@@ -738,6 +752,18 @@ export default function Studio() {
   const badRange =
     trimIn != null && trimOut != null && trimOut - trimIn < 1;
   const selectedPhrase = phrases?.find((ph) => ph.index === selected) ?? null;
+  // The A1 lane plays the whole job's reference, which is one actor's voice
+  // standing in for the entire cast. When the selected phrase belongs to a
+  // speaker that was cloned from their own clip, play THAT clip instead, so the
+  // lane matches the voice actually speaking the selected line.
+  const selectedSpeaker =
+    speakers?.find((s) => s.label === selectedPhrase?.speaker && s.reference)
+    ?? null;
+  const referenceUrl = selectedSpeaker && job
+    ? speakerAudioUrl(job.job_id, selectedSpeaker.label)
+    : job?.reference_audio;
+  const referenceSeconds =
+    (selectedSpeaker?.reference?.duration ?? job?.reference_seconds);
   const voiceTrack = kind === "voiceover" && tab === "dub" ? (job?.dub_audio ?? "") : "";
 
   const state: { lamp: "idle" | "run" | "good" | "bad"; text: string } =
@@ -804,7 +830,7 @@ export default function Studio() {
               <FilePlus size={18} className="text-c-mute" />
               <span className="text-[11px] text-c-dim">Drop a clip, or click to browse</span>
               <span className="text-[10px] leading-snug text-c-mute">
-                MP4, MOV, WebM · up to {MAX_MB} MB<br />One front-facing speaker
+                MP4, MOV, WebM · up to {MAX_MB} MB<br />Any number of speakers
               </span>
             </label>
           ) : (
@@ -1081,7 +1107,7 @@ export default function Studio() {
                     type="checkbox"
                     checked={preserveBackground === true}
                     onChange={(e) =>
-                      setPreserveBackground(e.target.checked ? true : null)}
+                      setPreserveBackground(e.target.checked)}
                     aria-label="Preserve the original soundtrack"
                   />
                 </Row>
@@ -1306,6 +1332,14 @@ export default function Studio() {
                     tone={job.sync.ok ? "good" : "warn"}
                   />
                 )}
+                {(job.dialogue_coverage?.uncovered?.length ?? 0) > 0 && (
+                  <p className="px-2.5 pb-1 pt-0.5 text-[10px] leading-relaxed text-c-warn">
+                    {job.dialogue_coverage!.uncovered_s.toFixed(1)}s of the
+                    original speech has no dubbed line over it — the dub is
+                    silent where someone was talking. Edit those phrases and
+                    re-render.
+                  </p>
+                )}
               </>
             ) : view === "idle" ? (
               <p className="px-2.5 py-1 text-[10px] leading-relaxed text-c-mute">
@@ -1329,6 +1363,20 @@ export default function Studio() {
             {phrases && selectedPhrase && (
               <>
                 <Sub>Phrase {selectedPhrase.index + 1} of {phrases.length}</Sub>
+
+                {/* Which voice this line will be spoken in. With more than one
+                    speaker the words alone do not say whose take this is, so
+                    the speaker is named here rather than left to the timeline. */}
+                {selectedPhrase.speaker && (
+                  <p className="px-2.5 pb-1 text-[10px] leading-relaxed text-c-dim">
+                    Spoken in{" "}
+                    <span className="text-c-text">
+                      {(speakers?.find((s) => s.label === selectedPhrase.speaker)?.name)
+                        ?? selectedPhrase.speaker}
+                    </span>
+                    &rsquo;s voice
+                  </p>
+                )}
 
                 {/* The shortcuts work anywhere on the timeline; these are here
                     so the operations are findable without knowing them. */}
@@ -1667,8 +1715,8 @@ export default function Studio() {
           current={current}
           onSeek={seek}
           sourceName={file?.name}
-          referenceUrl={job?.reference_audio}
-          referenceSeconds={job?.reference_seconds}
+          referenceUrl={referenceUrl}
+          referenceSeconds={referenceSeconds}
           dubUrl={job?.dub_audio}
           segments={job?.segment_count}
           stageIndex={stageIndex}
