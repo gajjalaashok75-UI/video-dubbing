@@ -248,7 +248,8 @@ def _fit_length(wave: np.ndarray, target_samples: int) -> np.ndarray:
 
 
 def prepare_units(segments: list, translated_texts: list,
-                  source_audio: str = None, video_duration: float = 0.0):
+                  source_audio: str = None, video_duration: float = 0.0,
+                  target_lang: str = None):
     """
     Split Whisper segments at the speaker's REAL pauses, returning
     (units, translated_texts) ready for `plan_timeline`.
@@ -281,12 +282,51 @@ def prepare_units(segments: list, translated_texts: list,
             return units, list(translated_texts)
         print(SA.summarize(units, segments, video_duration))
         units = _with_speakers(segments, units, [u["target"] for u in units])
+        attach_prosody(units, source_audio, target_lang)
         return units, [u["target"] for u in units]
     except Exception as e:
         print(f"[DUB] Pause detection unavailable ({e}); "
               f"falling back to whole-segment units")
         units = _with_speakers(segments, segments, translated_texts)
         return units, list(translated_texts)
+
+
+def attach_prosody(units: list, source_audio: str, target_lang: str = None) -> None:
+    """
+    Label each unit with how loudly its source line was delivered.
+
+    Only meaningful for the S2 Pro engine, which is the only one that accepts
+    delivery tags, so nothing is measured for the others and every unit is left
+    with an empty tag. Measured from the ORIGINAL audio, not the generated
+    speech: the point is to carry the actor's delivery across the language
+    change, and the dub has not been made yet at this point.
+    """
+    for unit in units:
+        unit.setdefault("prosody", "")
+    if not units or not source_audio:
+        return
+    try:
+        import engines as E
+        if not E.tunable("S2PRO_PROSDY"):
+            return
+        import languages as L
+        if L.engine_for(target_lang or "en") != L.ENGINE_S2PRO:
+            return
+        import speech_activity as SA
+        spans = [(u.get("start", 0.0), u.get("end", 0.0)) for u in units]
+        tags = SA.prosody_tags(SA.speech_levels(source_audio, spans))
+    except Exception as e:                                   # noqa: BLE001
+        print(f"[DUB] Prosody analysis unavailable ({e}); "
+              f"speaking every line at one level")
+        return
+    tagged = 0
+    for unit, tag in zip(units, tags, strict=True):
+        if tag:
+            unit["prosody"] = tag
+            tagged += 1
+    if tagged:
+        print(f"[DUB] Matched delivery on {tagged} of {len(units)} lines "
+              f"(loud/quiet relative to this clip's own median)")
 
 
 def _with_speakers(segments: list, units: list, texts: list):
@@ -448,6 +488,9 @@ def plan_timeline(segments: list, texts: list, duration_model: DurationModel,
             "duration": target, "natural": natural, "rate": rate,
             "speaker": label,
             "ref_index": SPK.ref_index_for(speakers, label),
+            # Carried through for the engine that accepts delivery tags. Empty
+            # for every other engine, so this is inert unless S2 Pro speaks.
+            "prosody": seg.get("prosody") or "",
         })
         cursors[label] = start + target
 
@@ -540,13 +583,20 @@ def synth_unit(unit: dict, ref_path: str, ref_text: str, ref_duration: float,
     lang = L.synth_lang(target_lang)
     use_fix = isinstance(engine, tts_engines.IndicF5Engine)
 
+    # Only the S2 Pro engine understands delivery tags; passing the keyword to
+    # the others would raise, so it is offered only where it is meaningful.
+    kwargs = {}
+    if unit.get("prosody") and isinstance(engine, tts_engines.S2ProEngine):
+        kwargs["prosody"] = unit["prosody"]
+
     with _with_seed(engine, seed):
         if use_fix:
             # fix_duration is the TOTAL (reference + generated) length.
             wave, sr = _synth_fixed(engine, unit["text"], ref_path, ref_text,
                                     lang, ref_duration + unit["duration"])
         else:
-            wave, sr = engine.synthesize(unit["text"], ref_path, ref_text, lang=lang)
+            wave, sr = engine.synthesize(unit["text"], ref_path, ref_text,
+                                         lang=lang, **kwargs)
 
     if sr != SAMPLE_RATE and wave.size:
         import librosa
@@ -910,7 +960,7 @@ def build_dubbed_track(segments: list, translated_texts: list, reference: dict,
                                       target_lang, dm)
 
     units, texts = prepare_units(segments, translated_texts,
-                                 source_audio, video_duration)
+                                 source_audio, video_duration, target_lang)
 
     engine = tts_engines.get_engine(target_lang)
     natural_fn = None

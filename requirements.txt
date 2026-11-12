@@ -115,6 +115,33 @@ pypinyin>=0.49,<1
 
 
 # ============================================================
+# Alternative voice cloning — Fish Audio S2 Pro
+# ============================================================
+#
+# OPTIONAL. Fish Audio S2 Pro (extraplus/s2-pro) is a second cloning engine
+# that covers most of this project's targets — the eleven Indian languages and
+# the foreign ones — from a single model. Select it with
+# VIDEOTRANS_TTS_ENGINE=s2pro, or the "Voice engine" setting in the studio.
+#
+# Two pieces are needed and both are heavy, so neither is in the default
+# install:
+#
+#   1. the fish_speech package:
+#        pip install git+https://github.com/fishaudio/fish-speech.git
+#      It pins torch==2.8.0 and transformers==5.19.0. That conflicts with the
+#      torch 2.6 stack this project is built against, so install it with
+#      --no-deps and add its imports explicitly (hydra-core, einx,
+#      descript-audio-codec, kui, ormsgpack, resampy, ...). S2 Pro is off by
+#      default precisely so this trade is opt-in.
+#
+#   2. the ~11 GB of weights for extraplus/s2-pro, fetched from Settings or by
+#      scripts/download_models.py. Ungated on the Hub, but under the Fish Audio
+#      Research License: research and non-commercial use only.
+#
+# fish-speech
+
+
+# ============================================================
 # Test / development UI
 # ============================================================
 

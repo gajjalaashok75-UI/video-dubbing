@@ -102,6 +102,37 @@ CATALOG = {
              "warn": "Roughly double the synthesis time, which is already the slowest stage."},
         ],
     },
+    # Which voice model speaks. This is the switch behind the reported "add
+    # extraplus/s2-pro" request: S2 Pro covers most of this project's targets
+    # and is the preferred voice. `auto` (the default) uses it wherever it can
+    # speak the language and is installed, and otherwise falls back to the
+    # per-language house engine (IndicF5 for Indian languages, XTTS otherwise),
+    # so a fresh clone that never downloaded the 11 GB keeps working.
+    "voice": {
+        "label": "Voice engine",
+        "why": "Which cloning model speaks the dub. `auto` prefers Fish Audio S2 Pro wherever it is installed — it covers the eleven Indian languages and the foreign ones from one model — and falls back per language to IndicF5 or XTTS when it is not. Pin a specific engine to force it.",
+        "env": "VIDEOTRANS_TTS_ENGINE",
+        "default": "auto",
+        "options": [
+            {"id": "auto", "label": "Automatic (S2 Pro when installed)", "size": "-",
+             "note": "Uses S2 Pro wherever its package and weights are present, "
+                     "otherwise IndicF5 for Indian languages and XTTS for the "
+                     "rest. The default. Choosing this does not download "
+                     "anything; pick S2 Pro below to fetch its weights."},
+            {"id": "s2pro", "label": "Fish Audio S2 Pro", "size": "11 GB",
+             "repo": "extraplus/s2-pro",
+             "note": "Covers most Indian and foreign targets from one model, "
+                     "with zero-shot cloning. Needs the fish_speech package. "
+                     "Falls back to the house engine for Odia, which it cannot "
+                     "speak. Research / non-commercial licence."},
+            {"id": "indicf5", "label": "IndicF5 only", "size": "1.4 GB",
+             "repo": "ai4bharat/IndicF5",
+             "note": "The eleven Indian languages. Gated weights."},
+            {"id": "xtts", "label": "Coqui XTTS-v2 only", "size": "1.8 GB",
+             "warn": "Non-commercial licence and a large optional install. "
+                     "pip install \"TTS>=0.22.0\"."},
+        ],
+    },
 }
 
 def default_output_dir() -> str:
@@ -296,6 +327,14 @@ TUNABLES = {
                              "Audio is separated in chunks this long, which "
                              "bounds peak memory. Changing it re-runs Demucs.",
                              None),
+    # S2 Pro can be told how to deliver a line with inline tags. The tag is
+    # chosen from the source waveform, so a shouted line is shouted and a
+    # whispered one is whispered, instead of every line arriving at one level.
+    "S2PRO_PROSDY": (True, "bool", "Express emotion (S2 Pro)",
+                     "Read each line's loudness from the original audio and "
+                     "tell S2 Pro to match it, so loud lines stay loud and "
+                     "quiet ones stay quiet. Only applies to the S2 Pro voice "
+                     "engine; the others have no equivalent control.", "voice:s2pro"),
 }
 
 
@@ -344,7 +383,13 @@ def tunables_state() -> dict:
         relevant = True
         if applies and ":" in applies:
             stage, needle = applies.split(":", 1)
-            relevant = needle in str(current.get(stage, "")).lower()
+            chosen = str(current.get(stage, "")).lower()
+            # `auto` is not a model; it resolves to one per language. For the
+            # voice stage that resolution is what decides whether an S2 Pro
+            # knob applies, so ask the resolver rather than comparing strings.
+            if stage == "voice" and chosen in ("", "auto"):
+                chosen = needle if _s2pro_preferred() else ""
+            relevant = needle in chosen
         elif applies:
             relevant = applies in CATALOG
         rows[key] = {
@@ -353,6 +398,15 @@ def tunables_state() -> dict:
             "pinned": os.getenv(key) is not None,
         }
     return rows
+
+
+def _s2pro_preferred() -> bool:
+    """Whether `auto` would select S2 Pro right now, without importing it twice."""
+    try:
+        import languages as L
+        return L.engine_for("en") == L.ENGINE_S2PRO
+    except Exception:                                        # noqa: BLE001
+        return False
 
 
 def save_tunables(values: dict) -> dict:

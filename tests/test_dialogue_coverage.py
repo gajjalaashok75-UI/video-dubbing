@@ -79,5 +79,62 @@ class UncoveredSpeechTests(unittest.TestCase):
         self.assertEqual(out["uncovered_s"], 2.0)
 
 
+class MusicIsNotSpeechTests(unittest.TestCase):
+    """
+    A scored trailer must not report its score as dropped dialogue.
+
+    The energy gate reads a sustained music bed as speech. On the Aavesham
+    trailer it produced a single 25.4s "hole" spanning the whole run, and on the
+    two-male clip a 10.1s hole over the instrumental outro — both were the
+    music, and neither was a lost line. Passing the transcript's word timings in
+    makes the gate corroborate, which a music bed can never do.
+    """
+
+    def test_a_music_bed_with_no_words_is_not_reported(self):
+        # One long energy run over the outro, no words anywhere in it.
+        runs = [(0.0, 20.0)]
+        plan = [{"start": 0.0, "duration": 10.0}]
+        words = [[0.5, 9.8]]                      # the spoken half
+        out = speech_activity.uncovered_speech(runs, plan, words=words)
+        self.assertEqual(out["uncovered"], [])
+        # The score is not counted as source speech either: the 9.3s of word
+        # timings is padded by WORD_PAD at each end.
+        self.assertAlmostEqual(out["source_speech_s"], 9.54, places=2)
+
+    def test_real_dropped_dialogue_is_still_reported(self):
+        # The transcript has words at 12-16s and the plan covers none of them:
+        # this is a genuinely lost clause and must survive the mask.
+        runs = [(0.0, 16.0)]
+        plan = [{"start": 0.0, "duration": 10.0}]
+        words = [[0.5, 9.8], [12.0, 15.5]]
+        out = speech_activity.uncovered_speech(runs, plan, words=words)
+        self.assertEqual(len(out["uncovered"]), 1)
+        hole = out["uncovered"][0]
+        # 11.88-15.62 (padded) less the 0-10 covered plan: ~3.74s, not the raw
+        # 12-15.5, because each word is padded by WORD_PAD.
+        self.assertAlmostEqual(hole["gap_s"], 3.74, places=1)
+        self.assertLess(hole["start"], 12.0)
+
+    def test_a_sparse_transcript_does_not_mask_the_gate(self):
+        # A single word is not enough to trust as a mask; the old behaviour
+        # (report the energy runs) is kept rather than silently reporting zero.
+        runs = [(0.0, 5.0)]
+        out = speech_activity.uncovered_speech(runs, [], words=[[0.0, 0.2]])
+        self.assertEqual(out["uncovered_s"], 5.0)
+
+    def test_dict_word_form_is_accepted(self):
+        runs = [(0.0, 6.0)]
+        plan = [{"start": 0.0, "duration": 6.0}]
+        words = [{"start": 0.0, "end": 2.0}, {"start": 2.5, "end": 5.5}]
+        out = speech_activity.uncovered_speech(runs, plan, words=words)
+        self.assertEqual(out["uncovered"], [])
+
+    def test_words_without_a_mask_keep_the_old_result(self):
+        runs = [(0.0, 4.0)]
+        plan = [{"start": 0.0, "duration": 1.0}]
+        with_words = speech_activity.uncovered_speech(runs, plan, words=None)
+        self.assertEqual(with_words["uncovered_s"], 3.0)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -7,7 +7,16 @@ Drop-in replacement for speech_to_text.py with:
   - Automatic fallback to smaller models if large-v3 fails
 """
 
-import torch
+import re
+
+# torch is used here only to ask whether CUDA is present. It is a large import
+# that the pure-text helpers in this module do not need, and on a CPU-only host
+# it may not be installed at all, so a missing torch degrades to "CPU" instead
+# of failing the whole module at import time.
+try:
+    import torch
+except ImportError:                                          # pragma: no cover
+    torch = None
 
 # ---------------------------------------------------------------------------
 # Model selection
@@ -21,9 +30,13 @@ import engines
 MODEL_SIZE = engines.get("stt") or _DEFAULT_MODEL
 
 
+def _cuda_available() -> bool:
+    return bool(torch is not None and torch.cuda.is_available())
+
+
 def _get_compute_type():
     """Select optimal compute type for the available hardware."""
-    if torch.cuda.is_available():
+    if _cuda_available():
         return "float16"
     # MPS (Apple Silicon) — CTranslate2 doesn't support MPS natively,
     # but runs well on CPU with int8 quantization
@@ -32,7 +45,7 @@ def _get_compute_type():
 
 def _get_device():
     """Select device for faster-whisper."""
-    if torch.cuda.is_available():
+    if _cuda_available():
         return "cuda"
     # faster-whisper uses CTranslate2 which runs on CPU (not MPS)
     return "cpu"
@@ -334,6 +347,52 @@ def collapse_loops(text: str, min_repeats: int = 3, max_len: int = 6) -> str:
     return " ".join(words)
 
 
+# Whisper labels non-speech with bracketed cues - "[Music]", "[Applause]",
+# "(laughs)" - and marks singing with note glyphs. In a film trailer almost
+# every line of Whisper output carries one, and they were translated and then
+# SPOKEN: the dub narrated its own score ("[Music]") in every gap and read the
+# lyrics of the song. They are descriptions of the audio, not dialogue, so they
+# are dropped from the script before translation.
+# U+2669-U+266B are the quarter/eighth/beamed note glyphs Whisper emits around
+# sung lines. A line that is only notes carries no words at all.
+_MUSIC_NOTE = re.compile("[\u2669-\u266b\U0001d160-\U0001d167]")
+
+
+def strip_non_speech(text: str) -> str:
+    """
+    Remove Whisper's non-speech annotations, leaving only spoken words.
+
+    Deliberately conservative: only bracketed cues, the note glyphs and a small
+    closed set of stage directions are removed. Anything else is left alone, so
+    a line that genuinely contains the word "music" ("I love this music") keeps
+    it - the removal is anchored to a bracketed cue where one exists.
+    """
+    if not text:
+        return ""
+    out = _MUSIC_NOTE.sub(" ", text)
+    # A bracketed cue is removed outright; the bare stage directions are only
+    # removed when the WHOLE line is one, so ordinary prose is untouched.
+    out = re.sub(r"\[[^\]]{0,40}\]", " ", out)
+    out = re.sub(r"\((?:music|applause|laughter|laughs|laughing|sighs|"
+                 r"inaudible|silence|sound effects?)\)", " ", out,
+                 flags=re.IGNORECASE)
+    if re.fullmatch(r"\s*(?:music|applause|laughter|laughs|laughing|sighs|"
+                    r"inaudible|silence|sound effects?)\s*[.!]?\s*", out,
+                    flags=re.IGNORECASE):
+        return ""
+    return " ".join(out.split()).strip()
+
+
+def _is_sung_or_annotated(text: str) -> bool:
+    """Whether a whole line was music, not speech, and must not be dubbed."""
+    if not text:
+        return True
+    stripped = _MUSIC_NOTE.sub("", text)
+    stripped = re.sub(r"\[[^\]]{0,40}\]", "", stripped)
+    stripped = re.sub(r"\([^()]{0,40}\)", "", stripped)
+    return not stripped.strip()
+
+
 def _speech_in(audio_path: str, from_seconds: float) -> float:
     """Seconds of VAD-detected speech from `from_seconds` to the end."""
     try:
@@ -400,13 +459,23 @@ def transcribe_audio(audio_path: str, language: str = None) -> dict:
     all_text_parts = []
 
     for segment in segments:
-        all_text_parts.append(segment.text)
-
         text = segment.text.strip()
-        cleaned = collapse_loops(text)
-        if cleaned != text:
+        # Drop Whisper's non-speech annotations BEFORE anything downstream
+        # sees them. They are not dialogue; spoken aloud they make the dub
+        # narrate its own score. A line that is only music yields "" here and
+        # is skipped entirely, which is the right outcome for a trailer's
+        # instrumental passages.
+        spoken = strip_non_speech(text)
+        if not spoken:
+            if text:
+                print(f"[STT-v2] Dropped a non-speech line at "
+                      f"{segment.start:.1f}s: {text[:40]!r}")
+            continue
+        cleaned = collapse_loops(spoken)
+        if cleaned != spoken:
             print(f"[STT-v2] Collapsed a repetition loop at {segment.start:.1f}s: "
-                  f"{len(text.split())} -> {len(cleaned.split())} words")
+                  f"{len(spoken.split())} -> {len(cleaned.split())} words")
+        all_text_parts.append(cleaned)
         seg_data = {
             "start": segment.start,
             "end": segment.end,
@@ -454,9 +523,12 @@ def transcribe_audio(audio_path: str, language: str = None) -> dict:
                     continue
                 if segment.end - segment.start < MIN_RECOVERED_SEGMENT:
                     continue
-                all_text_parts.append(segment.text)
+                spoken = strip_non_speech(segment.text.strip())
+                if not spoken:
+                    continue
+                all_text_parts.append(spoken)
                 seg_data = {"start": segment.start, "end": segment.end,
-                            "text": segment.text.strip()}
+                            "text": spoken}
                 if segment.words:
                     seg_data["words"] = [
                         {"word": w.word.strip(), "start": w.start, "end": w.end,

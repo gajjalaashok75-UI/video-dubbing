@@ -726,6 +726,18 @@ def _majority(labels: list):
 # this function exists to remove.
 MIN_SPLIT_SECONDS = 0.30
 
+# How many speaker runs one Whisper segment may be split into before the
+# diarization is judged noise rather than a conversation.
+#
+# This used to be 4, checked BEFORE the short-run fold below. A genuine rapid
+# exchange — the two-male clip alternates five times inside one six-second
+# segment — therefore tripped the cap and the whole segment was returned
+# labelled with its majority speaker, so half the lines were spoken in the
+# wrong actor's voice. The cap is now a last resort that only fires after every
+# sub-backchannel run has been absorbed, and it is high enough that a real
+# back-and-forth (five or six turns) survives.
+MAX_SPLIT_GROUPS = 12
+
 
 def _split_at_changes(segment: dict) -> list:
     """
@@ -764,15 +776,11 @@ def _split_at_changes(segment: dict) -> list:
         else:
             groups.append({"speaker": word["speaker"], "words": [word]})
 
-    # More than a handful of changes inside one Whisper segment is a diarizer
-    # flip-flopping, not a conversation. Splitting there would shred a line
-    # into alternating one-word phrases spoken by different actors.
-    if len(groups) > 4:
-        return [_row(segment, segment.get("start"), segment.get("end"),
-                     segment.get("text"), segment.get("speaker"), words)]
-
     # Fold a too-short run into the neighbour it is closest to, so a cough in
-    # the middle of a line cannot become that speaker's one-word phrase.
+    # the middle of a line cannot become that speaker's one-word phrase. This
+    # runs BEFORE the group-count cap: a real back-and-forth whose turns are all
+    # long enough must not be discarded, and folding first is what makes the
+    # count below mean "turns", not "diarizer twitches".
     merged = []
     for group in groups:
         span = _span(group["words"])
@@ -783,6 +791,13 @@ def _split_at_changes(segment: dict) -> list:
     if len(merged) > 1 and _span(merged[0]["words"]) < MIN_SPLIT_SECONDS:
         merged[1]["words"] = merged[0]["words"] + merged[1]["words"]
         merged = merged[1:]
+
+    # Only now, with every sub-backchannel run absorbed, is a high group count
+    # evidence of a flip-flopping diarizer rather than a conversation. Bailing
+    # earlier is what collapsed the two-male clip to a single voice.
+    if len(merged) > MAX_SPLIT_GROUPS:
+        return [_row(segment, segment.get("start"), segment.get("end"),
+                     segment.get("text"), segment.get("speaker"), words)]
 
     if len(merged) < 2:
         return [_row(segment, segment.get("start"), segment.get("end"),
@@ -853,11 +868,103 @@ def assign_segments(segments: list, turns: list,
         label = label or last_known
         if label:
             last_known = label
-        out.append({"start": start, "end": end,
-                    "text": (seg.get("text") or "").strip(),
-                    "speaker": label,
-                    "words": seg.get("words")})
+        # No word timings to split on, but the segment may still straddle a
+        # speaker change: the two-male clip's six-second reply alternates
+        # SPEAKER_01/00 three times inside one segment, and the window-dominance
+        # rule handed the whole thing to SPEAKER_01, so half the lines came out
+        # in the wrong actor's voice. Split the span at the turn boundaries
+        # inside it and divide the text between them in proportion to how long
+        # each speaker actually holds. A single-speaker segment is returned
+        # unchanged, so the ordinary path is untouched.
+        pieces = _split_span_by_turns(seg, start, end, turns)
+        if len(pieces) > 1:
+            out.extend(pieces)
+        else:
+            out.append({"start": start, "end": end,
+                        "text": (seg.get("text") or "").strip(),
+                        "speaker": label,
+                        "words": seg.get("words")})
     return out
+
+
+def _split_span_by_turns(segment: dict, start: float, end: float,
+                         turns: list) -> list:
+    """
+    Split a word-less segment at the speaker changes inside it.
+
+    The text is divided between the runs in proportion to each run's duration,
+    the same weighted split `speech_activity` uses for detected pauses — we
+    cannot know which translated word belongs to which run, but keeping each
+    actor's share of the line in their own voice matters more than hitting the
+    exact word. Returns a single row when the segment sits under one speaker.
+    """
+    if end <= start:
+        return []
+    spans = []
+    for turn in turns:
+        try:
+            lo = max(start, float(turn.get("start", 0.0)))
+            hi = min(end, float(turn.get("end", 0.0)))
+        except (TypeError, ValueError):
+            continue
+        if hi - lo <= 0.05:
+            continue
+        speaker = str(turn.get("speaker"))
+        # Merge consecutive runs of the same speaker so a turn split in two by
+        # a stray other-speaker blip does not become two sub-segments.
+        if spans and spans[-1]["speaker"] == speaker:
+            spans[-1]["end"] = hi
+        else:
+            spans.append({"speaker": speaker, "start": lo, "end": hi})
+
+    # A run shorter than the split floor is a diarizer boundary wobble, not a
+    # line: pyannote often reports a 0.1s sliver of the previous speaker at the
+    # head of the next one's turn. Fold those away, and re-merge neighbours that
+    # end up on the same speaker, so a wobble cannot manufacture a split.
+    folded = []
+    for span in spans:
+        if folded and (span["end"] - span["start"]) < MIN_SPLIT_SECONDS:
+            folded[-1]["end"] = span["end"]
+        elif folded and folded[-1]["speaker"] == span["speaker"]:
+            folded[-1]["end"] = span["end"]
+        else:
+            folded.append(span)
+    if len(folded) > 1 and (folded[0]["end"] - folded[0]["start"]) < MIN_SPLIT_SECONDS:
+        folded[1]["start"] = folded[0]["start"]
+        folded = folded[1:]
+    spans = folded
+    if len(spans) < 2:
+        return []
+
+    # Two speakers active over the SAME span is an ambiguous overlap, not a
+    # turn-taking exchange. Splitting there would speak one line twice, in two
+    # voices, which is exactly the duplication the timeline must not produce.
+    # Only a strictly sequential back-and-forth is split.
+    for prev, cur in zip(spans, spans[1:]):
+        if cur["start"] < prev["end"] - 0.05:
+            return []
+
+    words = (segment.get("text") or "").split()
+    if len(words) < 2:
+        return []
+
+    weights = [s["end"] - s["start"] for s in spans]
+    try:
+        import speech_activity
+        chunks = speech_activity._split_text_by_weights(
+            segment.get("text") or "", weights)
+    except Exception:                                        # noqa: BLE001
+        return []
+
+    rows = []
+    for span, chunk in zip(spans, chunks):
+        text = (chunk or "").strip()
+        if not text:
+            continue
+        rows.append({"start": span["start"], "end": span["end"],
+                     "text": text, "speaker": span["speaker"],
+                     "words": segment.get("words")})
+    return rows if len(rows) > 1 else []
 
 
 def speaker_spans(segments: list) -> dict:

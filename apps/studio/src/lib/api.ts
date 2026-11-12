@@ -37,7 +37,12 @@ export interface VideoRecord {
 export interface Language {
   code: string;
   name: string;
+  /** The language's house engine. */
   engine: string;
+  /** The engine the current voice-engine setting will actually use. */
+  active_engine?: string;
+  /** Every engine that can speak this language, house engine first. */
+  engines?: string[];
   /** Whether an installed engine can speak this language right now. */
   available?: boolean;
   /** What to install or set to make it available, when it is not. */

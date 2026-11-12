@@ -161,6 +161,48 @@ class AssignmentTests(unittest.TestCase):
         out = SD.assign_segments(rows, turns)
         self.assertEqual(len(out), 1)
 
+    def test_rapid_alternation_inside_one_segment_is_split_not_collapsed(self):
+        # Regression: a genuine five-way back-and-forth inside one Whisper
+        # segment used to trip a "more than four groups" cap and come back
+        # labelled with its majority speaker, so half the lines were spoken in
+        # the wrong actor's voice. Reproduces the two-male demo exactly.
+        turns = [
+            turn(3.389, 6.157, "SPEAKER_01"),
+            turn(6.275, 7.152, "SPEAKER_00"),
+            turn(7.658, 8.553, "SPEAKER_01"),
+            turn(8.62, 9.245, "SPEAKER_00"),
+            turn(9.683, 10.595, "SPEAKER_01"),
+        ]
+        words = [word("what", 5.96, 6.19), word("if", 6.19, 6.42),
+                 word("they", 6.42, 6.66), word("dont", 6.66, 6.89),
+                 word("answer", 6.89, 7.12), word("then", 7.12, 7.35),
+                 word("you", 7.35, 7.58), word("dont", 7.58, 7.81),
+                 word("get", 7.81, 8.04), word("the", 8.04, 8.28),
+                 word("money", 8.28, 8.51), word("i", 8.51, 8.74),
+                 word("call", 8.74, 8.97), word("anyone", 8.97, 9.20),
+                 word("yeah", 9.20, 9.43), word("you", 9.43, 9.66),
+                 word("can", 9.66, 9.90), word("call", 9.90, 10.13),
+                 word("anyone", 10.13, 10.36)]
+        rows = [seg(5.96, 10.36, " ".join(w["word"] for w in words), words)]
+        out = SD.assign_segments(rows, turns)
+        # The whole exchange must not collapse onto SPEAKER_01.
+        self.assertGreater(len(out), 2)
+        self.assertEqual(len({s["speaker"] for s in out}), 2)
+        self.assertIn("SPEAKER_00", [s["speaker"] for s in out])
+
+    def test_a_flip_flopping_diarizer_beyond_the_cap_is_left_whole(self):
+        # Past MAX_SPLIT_GROUPS the diarization is noise, not a conversation;
+        # shredding the line would be worse than the majority label.
+        turns = []
+        for i in range(30):
+            turns.append(turn(i * 0.5, i * 0.5 + 0.5,
+                              "SPEAKER_00" if i % 2 == 0 else "SPEAKER_01"))
+        words = [word(f"w{i}", i * 0.5 + 0.05, i * 0.5 + 0.45)
+                 for i in range(30)]
+        rows = [seg(0.0, 15.0, " ".join(w["word"] for w in words), words)]
+        out = SD.assign_segments(rows, turns)
+        self.assertEqual(len(out), 1)
+
     def test_a_single_speaker_segment_is_not_split(self):
         turns = [turn(0.0, 4.0, "SPEAKER_00")]
         rows = [seg(0.0, 4.0, "one line",
@@ -205,6 +247,34 @@ class AssignmentTests(unittest.TestCase):
         out = SD.assign_segments(rows, turns)
         self.assertEqual([s["speaker"] for s in out],
                          ["SPEAKER_00", "SPEAKER_01"])
+
+    def test_wordless_segment_straddling_a_change_is_split(self):
+        # The two-male demo had no word timestamps at all, so the word-level
+        # split could not run and the whole six-second exchange was handed to
+        # its majority speaker. The word-less path must split it too.
+        turns = [turn(0.0, 4.0, "SPEAKER_00"), turn(4.0, 8.0, "SPEAKER_01"),
+                 turn(8.0, 12.0, "SPEAKER_00")]
+        rows = [seg(0.0, 12.0, "one two three four five six seven eight")]
+        out = SD.assign_segments(rows, turns)
+        self.assertEqual([s["speaker"] for s in out],
+                         ["SPEAKER_00", "SPEAKER_01", "SPEAKER_00"])
+        self.assertEqual(" ".join(s["text"] for s in out),
+                         "one two three four five six seven eight")
+
+    def test_a_wordless_overlap_is_not_split(self):
+        # Two speakers over the same span is ambiguity, not turn-taking.
+        turns = [turn(0.0, 2.0, "SPEAKER_00"), turn(0.0, 2.0, "SPEAKER_01")]
+        rows = [seg(0.0, 2.0, "who said this")]
+        out = SD.assign_segments(rows, turns)
+        self.assertEqual(len(out), 1)
+
+    def test_a_wordless_short_sliver_is_not_a_split(self):
+        # A 0.1s boundary wobble from pyannote is not a line.
+        turns = [turn(0.0, 3.0, "SPEAKER_00"), turn(3.0, 3.1, "SPEAKER_01"),
+                 turn(3.1, 6.0, "SPEAKER_00")]
+        rows = [seg(0.0, 6.0, "one two three four")]
+        out = SD.assign_segments(rows, turns)
+        self.assertEqual(len(out), 1)
 
     def test_zero_turns_returns_the_segments_untouched(self):
         rows = [seg(0.0, 1.0, "a")]

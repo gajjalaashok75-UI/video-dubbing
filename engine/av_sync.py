@@ -24,6 +24,21 @@ import json
 import os
 import subprocess
 
+# The mix sums already-normalised layers with `amix=normalize=0`, so nothing
+# stops a loud dialogue line landing on a loud score and overshooting full
+# scale. It did: three of five delivered clips measured at or above 0.0 dBFS
+# true peak (one at +0.1), which is audible clipping on every downbeat the two
+# layers coincide. Each layer is normalised to its own target with a true-peak
+# ceiling, but the SUM has no ceiling of its own, so one is applied here.
+#
+# 0.891 is -1.0 dBFS: the same ceiling `loudnorm`'s TP is asked for on the
+# dialogue, and the usual streaming target, so the delivered file is no louder
+# than the dialogue was promised to be. `level=0` disables alimiter's own
+# auto-level (it would otherwise re-normalise and undo the dialogue target),
+# and `latency=1` compensates the lookahead so the limiter adds no delay.
+TRUE_PEAK_LIMIT = 0.891
+LIMITER = f"alimiter=limit={TRUE_PEAK_LIMIT}:level=0:latency=1"
+
 
 def _ffprobe(args: list) -> dict:
     out = subprocess.run(
@@ -277,8 +292,10 @@ def mix_layers(dialogue_path: str, out_path: str, target: float = None,
         parts.append(f"{''.join(layers)}"
                      f"amix=inputs={len(layers)}:duration=first:normalize=0[mixed]")
 
-    # The single, authoritative length fix-up. See the docstring.
-    parts.append(f"[mixed]atrim=0:{target:.6f},"
+    # The single, authoritative length fix-up, plus the one ceiling that keeps
+    # the sum inside full scale. See TRUE_PEAK_LIMIT: the limiter is the only
+    # thing standing between two coincident loud layers and a clipped file.
+    parts.append(f"[mixed]atrim=0:{target:.6f},{LIMITER},"
                  f"apad=whole_dur={target:.6f}[out]")
 
     cmd = ["ffmpeg", "-y", "-nostats", "-loglevel", "error",
@@ -358,7 +375,8 @@ def mix_music(voice_path: str, music_path: str, out_path: str,
         f"atrim=0:{voice_len:.3f},"
         f"afade=t=out:st={fade_from:.3f}:d={fade:.3f},"
         f"aresample=24000[bed];"
-        f"[0:a][bed]amix=inputs=2:duration=first:normalize=0[out]"
+        f"[0:a][bed]amix=inputs=2:duration=first:normalize=0,"
+        f"{LIMITER}[out]"
     )
     cmd = [
         "ffmpeg", "-y", "-nostats", "-loglevel", "error",

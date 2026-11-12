@@ -363,7 +363,7 @@ def _measure_audio(path: str) -> dict:
         return {"error": str(e)[:200]}
 
 
-def _dialogue_coverage(input_path: str, plan: list) -> dict:
+def _dialogue_coverage(input_path: str, plan: list, segments: list = None) -> dict:
     """
     Where the source speaks but the dub is silent, measured against the plan.
 
@@ -371,18 +371,57 @@ def _dialogue_coverage(input_path: str, plan: list) -> dict:
     reads the source audio and hands it over. A failure here must never fail
     the render — the coverage number is a diagnostic, so an unreadable file or
     a missing librosa degrades to an error string in the log.
+
+    `input_path` should be the SEPARATED VOCALS when Demucs ran, not the mixed
+    original. The energy gate cannot tell a sustained music bed from a voice, so
+    measuring the mix reported music as speech: the two-male clip showed a
+    phantom 10s "dropped dialogue" hole over its instrumental outro and the
+    Aavesham trailer, which is scored throughout, reported a single 25s hole
+    across the whole run. Both were the score, not lost lines.
+
+    The vocals stem reduces that but does not remove it — a loud score leaks
+    through separation. `segments` (the transcript, with word timings) is passed
+    through so the gate must ALSO see a transcript word there, which is the one
+    thing a music bed never has.
     """
     try:
         import speech_activity
         runs = speech_activity.detect_speech_runs(input_path)
-        return speech_activity.uncovered_speech(runs, plan)
+        words = _transcript_words(segments)
+        return speech_activity.uncovered_speech(runs, plan, words=words)
     except Exception as e:                                   # noqa: BLE001
         return {"error": str(e)[:200]}
 
 
+def _transcript_words(segments: list) -> list:
+    """Every word timing in the transcript, as [[start, end], ...]."""
+    words = []
+    for seg in segments or []:
+        for w in (seg.get("words") or []):
+            if isinstance(w, dict):
+                words.append([w.get("start"), w.get("end")])
+            elif isinstance(w, (list, tuple)) and len(w) >= 2:
+                words.append([w[0], w[1]])
+    return words
+
+
+def _coverage_source(input_path: str, stems: dict) -> tuple:
+    """
+    Which track to measure speech coverage against, and whether it is isolated.
+
+    Returns `(path, isolated)`. The isolated vocals stem is the honest source:
+    the mix counts music as talking. Falls back to the original when separation
+    did not run, which keeps the number meaningful on a dialogue-only clip.
+    """
+    vocals = (stems or {}).get("vocals")
+    if vocals and os.path.exists(vocals):
+        return vocals, True
+    return input_path, False
+
+
 def _stage_source_vs_final(job_id: str, input_path: str, output_video_path: str,
                            dub_path: str, stems: dict, video_dur: float,
-                           plan: list = None) -> dict:
+                           plan: list = None, segments: list = None) -> dict:
     """
     Record what the source sounded like against what was delivered.
 
@@ -403,7 +442,10 @@ def _stage_source_vs_final(job_id: str, input_path: str, output_video_path: str,
         drift = None
         if source.get("duration_s") and final.get("duration_s"):
             drift = round(final["duration_s"] - source["duration_s"], 3)
-        coverage = _dialogue_coverage(input_path, plan)
+        coverage_path, coverage_isolated = _coverage_source(input_path, stems)
+        coverage = _dialogue_coverage(coverage_path, plan, segments)
+        coverage["measured_on"] = ("isolated_vocals" if coverage_isolated
+                                   else "mixed_original")
         if coverage.get("uncovered_s"):
             print(f"[APP] Job {job_id}: {coverage['uncovered_s']}s of original "
                   f"speech has no dubbed phrase over it: "
@@ -1127,7 +1169,7 @@ def process_video_task(job_id: str, input_path: str, original_language: str,
                     background_track=(os.path.basename(mixed) if mixed else None),
                     note="audio-only render")
                 _stage_source_vs_final(job_id, input_path, delivered, dub_path,
-                                       stems, video_dur, plan)
+                                       stems, video_dur, plan, segments)
                 _set(job_id, status="done", step="complete",
                      dub_path=delivered, filed_at=filed,
                      plan=plan, units_dir=units_dir,
@@ -1229,7 +1271,8 @@ def process_video_task(job_id: str, input_path: str, original_language: str,
                   if not mixed else
                   "the original background is preserved under the new dialogue"))
         coverage = _stage_source_vs_final(job_id, input_path, output_video_path,
-                                          dub_path, stems, video_dur, plan)
+                                          dub_path, stems, video_dur, plan,
+                                          segments)
         if coverage:
             _set(job_id, dialogue_coverage=coverage)
 
@@ -3356,6 +3399,14 @@ async def set_engine_settings(body: dict = Body(...)):
         raise HTTPException(status_code=500, detail=f"Could not save settings: {e}")
 
     applied, busy = [], any(j.get("status") == "processing" for j in jobs.values())
+    # `voice` selects the cloning engine, which is owned by tts_engines, so
+    # changing it must drop the warm engines the same way a step change does.
+    if "voice" in (body or {}):
+        try:
+            tts_engines.refresh()
+            applied.append("voice")
+        except Exception as e:                               # noqa: BLE001
+            print(f"[APP] Could not apply the voice engine change live: {e}")
     for stage, module in (("stt", speech_to_text_v2), ("mt", translation_v2),
                           ("lipsync", lip_sync), ("tts", tts_engines)):
         if stage not in (body or {}):
@@ -3456,6 +3507,11 @@ async def test_llm_settings():
 
 XTTS_HINT = ('Install the XTTS extra to speak this language: '
              'pip install "TTS>=0.22.0"')
+S2PRO_HINT = ('S2 Pro is selected as the voice engine but is not ready here. '
+              'Install its package (pip install '
+              'git+https://github.com/fishaudio/fish-speech.git) and download '
+              'the extraplus/s2-pro weights, or set the voice engine back to '
+              'Automatic in Settings.')
 GATED_HINT = ('Download the voice model first: its weights are gated. Accept '
               'the licence at https://huggingface.co/ai4bharat/IndicF5, put '
               'HF_TOKEN=hf_... in the .env file beside run.sh, then run '
@@ -3479,6 +3535,9 @@ def _require_speakable(target_language: str) -> None:
     if engine == L.ENGINE_INDICF5:
         detail = (f"{L.display_name(target_language)} is spoken by IndicF5, "
                   f"whose weights are not on this machine yet. {GATED_HINT}")
+    elif engine == L.ENGINE_S2PRO:
+        detail = (f"{L.display_name(target_language)} is set to be spoken by "
+                  f"S2 Pro, which is not ready here. {S2PRO_HINT}")
     else:
         detail = (f"{L.display_name(target_language)} is spoken by XTTS, "
                   f"which is not installed. {XTTS_HINT}. The Indian "
@@ -3498,10 +3557,15 @@ async def get_languages():
     rows = []
     for entry in L.supported_targets():
         row = dict(entry)
-        row["available"] = tts_engines.engine_available(entry.get("engine", ""))
+        active = entry.get("active_engine") or entry.get("engine", "")
+        row["available"] = tts_engines.engine_available(active)
         if not row["available"]:
-            row["needs"] = (GATED_HINT if entry.get("engine") == L.ENGINE_INDICF5
-                            else XTTS_HINT)
+            if active == L.ENGINE_S2PRO:
+                row["needs"] = S2PRO_HINT
+            elif entry.get("engine") == L.ENGINE_INDICF5:
+                row["needs"] = GATED_HINT
+            else:
+                row["needs"] = XTTS_HINT
         rows.append(row)
     return JSONResponse(rows)
 

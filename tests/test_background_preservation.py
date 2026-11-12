@@ -71,6 +71,23 @@ def band_energy(path: str, lo: float, hi: float, sr: int = SR) -> float:
     return float(spec[mask].sum() / mask.sum())
 
 
+def peak_abs(path: str) -> float:
+    """
+    The largest absolute sample, read back at full precision.
+
+    `volumedetect` reports a sample peak rounded to 0.1 dB, which is too coarse
+    to tell "just under the ceiling" from "clamped at full scale", and ffmpeg's
+    ebur128 true-peak meter over-reads badly on synthetic broadband noise (it
+    put +5 dBFS on a file whose samples never leave +/-1.0). Reading the samples
+    directly is exact and is what the assertions here actually mean.
+    """
+    import soundfile as sf
+    wave, _ = sf.read(path, dtype="float32")
+    if wave.ndim > 1:
+        wave = wave.mean(axis=1)
+    return float(np.max(np.abs(wave))) if wave.size else 0.0
+
+
 # ---------------------------------------------------------------------------
 # A fake demucs, so the wrapper can be driven for real
 # ---------------------------------------------------------------------------
@@ -945,6 +962,108 @@ class MixTests(unittest.TestCase):
                                  background_path=self.background)
         self.assertAlmostEqual(av_sync.duration(out), 4.0, places=3)
         # The background survives even when there is nothing to say.
+        self.assertGreater(band_energy(out, 60, 110), 1e3)
+
+
+class MixDoesNotClipTests(unittest.TestCase):
+    """
+    The delivered mix must stay inside full scale.
+
+    Every layer is normalised to its own target with a true-peak ceiling, but
+    the SUM had none: `amix=normalize=0` adds dialogue and score at their
+    normalised levels, and where a loud line lands on a loud downbeat the sum
+    overshoots. Three of five hosted clips measured at or above 0.0 dBFS true
+    peak, one at +0.1, which is audible clipping. A limiter after the mix is
+    the fix; these tests are what keeps it there.
+
+    The fixture is deliberately hot — both layers at -6 LUFS — so their sum
+    genuinely leaves full scale, and the first test proves that it does before
+    the others rely on it. The oracle is the largest absolute sample, read back
+    exactly: `volumedetect` rounds to 0.1 dB, which cannot separate "just under
+    the ceiling" from "clamped", and ebur128's true-peak meter over-reads on
+    synthetic broadband noise.
+    """
+
+    CEILING = av_sync.TRUE_PEAK_LIMIT
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="clip_test_")
+        rng = np.random.default_rng(11)
+        loud = lambda: np.clip(0.9 * rng.standard_normal(SR * 4), -1.0, 1.0)
+        self.dialogue = write_wav(os.path.join(self.tmp, "dialogue.wav"), loud())
+        self.background = write_wav(os.path.join(self.tmp, "background.wav"), loud())
+        self.music = write_wav(os.path.join(self.tmp, "music.wav"), loud())
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _unlimited_sum(self, out_path: str) -> str:
+        """
+        The same sum `mix_layers` builds, with the limiter left off.
+
+        Reproduces the defect on purpose: if this does not clip, the fixture is
+        too quiet to prove anything and the tests below would pass for the
+        wrong reason.
+        """
+        filters = (
+            "[0:a]loudnorm=I=-6.0:TP=-1.0:LRA=11,atrim=0:4[d];"
+            "[1:a]loudnorm=I=-6.0:TP=-2.0:LRA=11,atrim=0:4[b];"
+            "[d][b]amix=inputs=2:duration=first:normalize=0[m];"
+            "[m]atrim=0:4,apad=whole_dur=4[out]"
+        )
+        subprocess.run(
+            ["ffmpeg", "-y", "-nostats", "-loglevel", "error",
+             "-i", self.dialogue, "-i", self.background,
+             "-filter_complex", filters, "-map", "[out]",
+             "-acodec", "pcm_s16le", "-ar", str(SR), "-ac", "1", out_path],
+            check=True, capture_output=True)
+        return out_path
+
+    def test_the_fixture_really_clips_without_a_limiter(self):
+        # Guards the other tests: the two layers must overshoot when summed raw.
+        raw = self._unlimited_sum(os.path.join(self.tmp, "raw.wav"))
+        self.assertGreaterEqual(
+            peak_abs(raw), 1.0,
+            "the fixture does not clip unlimited, so it cannot prove the "
+            "limiter is doing anything")
+
+    def test_the_mix_stays_below_full_scale(self):
+        out = av_sync.mix_layers(self.dialogue, os.path.join(self.tmp, "m.wav"),
+                                 target=4.0, background_path=self.background,
+                                 dialogue_lufs=-6.0, background_lufs=-6.0)
+        self.assertLess(peak_abs(out), 1.0)
+
+    def test_the_mix_respects_the_true_peak_ceiling(self):
+        out = av_sync.mix_layers(self.dialogue, os.path.join(self.tmp, "m.wav"),
+                                 target=4.0, background_path=self.background,
+                                 dialogue_lufs=-6.0, background_lufs=-6.0)
+        # The limiter is asked for 0.891; allow the encoder's rounding a hair.
+        self.assertLessEqual(peak_abs(out), self.CEILING + 1e-3)
+
+    def test_the_mix_with_a_music_bed_stays_below_full_scale(self):
+        out = av_sync.mix_layers(self.dialogue, os.path.join(self.tmp, "m.wav"),
+                                 target=4.0, background_path=self.background,
+                                 music_path=self.music,
+                                 dialogue_lufs=-6.0, background_lufs=-6.0)
+        self.assertLess(peak_abs(out), 1.0)
+
+    def test_mix_music_stays_below_full_scale(self):
+        out = av_sync.mix_music(self.dialogue, self.music,
+                                os.path.join(self.tmp, "mm.wav"))
+        self.assertLessEqual(peak_abs(out), self.CEILING + 1e-3)
+
+    def test_the_limiter_does_not_delay_the_dialogue(self):
+        # `latency=1` compensates the lookahead; without it the limiter shifts
+        # the whole track by its delay and the dub drifts out of sync.
+        out = av_sync.mix_layers(self.dialogue, os.path.join(self.tmp, "m.wav"),
+                                 target=4.0, background_path=self.background)
+        self.assertAlmostEqual(av_sync.duration(out), 4.0, places=3)
+
+    def test_the_mix_still_carries_both_layers(self):
+        # The limiter must not silence a layer to keep the peak down.
+        out = av_sync.mix_layers(self.dialogue, os.path.join(self.tmp, "m.wav"),
+                                 target=4.0, background_path=self.background,
+                                 dialogue_lufs=-6.0, background_lufs=-6.0)
         self.assertGreater(band_energy(out, 60, 110), 1e3)
 
 

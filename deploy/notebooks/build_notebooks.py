@@ -749,6 +749,99 @@ else:
 
 
 # ============================================================
+# Optional extra: Fish Audio S2 Pro voice engine
+# ============================================================
+#
+# S2 Pro is a second cloning engine, selected with
+# VIDEOTRANS_TTS_ENGINE=s2pro. It is a big optional extra: the fish_speech
+# package pins torch==2.8.0 and transformers==5.19.0, which would replace the
+# CUDA-12 torch 2.6 stack and break CTranslate2 (the same libcublas.so.12
+# failure the install cell already guards against). So it is installed with
+# --no-deps and its import chain named explicitly, exactly like Demucs.
+#
+# The ~11 GB of weights are NOT fetched here - they are a separate opt-in
+# download, because most people do not want them. Fetch them from the studio's
+# Settings, or by adding extraplus/s2-pro to scripts/download_models.py.
+#
+# Comment this block out to skip S2 Pro entirely.
+
+print()
+print("=" * 70)
+print("INSTALLING OPTIONAL EXTRA (FISH AUDIO S2 PRO VOICE ENGINE)")
+print("=" * 70)
+
+S2PRO_DEPS = [
+    "hydra-core",
+    "einx",
+    "einops",
+    "descript-audio-codec",
+    "kui",
+    "ormsgpack",
+    "resampy",
+    "natsort",
+    "loguru",
+    "pyrootutils",
+    "opencc-python-reimplemented",
+    "silero-vad",
+    "cachetools",
+    "modelscope",
+    "pyaudio",
+]
+
+s2pro_pkg = subprocess.run(
+    [
+        sys.executable,
+        "-m",
+        "pip",
+        "install",
+        "--no-cache-dir",
+        "--no-deps",
+        "git+https://github.com/fishaudio/fish-speech.git",
+    ],
+    text=True,
+    capture_output=True,
+)
+
+if s2pro_pkg.returncode == 0:
+    print("ok   fish_speech installed")
+    print("     installing the modules it imports, also with --no-deps:")
+    s2pro_deps = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            "--no-cache-dir",
+            "--no-deps",
+            *S2PRO_DEPS,
+        ],
+        text=True,
+        capture_output=True,
+    )
+    if s2pro_deps.returncode != 0:
+        print("--   some fish_speech dependencies did not install")
+        for line in (s2pro_deps.stderr or s2pro_deps.stdout or "").strip().splitlines()[-3:]:
+            print("       ", line)
+else:
+    print("--   fish_speech did not install; S2 Pro will be unavailable")
+    for line in (s2pro_pkg.stderr or s2pro_pkg.stdout or "").strip().splitlines()[-3:]:
+        print("       ", line)
+
+# As with Demucs, only a real import proves it works.
+s2pro_ready = subprocess.run(
+    [sys.executable, "-c", "import fish_speech; print('ok')"],
+    text=True,
+    capture_output=True,
+)
+if s2pro_ready.returncode == 0:
+    print("ok   fish_speech imports (S2 Pro is selectable once its weights are downloaded)")
+else:
+    print("--   fish_speech is installed but cannot import; S2 Pro is unavailable")
+    for line in (s2pro_ready.stderr or s2pro_ready.stdout or "").strip().splitlines()[-3:]:
+        print("       ", line)
+
+
+# ============================================================
 # Restore the pins a dependency can move
 # ============================================================
 #
@@ -1545,6 +1638,8 @@ TROUBLE = md("""
 | A model says MISSING after it downloaded | The download was interrupted. Re-run the model cell. |
 | `WARNING: ... was skipped (gated, no HF_TOKEN)` | Expected without a token. Indian languages are unavailable; everything else works. |
 | A language is refused when you press Render | That language's voice model is not installed. The language list says which and why. Indian languages need `HF_TOKEN`; the others need `pip install "TTS>=0.22.0"`. |
+| S2 Pro is refused even though it installed | Its ~11 GB weights are a separate download. Fetch `extraplus/s2-pro` from Settings, or set the voice engine back to *Automatic*. |
+| S2 Pro renders sound wrong after installing it | `fish_speech` pins `torch==2.8`; installing it without `--no-deps` replaces the CUDA-12 torch 2.6 build and breaks CTranslate2 with `libcublas.so.12`. Re-run the install cell, which installs it `--no-deps`. |
 | `401`/`403` when fetching models | The gated voice model needs a token. Accept the licence at <https://huggingface.co/ai4bharat/IndicF5>, set `HF_TOKEN`, re-run the token and model cells. |
 | Renders are still slow | Confirm the GPU line in cell 2. A CPU render is correct, just slow. |
 | Out of memory on a small GPU | Use a smaller Whisper: `os.environ["WHISPER_MODEL"] = "medium"` before starting the server. |

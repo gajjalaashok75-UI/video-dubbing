@@ -90,10 +90,14 @@ def _target_choices():
     """
     indic, other = [], []
     for entry in L.supported_targets():
+        # The badge names the engine that will actually speak, which is the
+        # house engine under `auto` and S2 Pro when it is pinned.
+        active = entry.get("active_engine") or entry["engine"]
         if entry["engine"] == L.ENGINE_INDICF5:
             indic.append((f"{entry['name']} ({entry['code']})", entry["code"]))
         else:
-            other.append((f"{entry['name']} ({entry['code']}) · XTTS",
+            badge = "S2 Pro" if active == L.ENGINE_S2PRO else "XTTS"
+            other.append((f"{entry['name']} ({entry['code']}) · {badge}",
                           entry["code"]))
     return indic + other
 

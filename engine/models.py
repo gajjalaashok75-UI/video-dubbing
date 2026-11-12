@@ -78,6 +78,19 @@ MODELS = [
              "Optional",
          size="27 MB", required=False,
          files=("config.yaml", "pytorch_model.bin")),
+    # Optional: an alternative voice-cloning engine. Fish Audio S2 Pro covers
+    # most of the targets this project offers — Indic and foreign alike — so a
+    # deployment can pin it with VIDEOTRANS_TTS_ENGINE=s2pro. Not `required`:
+    # IndicF5 is the default voice and this is a ~11 GB alternative. Ungated on
+    # the Hub, but under the Fish Audio Research License (non-commercial).
+    dict(label="Voice cloning (S2 Pro)", id="extraplus/s2-pro",
+         why="An alternative cloning engine for VIDEOTRANS_TTS_ENGINE=s2pro. "
+             "Needs the fish_speech package; research/non-commercial only",
+         size="11 GB", required=False,
+         files=("config.json", "codec.pth", "model.safetensors.index.json",
+                "model-00001-of-00002.safetensors",
+                "model-00002-of-00002.safetensors",
+                "tokenizer.json", "chat_template.jinja")),
 ]
 
 # The Wav2Lip weights are not a Hub snapshot repo, and they are too large to
@@ -497,6 +510,16 @@ def run(ids: list[str] | None = None) -> bool:
             print(f"[MODELS] Download failed: {exc}")
         finally:
             _set(running=False, finished=True)
+            # The voice engines cache "is this installed?" per process, and
+            # whether a model is present is half of that answer. Without this
+            # the studio kept refusing a language after its weights landed,
+            # until the server was restarted. Local import: tts_engines reads
+            # this module, so a top-level one would be circular.
+            try:
+                import tts_engines
+                tts_engines.refresh()
+            except Exception:                                # noqa: BLE001
+                pass
 
     threading.Thread(target=work, daemon=True).start()
     return True

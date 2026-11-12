@@ -636,11 +636,218 @@ class XTTSEngine:
 
 
 # ---------------------------------------------------------------------------
+# Fish Audio S2 Pro (extraplus/s2-pro)
+# ---------------------------------------------------------------------------
+class S2ProEngine:
+    """
+    Warm wrapper around Fish Audio S2 Pro, via the `fish_speech` package.
+
+    S2 Pro is a Fish Speech model (the `fish_qwen3_omni` architecture) with
+    zero-shot cloning from a reference clip and its transcript, the same
+    interface IndicF5 exposes — so it slots into `synth_unit` unchanged. It
+    covers most of this project's targets, Indic and foreign alike.
+
+    Unlike IndicF5 it is not an f5_tts flow-matching model: there is no
+    `nfe_step` and no `fix_duration`, so `synth_unit` takes the non-IndicF5
+    branch and lets the timeline absorb the model's own pace, exactly as it
+    does for XTTS.
+
+    Weights are `extraplus/s2-pro` on the Hub (ungated, but under the Fish
+    Audio Research License — research and non-commercial use). `fish_speech`
+    is an optional extra: a default install does not carry it and this engine
+    reports itself unavailable rather than failing a render several minutes in.
+    """
+
+    REPO_ID = "extraplus/s2-pro"
+    # The DAC codec in this checkpoint runs at 44.1 kHz.
+    SAMPLE_RATE = 44100
+    MODEL_FAMILY = "s2"
+
+    def __init__(self, seed: int = None):
+        self._engine = None
+        self._lock = threading.Lock()
+        self._ref_cache = {}
+        self.device = None
+        env_seed = os.getenv("S2PRO_SEED", "1234")
+        self.seed = (int(seed) if seed is not None
+                     else (int(env_seed) if env_seed.strip() else None))
+
+    # -- loading ------------------------------------------------------------
+    def load(self):
+        if self._engine is not None:
+            return self._engine
+        with self._lock:
+            if self._engine is not None:
+                return self._engine
+
+            # Resolve the package BEFORE anything expensive. A missing
+            # fish_speech used to be discovered after a ~11 GB snapshot
+            # download and a torch import, which is a long wait for a failure
+            # that a spec check answers instantly.
+            try:
+                from fish_speech.inference_engine import TTSInferenceEngine
+                from fish_speech.models.dac.inference import (
+                    load_model as load_decoder_model,
+                )
+                from fish_speech.models.text2semantic.inference import (
+                    launch_thread_safe_queue,
+                )
+            except Exception as e:                            # noqa: BLE001
+                raise SynthesisError(
+                    f"fish_speech is not installed, so S2 Pro cannot speak. "
+                    f"Install it with `pip install "
+                    f"git+https://github.com/fishaudio/fish-speech.git`. ({e})"
+                ) from e
+
+            import torch
+            _ensure_mps_fallback()
+            self.device = _pick_device()
+            checkpoint = _s2pro_checkpoint_dir()
+            # bfloat16 is the upstream server's default (`--half` opts into
+            # fp16). It is the safer of the two across Ampere and older cards,
+            # and the model card's own examples run it this way.
+            precision = torch.bfloat16
+            print(f"[S2Pro] Loading {self.REPO_ID} on {self.device}...")
+
+            llama_queue = launch_thread_safe_queue(
+                checkpoint_path=checkpoint,
+                device=self.device,
+                precision=precision,
+                compile=False,
+            )
+            # `resolve_codec_path` also finds the sibling s2-pro/codec.pth when
+            # the checkpoint directory does not carry one, which is the case for
+            # fine-tuned copies of this model.
+            try:
+                from fish_speech.models.text2semantic.inference import (
+                    resolve_codec_path,
+                )
+                codec_path = str(resolve_codec_path(checkpoint))
+            except Exception:                                    # noqa: BLE001
+                codec_path = os.path.join(checkpoint, "codec.pth")
+            decoder = load_decoder_model(
+                config_name="modded_dac_vq",
+                checkpoint_path=codec_path,
+                device=self.device,
+            )
+            self._engine = TTSInferenceEngine(
+                llama_queue=llama_queue,
+                decoder_model=decoder,
+                precision=precision,
+                compile=False,
+                model_family=self.MODEL_FAMILY,
+            )
+            print(f"[S2Pro] Ready on {self.device}")
+            return self._engine
+
+    # -- reference handling -------------------------------------------------
+    def _reference(self, ref_path: str, ref_text: str):
+        """
+        Read the reference clip once per job and cache its bytes.
+
+        S2 Pro takes the reference audio inline in the request, so the bytes are
+        what get cached rather than a decoded tensor. Cached because a
+        thirty-segment video would otherwise re-read the same file thirty times.
+        """
+        key = (ref_path, os.path.getmtime(ref_path))
+        if key in self._ref_cache:
+            return self._ref_cache[key]
+        with open(ref_path, "rb") as f:
+            audio = f.read()
+        self._ref_cache.clear()          # only ever one reference per job
+        self._ref_cache[key] = (audio, ref_text or "")
+        return audio, ref_text or ""
+
+    # -- synthesis ----------------------------------------------------------
+    def natural_duration(self, text: str, ref_path: str = None,
+                         ref_text: str = None, lang: str = "en",
+                         source_lang: str = None) -> float:
+        """
+        Estimated spoken length, so the planner treats S2 Pro like the others.
+
+        S2 Pro has no `fix_duration`; it speaks at its own pace and the timeline
+        absorbs the difference, so this is the generic characters-per-second
+        model — the same fallback XTTS uses.
+        """
+        try:
+            cps = L.chars_per_second(lang)
+        except Exception:
+            cps = 14.0
+        return max(0.2, len((text or "").strip()) / cps)
+
+    def synthesize(self, text: str, ref_path: str, ref_text: str = "",
+                   lang: str = "en", speed: float = 1.0, prosody: str = ""):
+        text = (text or "").strip()
+        if not text:
+            return np.zeros(0, dtype=np.float32), self.SAMPLE_RATE
+
+        # S2 Pro reads inline control tags ("[loud]", "[low volume]", ...) as
+        # free-form delivery instructions. The tag is prepended rather than
+        # spliced into the line so it always governs the whole phrase; an empty
+        # tag leaves the text exactly as the others would speak it.
+        tag = (prosody or "").strip()
+        if tag:
+            text = f"{tag} {text}"
+
+        engine = self.load()
+        from fish_speech.utils.schema import ServeReferenceAudio, ServeTTSRequest
+
+        audio, transcript = self._reference(ref_path, ref_text)
+        req = ServeTTSRequest(
+            text=text,
+            references=[ServeReferenceAudio(audio=audio, text=transcript)],
+            format="wav",
+            seed=self.seed,
+            # The reference is the same speaker clip for every phrase in a job,
+            # so let the engine keep its encoded prompt tokens instead of
+            # re-encoding ~10s of audio on each of a hundred units.
+            use_memory_cache="on",
+        )
+
+        try:
+            result = None
+            for chunk in engine.inference(req):
+                if chunk.code == "error":
+                    raise SynthesisError(
+                        f"S2 Pro synthesis failed: {chunk.error}")
+                if chunk.code == "final":
+                    result = chunk
+            if result is None or result.audio is None:
+                raise SynthesisError("S2 Pro returned no audio")
+            sr, wave = result.audio
+        except SynthesisError:
+            raise
+        except Exception as e:                                # noqa: BLE001
+            raise SynthesisError(f"S2 Pro synthesis failed: {e}") from e
+
+        # The codec decodes to float32 in [-1, 1], which is the range the rest
+        # of the pipeline works in. Normalise defensively in case a future
+        # codec hands back int16 PCM instead.
+        arr = np.asarray(wave)
+        if arr.dtype == np.int16:
+            arr = arr.astype(np.float32) / 32768.0
+        else:
+            arr = arr.astype(np.float32)
+        return arr.reshape(-1), int(sr)
+
+
+def _s2pro_checkpoint_dir() -> str:
+    """
+    The local snapshot directory for extraplus/s2-pro, fetched if absent.
+
+    `from_pretrained` wants a directory, not a repo id, so the snapshot is
+    resolved here. `local_files_only` is not set: an un-downloaded model
+    fetches on first use, which is the behaviour the settings page promises.
+    """
+    from huggingface_hub import snapshot_download
+    return snapshot_download(S2ProEngine.REPO_ID)
+
+
+# ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
 _ENGINES = {}
 _REG_LOCK = threading.Lock()
-
 
 _AVAILABLE: dict = {}
 
@@ -677,6 +884,31 @@ def _indicf5_present() -> bool:
     return True
 
 
+def _s2pro_present() -> bool:
+    """
+    Whether S2 Pro can actually be run here: package installed and weights present.
+
+    Two separate conditions, and both must hold. `fish_speech` is an optional
+    extra a default install does not carry; the ~11 GB of weights are a
+    separate download. Advertising S2 Pro when either is missing is the same
+    failure this file already fixed for XTTS and IndicF5.
+    """
+    try:
+        import importlib.util
+        if importlib.util.find_spec("fish_speech") is None:
+            return False
+    except Exception:                                        # noqa: BLE001
+        return False
+    try:
+        import models
+    except ImportError:
+        return True
+    for entry in models.MODELS:
+        if entry["id"] == S2ProEngine.REPO_ID:
+            return models.is_cached(entry["id"], entry["files"])
+    return True
+
+
 def engine_available(name: str) -> bool:
     """
     Whether the model behind an engine is actually usable here.
@@ -686,7 +918,8 @@ def engine_available(name: str) -> bool:
     this check the app offered sixteen languages it could not speak, and the
     failure arrived as a ModuleNotFoundError deep in a render the person had
     already waited several minutes for. IndicF5 is the mirror image: the
-    package is always present, but its gated weights may not be.
+    package is always present, but its gated weights may not be. S2 Pro needs
+    both the `fish_speech` package and its own weights.
     """
     if name in _AVAILABLE:
         return _AVAILABLE[name]
@@ -699,6 +932,8 @@ def engine_available(name: str) -> bool:
             ok = False
     elif name == L.ENGINE_INDICF5:
         ok = _indicf5_present()
+    elif name == L.ENGINE_S2PRO:
+        ok = _s2pro_present()
     _AVAILABLE[name] = ok
     return ok
 
@@ -713,7 +948,12 @@ def get_engine(target_lang: str):
     name = L.engine_for(target_lang)
     with _REG_LOCK:
         if name not in _ENGINES:
-            _ENGINES[name] = IndicF5Engine() if name == L.ENGINE_INDICF5 else XTTSEngine()
+            if name == L.ENGINE_INDICF5:
+                _ENGINES[name] = IndicF5Engine()
+            elif name == L.ENGINE_S2PRO:
+                _ENGINES[name] = S2ProEngine()
+            else:
+                _ENGINES[name] = XTTSEngine()
         return _ENGINES[name]
 
 

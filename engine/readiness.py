@@ -543,6 +543,38 @@ def feature_xtts(target_language: str = None) -> dict:
     return entry
 
 
+def feature_s2pro(target_language: str = None) -> dict:
+    """
+    The alternative voice engine (Fish Audio S2 Pro). Optional.
+
+    Two independent conditions: the `fish_speech` package, and the ~11 GB of
+    weights. Either missing leaves the engine unusable, and the reason says
+    which — the same split that keeps the IndicF5 and XTTS checks honest.
+    """
+    entry = {"status": OPTIONAL_MISSING, "tier": OPTIONAL, "engine": "s2pro",
+             "reason": None, "fallback": None}
+    if not _has_module("fish_speech"):
+        entry["reason"] = (
+            "The fish_speech package is not installed, so S2 Pro cannot speak. "
+            "Install it with: pip install "
+            "git+https://github.com/fishaudio/fish-speech.git")
+        return entry
+    try:
+        import tts_engines
+        if not tts_engines._s2pro_present():
+            entry["reason"] = (
+                "The extraplus/s2-pro weights are not on this machine yet. "
+                "Download them from Settings, or run "
+                "scripts/download_models.py. Note the Fish Audio Research "
+                "License is research / non-commercial only.")
+            return entry
+    except Exception as e:                                   # noqa: BLE001
+        entry["reason"] = f"Could not check the S2 Pro weights ({e})."
+        return entry
+    entry["status"] = READY
+    return entry
+
+
 def feature_asr() -> dict:
     """faster-whisper and its weights."""
     entry = {"status": BLOCKED, "tier": CORE, "reason": None,
@@ -649,6 +681,9 @@ def feature_language(target_language: str = None) -> dict:
     if engine == L.ENGINE_INDICF5:
         entry["status"] = feature_indicf5(target_language=code)["status"]
         entry["reason"] = feature_indicf5(target_language=code)["reason"]
+    elif engine == L.ENGINE_S2PRO:
+        entry["status"] = feature_s2pro(target_language=code)["status"]
+        entry["reason"] = feature_s2pro(target_language=code)["reason"]
     else:
         xtts = feature_xtts(code)
         entry["status"] = xtts["status"]
@@ -695,6 +730,7 @@ def snapshot(target_language: str = None, source_language: str = None) -> dict:
         "translation": feature_translation(),
         "indicf5": feature_indicf5(token["present"], target_language),
         "xtts": feature_xtts(target_language),
+        "s2pro": feature_s2pro(target_language),
         "diarization": feature_diarization(token["present"]),
         "background_preservation": feature_background(token["present"]),
         "lipsync": feature_lipsync(),

@@ -268,7 +268,71 @@ def build_phrase_units(segments: list, translated: list, speech_runs: list,
     return units
 
 
-def uncovered_speech(runs: list, plan: list, min_hole: float = 0.5) -> dict:
+# Whisper's word timings are interpolated and clip syllables; pad before use.
+WORD_PAD = 0.12
+# Ordinary inter-word gap; close anything shorter so a phrase is one interval.
+WORD_MERGE_GAP = 0.30
+# Below this many seconds of word timings the transcript is not dense enough to
+# be trusted as a mask, and the energy gate is used on its own (the old
+# behaviour). A clip that genuinely has no transcript keeps its report.
+MIN_WORD_SECONDS = 1.0
+
+
+def _spoken_intervals(words: list, pad: float = WORD_PAD,
+                      merge_gap: float = WORD_MERGE_GAP) -> list:
+    """
+    Union of the word timings, padded and merged, as [(start, end), ...].
+
+    Whisper's word timings are interpolated and can clip a syllable, so each is
+    padded before merging rather than used as-is; the merge then closes the
+    ordinary inter-word gaps so a phrase reads as one interval rather than a
+    picket fence.
+    """
+    spans = []
+    for w in words or []:
+        # Whisper's segment output nests words as {"word","start","end"}; the
+        # plain pair form is what the coverage helper is tested with. Accept
+        # both so the caller does not have to reshape the transcript.
+        if isinstance(w, dict):
+            a, b = w.get("start"), w.get("end")
+        else:
+            try:
+                a, b = w[0], w[1]
+            except (TypeError, IndexError):
+                continue
+        try:
+            a, b = float(a), float(b)
+        except (TypeError, ValueError):
+            continue
+        if b < a:
+            a, b = b, a
+        spans.append([max(0.0, a - pad), b + pad])
+    if not spans:
+        return []
+    spans.sort()
+    merged = [spans[0]]
+    for a, b in spans[1:]:
+        if a - merged[-1][1] <= merge_gap:
+            merged[-1][1] = max(merged[-1][1], b)
+        else:
+            merged.append([a, b])
+    return [(a, b) for a, b in merged]
+
+
+def _intersect_runs(runs: list, spoken: list) -> list:
+    """The parts of `runs` that lie inside `spoken`, as [(start, end), ...]."""
+    out = []
+    for a, b in runs:
+        for c, d in spoken:
+            lo, hi = max(a, c), min(b, d)
+            if hi > lo:
+                out.append((lo, hi))
+    out.sort()
+    return out
+
+
+def uncovered_speech(runs: list, plan: list, min_hole: float = 0.5,
+                     words: list = None) -> dict:
     """
     Where the source speaks but no dubbed phrase was placed.
 
@@ -281,6 +345,16 @@ def uncovered_speech(runs: list, plan: list, min_hole: float = 0.5) -> dict:
 
     A hole shorter than `min_hole` is normal breath between lines, not a dropped
     clause, so it is not named — naming those would drown the signal.
+
+    `words` is the transcript's word timings, as `[[start, end], ...]` or the
+    `{"start","end"}` dicts Whisper emits. When given, a run is only counted as
+    speech where the transcript actually has words: a sustained music bed sits
+    well above the energy gate and used to be reported as speech, so a scored
+    trailer showed one 25s "dropped dialogue" hole that was really the score.
+    Requiring both signals removes that false alarm while keeping the real one —
+    dropped dialogue is speech the transcript knows about and the plan does not
+    cover. A transcript too sparse to be trusted is ignored, so the previous
+    behaviour is preserved for a clip with no words.
 
     Pure, so it is testable without librosa or a rendered dub.
     """
@@ -295,15 +369,19 @@ def uncovered_speech(runs: list, plan: list, min_hole: float = 0.5) -> dict:
             total += max(0.0, min(b, e) - max(a, s))
         return total
 
+    spoken = _spoken_intervals(words)
+    masked = bool(spoken) and sum(b - a for a, b in spoken) >= MIN_WORD_SECONDS
+    measured = _intersect_runs(runs, spoken) if masked else list(runs)
+
     uncovered = []
-    for a, b in runs:
+    for a, b in measured:
         gap = (b - a) - covered_seconds(a, b)
         if gap >= min_hole:
             uncovered.append({"start": round(a, 2), "end": round(b, 2),
                               "gap_s": round(gap, 2)})
 
     return {
-        "source_speech_s": round(sum(b - a for a, b in runs), 2),
+        "source_speech_s": round(sum(b - a for a, b in measured), 2),
         "dubbed_s": round(sum(e - s for s, e in covered), 2),
         "uncovered_s": round(sum(u["gap_s"] for u in uncovered), 2),
         "uncovered": uncovered,
@@ -315,3 +393,86 @@ def summarize(units: list, segments: list, total_duration: float) -> str:
     return (f"[VAD] {len(segments)} segments -> {len(units)} phrase units; "
             f"{speech:.2f}s speech, {total_duration - speech:.2f}s pause "
             f"({100 * (total_duration - speech) / max(total_duration, 0.01):.1f}%)")
+
+
+# ---------------------------------------------------------------------------
+# Prosody: how loudly each line is delivered, relative to the rest of the clip
+# ---------------------------------------------------------------------------
+# S2 Pro takes free-form inline control tags ("[loud]", "[low volume]", ...),
+# and a trailer's whole character is the contrast between a whispered line and
+# a shouted one. The tags are only worth emitting when they are measured rather
+# than guessed, so the level is read from the source waveform and compared with
+# the clip's own median speech level: a line is "loud" when it is loud for THIS
+# speaker in THIS clip, which is the comparison a listener actually makes.
+
+# How far above/below the clip's median speech a line must sit to be tagged.
+LOUD_DB = 4.0
+QUIET_DB = -5.0
+
+
+def speech_levels(audio_path: str, spans: list) -> list:
+    """
+    Median speech level in dBFS for each (start, end) span, or None for a span.
+
+    One load of the file and one RMS envelope, then a slice per span: measuring
+    each line separately would decode the whole file once per line. Spans with
+    no audible speech return None rather than a floor, so they are never tagged.
+    """
+    import librosa
+
+    y, sr = librosa.load(audio_path, sr=16000)
+    if y.size == 0:
+        return [None] * len(spans)
+
+    hop = max(1, int(sr * HOP_SECONDS))
+    rms = librosa.feature.rms(y=y, frame_length=hop * 2, hop_length=hop)[0]
+    if rms.max() <= 0:
+        return [None] * len(spans)
+    db = librosa.amplitude_to_db(rms, ref=1.0)
+    # Frames that are effectively digital silence carry no level information.
+    floor = float(np.percentile(db, 5))
+    peak = float(db.max())
+    voiced_cut = max(floor, peak - 40.0)
+
+    levels = []
+    for span in spans:
+        try:
+            a, b = float(span[0]), float(span[1])
+        except (TypeError, ValueError):
+            levels.append(None)
+            continue
+        i0 = max(0, int(a / HOP_SECONDS))
+        i1 = min(len(db), max(i0 + 1, int(b / HOP_SECONDS)))
+        window = db[i0:i1]
+        window = window[window > voiced_cut]
+        levels.append(float(np.median(window)) if window.size else None)
+    return levels
+
+
+def prosody_tags(levels: list, loud_db: float = LOUD_DB,
+                 quiet_db: float = QUIET_DB) -> list:
+    """
+    Turn measured levels into S2 Pro control tags, one per span.
+
+    "" means "say it normally" and is the right answer for the median line; only
+    a clear deviation earns a tag. The median is taken over the non-None levels,
+    so a clip that is uniformly loud is not tagged loud all the way through.
+    """
+    present = [v for v in levels if v is not None]
+    if len(present) < 3:
+        # Too few lines to know what "normal" is for this clip. Tagging from a
+        # two-line sample would be a coin flip dressed as analysis.
+        return [""] * len(levels)
+    baseline = float(np.median(present))
+
+    tags = []
+    for level in levels:
+        if level is None:
+            tags.append("")
+        elif level - baseline >= loud_db:
+            tags.append("[loud]")
+        elif level - baseline <= quiet_db:
+            tags.append("[low volume]")
+        else:
+            tags.append("")
+    return tags

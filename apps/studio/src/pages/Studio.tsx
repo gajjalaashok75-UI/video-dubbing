@@ -738,7 +738,9 @@ export default function Studio() {
   const stages = stagesFor(kind);
   const progress = readProgress(job?.step, view === "done" ? "done" : undefined, kind);
   const stageIndex = progress.index;
-  const engine = (langs ?? FALLBACK).find((l) => l.code === target)?.engine ?? "—";
+  const engine = (langs ?? FALLBACK).find((l) => l.code === target)?.active_engine
+    ?? (langs ?? FALLBACK).find((l) => l.code === target)?.engine
+    ?? "—";
   // The chosen target when nothing installed can speak it, so the form can say
   // so up front. The server refuses the same case with a 400, but only after
   // the user has committed to a render.

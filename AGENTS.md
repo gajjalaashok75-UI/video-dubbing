@@ -481,3 +481,28 @@
   `null`, and a log that shows only `null` reads as "off" when the default
   (on) is what actually ran. `preserve_background_resolved` is
   `_preserve_background(preserve_background)` and is what to read.
+- The mix must be LIMITED, not just each layer. `av_sync.mix_layers` and
+  `mix_music` sum layers that are each loudnorm'd to their own target with a
+  true-peak ceiling, then hand the sum to the encoder with `amix=normalize=0`,
+  which does no peak management. Where a loud line lands on a loud downbeat the
+  sum overshoots: the five hosted clips measured -0.2, -0.9, 0.0, +0.1 and 0.0
+  dBFS true peak, three of five clipping. A single `alimiter`
+  (`TRUE_PEAK_LIMIT` = 0.891, -1 dBFS) at the end of each chain fixes it, and
+  `latency=1` compensates the lookahead so the dub does not drift out of sync.
+  Pinned by `MixDoesNotClipTests`; the first test proves the fixture clips
+  unlimited, so the others cannot pass for the wrong reason. Measure with the
+  largest absolute sample, not `volumedetect` (rounds to 0.1 dB) or ebur128's
+  true-peak meter (over-reads on synthetic broadband noise — it put +5 dBFS on
+  a file whose samples never leave +/-1.0).
+- The dialogue-coverage gate must NOT be fooled by a music bed. The energy
+  detector cannot tell a sustained score from a voice, so reading the mixed
+  original reported phantom "dropped dialogue": the two-male clip showed a 10s
+  hole over its instrumental outro and the Aavesham trailer, scored throughout,
+  one 25s hole across the whole run. `_dialogue_coverage` now reads the
+  SEPARATED VOCALS where separation ran, and passes the transcript's word
+  timings (`segments`) through so the gate must ALSO see a transcript word in
+  the interval — the one thing a music bed never has. `_spoken_intervals` pads
+  Whisper's interpolated word timings (`WORD_PAD`) and merges the ordinary
+  inter-word gaps (`WORD_MERGE_GAP`); a transcript with less than
+  `MIN_WORD_SECONDS` of words is too sparse to trust as a mask and falls back
+  to the energy gate alone.
