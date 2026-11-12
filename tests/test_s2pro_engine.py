@@ -262,6 +262,94 @@ class GracefulFailureTests(_NoEnv):
         self.assertIn("fish-speech", str(ctx.exception))
 
 
+class PipInstallTests(unittest.TestCase):
+    """
+    The shipped `pip_install` must survive one bad package in a batch.
+
+    This is the exact failure that broke S2 Pro on Colab/Kaggle: `pyaudio`
+    cannot build (no PortAudio headers), pip aborts the whole `pip install a b
+    c ...`, and every other package in the batch - including `audiotools`, which
+    `import fish_speech` needs - is silently dropped. The helper retries each
+    package alone so the survivors still land.
+    """
+
+    def _load(self):
+        import ast
+        import json
+
+        nb = json.loads((ROOT / "deploy" / "notebooks" / "colab.ipynb").read_text(
+            encoding="utf-8"))
+        for cell in nb["cells"]:
+            if cell["cell_type"] != "code":
+                continue
+            src = "".join(cell["source"])
+            tree = ast.parse(src)
+            for node in tree.body:
+                if isinstance(node, ast.FunctionDef) and node.name == "pip_install":
+                    return ast.get_source_segment(src, node)
+        self.fail("pip_install is not defined in the install cell")
+
+    def _packages(self, cmd):
+        """The package arguments of a `pip install` command, ignoring flags."""
+        out, skip_next = [], False
+        for arg in cmd:
+            if skip_next:
+                skip_next = False
+                continue
+            if arg in ("-c", "-r", "-t", "--target"):
+                skip_next = True
+                continue
+            if arg.startswith("-"):
+                continue
+            out.append(arg)
+        return out[3:]  # drop the "<python> -m pip install" prefix
+
+    def _namespace(self, fake_run):
+        import sys as _sys
+        import types
+
+        subprocess_stub = types.SimpleNamespace(run=fake_run)
+        ns = {
+            "sys": _sys,
+            "subprocess": subprocess_stub,
+            "CONSTRAINTS": "/tmp/constraints.txt",
+        }
+        exec(self._load(), ns)
+        return ns["pip_install"]
+
+    def test_a_bad_package_does_not_sink_the_others(self):
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            pkgs = self._packages(cmd)
+            # A lone pyaudio fails, and so does any batch that contains it, as
+            # real pip does; everything else installs.
+            calls.append(list(pkgs))
+            if "pyaudio" in pkgs:
+                return type("P", (), {"returncode": 1, "stdout": "",
+                                      "stderr": "portaudio.h: No such file"})()
+            return type("P", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+        pip_install = self._namespace(fake_run)
+        failed = pip_install(["audiotools", "pyaudio", "loguru"])
+        self.assertEqual(failed, ["pyaudio"])
+        # The batch was tried once, then each package alone.
+        self.assertTrue(any(len(c) > 1 for c in calls))
+        self.assertIn(["audiotools"], calls)
+        self.assertIn(["loguru"], calls)
+
+    def test_a_clean_batch_is_a_single_call(self):
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            return type("P", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+        pip_install = self._namespace(fake_run)
+        self.assertEqual(pip_install(["a", "b", "c"]), [])
+        self.assertEqual(len(calls), 1)
+
+
 class NotebookTests(unittest.TestCase):
     def test_the_install_cell_installs_fish_speech_without_deps(self):
         # Installing it WITH deps would pull torch 2.8 over the CUDA-12 torch
@@ -269,8 +357,42 @@ class NotebookTests(unittest.TestCase):
         src = (ROOT / "deploy" / "notebooks" / "build_notebooks.py").read_text(
             encoding="utf-8")
         self.assertIn("fish-speech.git", src)
-        block = src.split("S2PRO_DEPS")[0]
+        block = src.split("S2PRO_PACKAGES")[0]
         self.assertIn("--no-deps", block)
+
+    def test_pyaudio_is_not_installed(self):
+        # pyaudio cannot build without PortAudio headers, and one failing
+        # package aborts the whole `pip install` batch - which is how
+        # `audiotools` went missing and S2 Pro failed to import. Nothing on the
+        # TTS path imports it, so it must not be in the install list.
+        src = (ROOT / "deploy" / "notebooks" / "build_notebooks.py").read_text(
+            encoding="utf-8")
+        block = src.split("S2PRO_PACKAGES")[1].split("]")[0]
+        self.assertNotIn("pyaudio", block)
+
+    def test_the_dependency_group_is_installed_tolerantly(self):
+        # The group must go through `pip_install` (per-package salvage), not a
+        # single all-or-nothing `pip install`.
+        src = (ROOT / "deploy" / "notebooks" / "build_notebooks.py").read_text(
+            encoding="utf-8")
+        self.assertIn("failed = pip_install(", src)
+
+    def test_the_import_check_names_the_modules_the_engine_loads(self):
+        # `import fish_speech` passes on a broken install; the check must ask
+        # for the modules `S2ProEngine.load()` actually imports.
+        src = (ROOT / "deploy" / "notebooks" / "build_notebooks.py").read_text(
+            encoding="utf-8")
+        self.assertIn("S2PRO_IMPORT", src)
+        self.assertIn("fish_speech.models.dac.inference import load_model", src)
+        self.assertIn("launch_thread_safe_queue", src)
+
+    def test_a_pyrootutils_marker_is_written(self):
+        # `fish_speech/models/dac/inference.py` calls
+        # `pyrootutils.setup_root(..., indicator=".project-root")` at import
+        # time; without a marker above it the import raises FileNotFoundError.
+        src = (ROOT / "deploy" / "notebooks" / "build_notebooks.py").read_text(
+            encoding="utf-8")
+        self.assertIn(".project-root", src)
 
     def test_the_requirements_file_documents_the_extra(self):
         text = (ROOT / "requirements.txt").read_text(encoding="utf-8")

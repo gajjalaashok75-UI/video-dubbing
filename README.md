@@ -210,6 +210,7 @@ python3.10 -m venv venv
 ./venv/bin/pip install -r requirements.txt
 cp .env.example .env                              # set HF_TOKEN for the gated voice model
 ./venv/bin/python scripts/download_models.py      # --check reports without downloading
+# `--no-background` skips the Demucs htdemucs checkpoint (background music/SFX)
 cd apps/studio && npx tauri build                 # the window, once
 ```
 

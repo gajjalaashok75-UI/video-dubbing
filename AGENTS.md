@@ -506,3 +506,45 @@
   inter-word gaps (`WORD_MERGE_GAP`); a transcript with less than
   `MIN_WORD_SECONDS` of words is too sparse to trust as a mask and falls back
   to the energy gate alone.
+
+## Installing the optional extras on Colab/Kaggle
+
+Both extras (Demucs, S2 Pro) fight the pinned stack, and pip's failure modes
+make that fight silent. What actually bites:
+
+- pip is all-or-nothing per invocation. One package that cannot build aborts
+  the whole `pip install a b c ...` and drops every other package in the batch,
+  with no error the caller sees unless it reads the log. `pyaudio` (no PortAudio
+  headers on these runtimes) did exactly this and left `audiotools` uninstalled,
+  so `import fish_speech` died with `No module named 'audiotools'` while the
+  install cell printed "ok". The notebooks now install the group through
+  `pip_install`, which retries each package alone so the survivors land, and
+  `pyaudio` is dropped outright - nothing on the TTS path imports it.
+- `fish_speech/models/dac/inference.py` runs
+  `pyrootutils.setup_root(__file__, indicator=".project-root")` at import time.
+  No `.project-root` exists above the installed package, so the import raises
+  `FileNotFoundError: Project root directory not found` even though the package
+  is installed. The install cell writes an empty marker into the installed
+  `fish_speech/` directory. The repo root has one for the same reason.
+- Install the extras' dependency groups WITH resolution under
+  `deploy/constraints.txt`, not with `--no-deps`. `--no-deps` looks safer but it
+  means a package like `descript-audio-codec` cannot pull `descript-audiotools`
+  (the `audiotools` import), and the import fails later. The constraints file
+  holds torch/NumPy/transformers at their pins so resolution cannot move them.
+- `fish-speech` metadata pins torch==2.8.0 / transformers==5.19.0. Install the
+  package itself with `--no-deps` (it is the one that would drag torch 2.8 over
+  the CUDA-12 torch 2.6 build and break CTranslate2); install its imports
+  separately, as above.
+- A readiness probe must import the exact modules `S2ProEngine.load()` uses, not
+  just `import fish_speech`: the package root imports cleanly while the heavy
+  modules (and the pyrootutils call) sit deeper. The notebooks' import check
+  names them.
+- `scripts/download_models.py` prefetches the Demucs `htdemucs` checkpoint
+  (mirror list, verified by SHA-256, installed under the name torch.hub looks
+  for). `--no-background` skips it. Without the prefetch the first separation
+  hits the Meta host whose TLS certificate expired, and a failed fetch disables
+  background preservation silently - the render just loses its music.
+- `web/` is committed and CI fails if it drifts from `apps/studio/src`. After
+  any change under `apps/studio/src`, run `cd apps/studio && npm run build` and
+  commit `web/` in the same change; commit 48f2486 changed the source and left
+  the committed bundle stale.

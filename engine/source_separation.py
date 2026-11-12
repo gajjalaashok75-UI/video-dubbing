@@ -57,6 +57,134 @@ CHUNK_SECONDS = 600
 # vocals` split is what produces the `no_vocals` bed.
 MODEL = "htdemucs"
 
+# ---------------------------------------------------------------------------
+# The checkpoint
+# ---------------------------------------------------------------------------
+#
+# Demucs fetches `htdemucs` from `https://dl.fbaipublicfiles.com/demucs/...` the
+# first time it runs, via `torch.hub.load_state_dict_from_url`. That host is a
+# single point of failure, and on 2026-11-11 it failed: Meta let the TLS
+# certificate for `*.fbaipublicfiles.com` lapse, every download then died with
+# `[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: certificate has
+# expired`, and because separation is failure-safe the render silently dropped
+# the entire soundtrack — the dub came back dialogue-only with no error the
+# user could see. A background-preservation feature that depends on one
+# third-party host being up is not a feature, so the checkpoint is fetched
+# here, from the verified mirrors below, and installed into torch's own hub
+# cache before Demucs is ever asked to run. `torch.hub.load_state_dict_from_url`
+# then finds it already cached and never touches the network.
+#
+# The file name is load-bearing twice over: torch looks up
+# `<torch.hub.get_dir()>/checkpoints/<basename>`, and `check_hash=True` (which
+# demucs/repo.py passes) reads the SHA-256 prefix out of the `-<hash>` segment
+# of the name. So the file must be named `955717e8-8726e21a.th`, and
+# `8726e21a` must be the real SHA-256 prefix of the contents or torch rejects
+# it. Both mirrors below were confirmed byte-identical to the official file
+# (SHA-256 8726e21a993978c7ba086d3872e7608d7d5bfca646ca4aca459ffda844faa8b4).
+DEMUCS_CHECKPOINT = "955717e8-8726e21a.th"
+DEMUCS_CHECKPOINT_BYTES = 84_141_911
+DEMUCS_CHECKPOINT_SHA256 = (
+    "8726e21a993978c7ba086d3872e7608d7d5bfca646ca4aca459ffda844faa8b4")
+DEMUCS_CHECKPOINT_URLS = (
+    "https://huggingface.co/anchor-flux/demucs-htdemucs/resolve/main/htdemucs.th",
+    "https://dl.fbaipublicfiles.com/demucs/hybrid_transformer/955717e8-8726e21a.th",
+)
+
+
+def _hub_checkpoints_dir() -> str:
+    """torch's hub `checkpoints/` directory, where Demucs looks for the file."""
+    try:
+        import torch.hub
+        return os.path.join(torch.hub.get_dir(), "checkpoints")
+    except Exception:                                        # noqa: BLE001
+        # torch not importable yet: fall back to the documented default, which
+        # is what `get_dir()` returns anyway.
+        return os.path.join(os.path.expanduser("~"), ".cache", "torch", "hub",
+                            "checkpoints")
+
+
+def _sha256(path: str) -> str:
+    import hashlib
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def checkpoint_present() -> bool:
+    """
+    Whether Demucs' `htdemucs` checkpoint is already in torch's hub cache.
+
+    Checks the hash, not just the name: a truncated or substituted file would
+    otherwise sit in the cache and make `check_hash=True` raise deep inside a
+    render, which is the failure mode this whole block exists to remove.
+    """
+    path = os.path.join(_hub_checkpoints_dir(), DEMUCS_CHECKPOINT)
+    try:
+        return (os.path.getsize(path) == DEMUCS_CHECKPOINT_BYTES
+                and _sha256(path) == DEMUCS_CHECKPOINT_SHA256)
+    except OSError:
+        return False
+
+
+def ensure_checkpoint(log=print, timeout: int = 300) -> bool:
+    """
+    Make sure the `htdemucs` checkpoint is cached, downloading it if not.
+
+    Returns True when the checkpoint is present and verified. Never raises:
+    like everything else here, a failure is a warning and a False, and the
+    caller falls back to the dialogue-only path.
+
+    Downloads to a `.part` file and renames only after the SHA-256 matches, so
+    an interrupted or corrupted fetch can never leave a bad file where torch
+    would find it.
+    """
+    if checkpoint_present():
+        return True
+    dest_dir = _hub_checkpoints_dir()
+    dest = os.path.join(dest_dir, DEMUCS_CHECKPOINT)
+    try:
+        os.makedirs(dest_dir, exist_ok=True)
+    except OSError as e:
+        log(f"[STEM] Cannot create the checkpoint cache {dest_dir}: {e}")
+        return False
+
+    import urllib.request
+    part = dest + ".part"
+    for url in DEMUCS_CHECKPOINT_URLS:
+        host = url.split("/")[2]
+        try:
+            log(f"[STEM] Fetching the {MODEL} checkpoint from {host} "
+                f"({DEMUCS_CHECKPOINT_BYTES // 1_000_000} MB, one time)")
+            req = urllib.request.Request(url, headers={"User-Agent": "videotrans"})
+            with urllib.request.urlopen(req, timeout=timeout) as r, \
+                    open(part, "wb") as out:
+                while True:
+                    block = r.read(1 << 20)
+                    if not block:
+                        break
+                    out.write(block)
+            got = _sha256(part)
+            if got != DEMUCS_CHECKPOINT_SHA256:
+                log(f"[STEM] {host} served a file that does not match the "
+                    f"expected SHA-256; trying another source")
+                os.remove(part)
+                continue
+            os.replace(part, dest)
+            log(f"[STEM] {MODEL} checkpoint verified and cached at {dest}")
+            return True
+        except Exception as e:                               # noqa: BLE001
+            log(f"[STEM] {host} failed: {type(e).__name__}: {e}")
+            try:
+                os.remove(part)
+            except OSError:
+                pass
+    log("[STEM] Could not fetch the Demucs checkpoint from any mirror. "
+        "Background preservation will be unavailable for this run.")
+    return False
+
+
 # Where the stems land inside a job's workdir.
 STEMS_DIR = "stems"
 VOCALS_NAME = "vocals.wav"
@@ -371,6 +499,16 @@ def separate(input_path: str, workdir: str, device: str = None,
             "       Demucs is not installed.\n"
             "       The job will continue with dialogue-only audio.\n"
             "       Install with:  pip install 'demucs>=4.0.0'")
+        return None
+
+    # Demucs would otherwise fetch its checkpoint from a host that is allowed to
+    # fail (see DEMUCS_CHECKPOINT_URLS). Do it here, where a failure is a
+    # warning with a name, rather than letting `demucs.separate` die on an SSL
+    # error that the caller reports only as "separation unavailable".
+    if not ensure_checkpoint(log=log):
+        log("[STEM] Background preservation unavailable:\n"
+            "       The Demucs checkpoint could not be fetched.\n"
+            "       The job will continue with dialogue-only audio.")
         return None
 
     try:

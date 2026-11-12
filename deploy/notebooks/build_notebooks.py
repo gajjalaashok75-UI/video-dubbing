@@ -389,6 +389,46 @@ def _installed(dist):
     return True
 
 
+def pip_install(packages, *, constraints=True, no_deps=False, label=None):
+    """
+    Install `packages`, salvaging the ones that work when one of them fails.
+
+    `pip install a b c ...` is all-or-nothing: if a single package cannot build
+    or resolve, pip aborts the whole command and writes NONE of them. On Colab
+    and Kaggle `pyaudio` cannot build (there are no PortAudio headers), and that
+    one failure is what quietly cost the rest of the S2 Pro dependency set - the
+    package reported "installed" while `audiotools` was missing, so the engine
+    could not import.
+
+    So the batch is tried once (fast, and it still surfaces a genuine conflict
+    between two of them), and only if it fails is each package retried alone to
+    keep the ones that do install. Returns the packages that still failed.
+    """
+    cmd = [sys.executable, "-m", "pip", "install", "--no-cache-dir"]
+    if constraints:
+        cmd += ["-c", CONSTRAINTS]
+    if no_deps:
+        cmd.append("--no-deps")
+    if label:
+        print(label)
+
+    batch = subprocess.run(cmd + list(packages), text=True, capture_output=True)
+    if batch.returncode == 0:
+        for pkg in packages:
+            print(f"  ok   {pkg}")
+        return []
+
+    print("  one of these did not install; retrying each on its own:")
+    failed = []
+    for pkg in packages:
+        proc = subprocess.run(cmd + [pkg], text=True, capture_output=True)
+        if proc.returncode == 0:
+            print(f"  ok   {pkg}")
+        else:
+            failed.append(pkg)
+    return failed
+
+
 # ============================================================
 # Required Torch stack
 # ============================================================
@@ -756,8 +796,24 @@ else:
 # VIDEOTRANS_TTS_ENGINE=s2pro. It is a big optional extra: the fish_speech
 # package pins torch==2.8.0 and transformers==5.19.0, which would replace the
 # CUDA-12 torch 2.6 stack and break CTranslate2 (the same libcublas.so.12
-# failure the install cell already guards against). So it is installed with
-# --no-deps and its import chain named explicitly, exactly like Demucs.
+# failure the install cell already guards against). So the package itself is
+# installed with --no-deps and its import chain named explicitly.
+#
+# Its *dependencies* are installed WITH resolution under the constraints file,
+# not with --no-deps. Two reasons, both learned the hard way:
+#
+#   * `--no-deps` cannot be used for the group. pip is all-or-nothing: `pyaudio`
+#     cannot build here (no PortAudio headers), and that single failure aborted
+#     the whole batch, so `audiotools` never landed and `import fish_speech`
+#     died on `No module named 'audiotools'`. The package printed "installed"
+#     while the engine was dead. pyaudio is dropped (nothing in the TTS path
+#     imports it) and the group is installed tolerantly, so one bad package
+#     cannot take the rest with it.
+#   * With resolution, `descript-audio-codec` pulls `descript-audiotools` and
+#     the audio stack (`julius`, `pyloudnorm`, `tensorboard`, ...) that
+#     `audiotools` needs at import time. The constraints file holds torch and
+#     NumPy where they are; protobuf is left alone, because audiotools' own
+#     `protobuf<3.20` pin is stale (tensorboard is happy with what resolves).
 #
 # The ~11 GB of weights are NOT fetched here - they are a separate opt-in
 # download, because most people do not want them. Fetch them from the studio's
@@ -770,8 +826,11 @@ print("=" * 70)
 print("INSTALLING OPTIONAL EXTRA (FISH AUDIO S2 PRO VOICE ENGINE)")
 print("=" * 70)
 
-S2PRO_DEPS = [
+# pyaudio is deliberately absent: it cannot build without PortAudio headers and
+# nothing on the TTS path imports it.
+S2PRO_PACKAGES = [
     "hydra-core",
+    "omegaconf",
     "einx",
     "einops",
     "descript-audio-codec",
@@ -785,7 +844,9 @@ S2PRO_DEPS = [
     "silero-vad",
     "cachetools",
     "modelscope",
-    "pyaudio",
+    "tiktoken",
+    "click",
+    "tensorboard",
 ]
 
 s2pro_pkg = subprocess.run(
@@ -804,32 +865,53 @@ s2pro_pkg = subprocess.run(
 
 if s2pro_pkg.returncode == 0:
     print("ok   fish_speech installed")
-    print("     installing the modules it imports, also with --no-deps:")
-    s2pro_deps = subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "pip",
-            "install",
-            "--no-cache-dir",
-            "--no-deps",
-            *S2PRO_DEPS,
-        ],
-        text=True,
-        capture_output=True,
+    failed = pip_install(
+        S2PRO_PACKAGES,
+        label="     installing the modules it imports:",
     )
-    if s2pro_deps.returncode != 0:
-        print("--   some fish_speech dependencies did not install")
-        for line in (s2pro_deps.stderr or s2pro_deps.stdout or "").strip().splitlines()[-3:]:
-            print("       ", line)
+    if failed:
+        print("--   these did not install:", ", ".join(failed))
+        print("     S2 Pro may still work if none of them is on its import path.")
 else:
     print("--   fish_speech did not install; S2 Pro will be unavailable")
     for line in (s2pro_pkg.stderr or s2pro_pkg.stdout or "").strip().splitlines()[-3:]:
         print("       ", line)
 
-# As with Demucs, only a real import proves it works.
+# `fish_speech/models/dac/inference.py` calls
+# `pyrootutils.setup_root(__file__, indicator=".project-root")` at import time,
+# which walks up looking for a `.project-root` marker. The wheel does not ship
+# one and site-packages has no such file above it, so the import dies with
+# `FileNotFoundError: Project root directory not found` - which is how "S2 Pro
+# is installed but cannot import" showed up in a real render. The repo keeps a
+# `.project-root` at its root for exactly this reason; drop the same marker
+# next to the installed package so the search terminates there.
+if s2pro_pkg.returncode == 0:
+    marker = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import os, fish_speech;"
+            "p = os.path.join(fish_speech.__path__[0], '.project-root');"
+            "open(p, 'a').close();"
+            "print('marker:', p)",
+        ],
+        text=True,
+        capture_output=True,
+    )
+    print("ok   " + (marker.stdout or "pyrootutils marker written").strip())
+
+# As with Demucs, only a real import proves it works - and `import fish_speech`
+# alone does NOT, because the heavy modules (and the pyrootutils call) live
+# deeper. Ask for the exact modules `S2ProEngine.load()` imports.
+S2PRO_IMPORT = (
+    "from fish_speech.inference_engine import TTSInferenceEngine;"
+    "from fish_speech.models.dac.inference import load_model;"
+    "from fish_speech.models.text2semantic.inference import "
+    "launch_thread_safe_queue, resolve_codec_path;"
+    "print('ok')"
+)
 s2pro_ready = subprocess.run(
-    [sys.executable, "-c", "import fish_speech; print('ok')"],
+    [sys.executable, "-c", S2PRO_IMPORT],
     text=True,
     capture_output=True,
 )

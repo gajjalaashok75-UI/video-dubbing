@@ -240,8 +240,14 @@ class SeparationWrapperTests(unittest.TestCase):
         os.makedirs(self.workdir, exist_ok=True)
         self.source = write_wav(os.path.join(self.tmp, "source.wav"),
                                 tone(120, 6.0), SR, channels=2)
+        # These tests are about the separation wrapper, not about fetching the
+        # checkpoint, and a real fetch would hit the network (and download 84 MB
+        # on a cold cache). The checkpoint fetch has its own tests below.
+        self._real_ensure = SS.ensure_checkpoint
+        SS.ensure_checkpoint = lambda *a, **k: True
 
     def tearDown(self):
+        SS.ensure_checkpoint = self._real_ensure
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def _install(self, fake):
@@ -396,6 +402,209 @@ class SeparationWrapperTests(unittest.TestCase):
             self._uninstall()
         self.assertIsNotNone(stems)
         self.assertLess(band_energy(stems["background"], 20, 200), 1e-6)
+
+
+class CheckpointFetchTests(unittest.TestCase):
+    """
+    The `htdemucs` checkpoint must be fetched from a host that is allowed to
+    fail, before Demucs is asked to run.
+
+    On 2026-11-11 Meta's `dl.fbaipublicfiles.com` TLS certificate expired and
+    every Demucs run died on an SSL error while trying to fetch this file.
+    Because separation is failure-safe, the render silently came back with no
+    background at all. These tests pin the replacement: the file is fetched from
+    a mirror, verified by SHA-256, and placed exactly where
+    `torch.hub.load_state_dict_from_url(check_hash=True)` will find it.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="ckpt_test_")
+        self._real_dir = SS._hub_checkpoints_dir
+        SS._hub_checkpoints_dir = lambda: self.tmp
+
+    def tearDown(self):
+        SS._hub_checkpoints_dir = self._real_dir
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _write_checkpoint(self, data: bytes, name: str = None):
+        name = name or SS.DEMUCS_CHECKPOINT
+        path = os.path.join(self.tmp, name)
+        with open(path, "wb") as f:
+            f.write(data)
+        return path
+
+    def test_the_checkpoint_name_carries_the_hash_torch_checks(self):
+        # torch.hub's HASH_REGEX is r'-([a-f0-9]*)\.' and it compares the match
+        # to the file's SHA-256. If the name and the constant ever drift apart,
+        # torch will reject a perfectly good file at render time.
+        import re
+        m = re.search(r"-([a-f0-9]*)\.", SS.DEMUCS_CHECKPOINT)
+        self.assertIsNotNone(m)
+        self.assertEqual(m.group(1), SS.DEMUCS_CHECKPOINT_SHA256[:8])
+
+    def test_present_is_false_when_the_file_is_absent(self):
+        self.assertFalse(SS.checkpoint_present())
+
+    def test_present_is_false_when_the_file_is_the_wrong_size(self):
+        self._write_checkpoint(b"not the checkpoint")
+        self.assertFalse(SS.checkpoint_present())
+
+    def test_present_is_true_for_a_verified_file(self):
+        self._write_checkpoint(b"x" * SS.DEMUCS_CHECKPOINT_BYTES)
+        real_sha = SS.DEMUCS_CHECKPOINT_SHA256
+        import hashlib
+        SS.DEMUCS_CHECKPOINT_SHA256 = hashlib.sha256(
+            b"x" * SS.DEMUCS_CHECKPOINT_BYTES).hexdigest()
+        try:
+            self.assertTrue(SS.checkpoint_present())
+        finally:
+            SS.DEMUCS_CHECKPOINT_SHA256 = real_sha
+
+    def test_ensure_checkpoint_is_a_noop_when_already_present(self):
+        import hashlib
+        payload = b"y" * SS.DEMUCS_CHECKPOINT_BYTES
+        self._write_checkpoint(payload)
+        real_sha = SS.DEMUCS_CHECKPOINT_SHA256
+        SS.DEMUCS_CHECKPOINT_SHA256 = hashlib.sha256(payload).hexdigest()
+        try:
+            # No network: the urls are left untouched, so a real fetch would
+            # hang or fail. It must not be attempted.
+            self.assertTrue(SS.ensure_checkpoint(log=lambda *a: None))
+        finally:
+            SS.DEMUCS_CHECKPOINT_SHA256 = real_sha
+
+    def test_ensure_checkpoint_never_raises_when_every_mirror_fails(self):
+        real_urls = SS.DEMUCS_CHECKPOINT_URLS
+        SS.DEMUCS_CHECKPOINT_URLS = ("https://127.0.0.1:1/nope.th",)
+        try:
+            self.assertFalse(SS.ensure_checkpoint(log=lambda *a: None,
+                                                  timeout=2))
+        finally:
+            SS.DEMUCS_CHECKPOINT_URLS = real_urls
+
+    def test_a_bad_download_is_not_left_where_torch_would_find_it(self):
+        # A mirror serving the wrong bytes must leave the cache empty, so the
+        # next attempt (or the next render) can still succeed.
+        real_urls = SS.DEMUCS_CHECKPOINT_URLS
+        SS.DEMUCS_CHECKPOINT_URLS = ("https://127.0.0.1:1/nope.th",)
+        try:
+            SS.ensure_checkpoint(log=lambda *a: None, timeout=2)
+        finally:
+            SS.DEMUCS_CHECKPOINT_URLS = real_urls
+        self.assertFalse(os.path.exists(
+            os.path.join(self.tmp, SS.DEMUCS_CHECKPOINT)))
+        self.assertFalse(os.path.exists(
+            os.path.join(self.tmp, SS.DEMUCS_CHECKPOINT + ".part")))
+
+    def test_the_installed_file_has_the_name_torch_looks_for(self):
+        # torch looks the checkpoint up by `basename(url)` unless a file_name is
+        # passed, and `demucs/repo.py` passes none. So the cache file MUST be
+        # named after the official URL's basename, or a prefetched checkpoint
+        # would sit in the cache under a name torch never asks for and the
+        # render would try to download again. The mirror's own basename
+        # (`htdemucs.th`) is therefore irrelevant - it is renamed on install.
+        self.assertEqual(SS.DEMUCS_CHECKPOINT, "955717e8-8726e21a.th")
+        self.assertTrue(SS.DEMUCS_CHECKPOINT_URLS[0].endswith("/htdemucs.th"))
+        self.assertTrue(SS.DEMUCS_CHECKPOINT_URLS[1].endswith(
+            "/" + SS.DEMUCS_CHECKPOINT))
+
+    def test_ensure_checkpoint_installs_under_the_official_name(self):
+        # Drive the download for real against a file:// mirror holding a payload
+        # whose size and SHA-256 we control, so no network is needed.
+        import hashlib
+        payload = os.urandom(4096)
+        src = os.path.join(self.tmp, "mirror.th")
+        with open(src, "wb") as f:
+            f.write(payload)
+        real_urls = SS.DEMUCS_CHECKPOINT_URLS
+        real_bytes = SS.DEMUCS_CHECKPOINT_BYTES
+        real_sha = SS.DEMUCS_CHECKPOINT_SHA256
+        SS.DEMUCS_CHECKPOINT_URLS = ("file://" + src,)
+        SS.DEMUCS_CHECKPOINT_BYTES = len(payload)
+        SS.DEMUCS_CHECKPOINT_SHA256 = hashlib.sha256(payload).hexdigest()
+        try:
+            self.assertTrue(SS.ensure_checkpoint(log=lambda *a: None))
+        finally:
+            SS.DEMUCS_CHECKPOINT_URLS = real_urls
+            SS.DEMUCS_CHECKPOINT_BYTES = real_bytes
+            SS.DEMUCS_CHECKPOINT_SHA256 = real_sha
+        installed = os.path.join(self.tmp, SS.DEMUCS_CHECKPOINT)
+        self.assertTrue(os.path.exists(installed))
+        with open(installed, "rb") as f:
+            self.assertEqual(f.read(), payload)
+
+    def test_a_corrupt_mirror_file_is_rejected_and_removed(self):
+        src = os.path.join(self.tmp, "bad.th")
+        with open(src, "wb") as f:
+            f.write(b"definitely not the checkpoint")
+        real_urls = SS.DEMUCS_CHECKPOINT_URLS
+        SS.DEMUCS_CHECKPOINT_URLS = ("file://" + src,)
+        try:
+            self.assertFalse(SS.ensure_checkpoint(log=lambda *a: None))
+        finally:
+            SS.DEMUCS_CHECKPOINT_URLS = real_urls
+        self.assertFalse(os.path.exists(
+            os.path.join(self.tmp, SS.DEMUCS_CHECKPOINT)))
+        self.assertFalse(os.path.exists(
+            os.path.join(self.tmp, SS.DEMUCS_CHECKPOINT + ".part")))
+
+
+class DownloadModelsPrefetchesTheCheckpointTests(unittest.TestCase):
+    """
+    `scripts/download_models.py` must fetch the Demucs checkpoint up front.
+
+    Left to itself, Demucs fetches it through torch.hub on the first separation,
+    from a host whose TLS certificate has expired - and a failed fetch disables
+    background preservation silently, so the render loses its music. The script
+    is the documented "download everything first" step, so it must cover this
+    file too, and it must be skippable for someone who does not want Demucs.
+    """
+
+    def _load(self):
+        import importlib.util
+        path = os.path.join(ROOT, "scripts", "download_models.py")
+        spec = importlib.util.spec_from_file_location("download_models", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def test_the_script_knows_about_the_checkpoint(self):
+        mod = self._load()
+        self.assertTrue(hasattr(mod, "_fetch_checkpoint"))
+        self.assertTrue(hasattr(mod, "_report_checkpoint"))
+
+    def test_the_background_fetch_is_skippable(self):
+        import pathlib
+        src = pathlib.Path(ROOT, "scripts", "download_models.py").read_text(
+            encoding="utf-8")
+        self.assertIn("--no-background", src)
+        self.assertIn("checkpoint_present", src)
+
+    def test_a_present_checkpoint_is_not_re_fetched(self):
+        mod = self._load()
+        real_present = mod.separation.checkpoint_present
+        real_ensure = mod.separation.ensure_checkpoint
+        calls = []
+        mod.separation.checkpoint_present = lambda: True
+        mod.separation.ensure_checkpoint = lambda *a, **k: calls.append(1) or True
+        try:
+            self.assertTrue(mod._fetch_checkpoint())
+        finally:
+            mod.separation.checkpoint_present = real_present
+            mod.separation.ensure_checkpoint = real_ensure
+        self.assertEqual(calls, [])
+
+    def test_a_missing_checkpoint_is_fetched(self):
+        mod = self._load()
+        real_present = mod.separation.checkpoint_present
+        real_ensure = mod.separation.ensure_checkpoint
+        mod.separation.checkpoint_present = lambda: False
+        mod.separation.ensure_checkpoint = lambda *a, **k: True
+        try:
+            self.assertTrue(mod._fetch_checkpoint())
+        finally:
+            mod.separation.checkpoint_present = real_present
+            mod.separation.ensure_checkpoint = real_ensure
 
 
 class Phase4DoesNotDisturbPhases1to3Tests(unittest.TestCase):
