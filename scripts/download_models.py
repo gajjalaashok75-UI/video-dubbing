@@ -57,13 +57,35 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="Download VideoTrans's models")
     ap.add_argument("--core", action="store_true",
                     help="skip optional models (evaluation harness)")
+    ap.add_argument("--extras", action="store_true",
+                    help="also fetch the multi-gigabyte alternative engines "
+                         "(S2 Pro, ~11 GB) that a default run never loads")
+    ap.add_argument("--only", metavar="ID", action="append", default=[],
+                    help="fetch only the named model id(s), regardless of the "
+                         "default set (repeatable)")
     ap.add_argument("--check", action="store_true",
                     help="report what is present without downloading")
     ap.add_argument("--no-background", action="store_true",
                     help="skip the Demucs background-separation checkpoint")
     args = ap.parse_args()
 
-    rows = [r for r in models.inventory() if r["required"] or not args.core]
+    if args.only:
+        # Explicit ids: fetch exactly those, extras included, so a user who
+        # opted into S2 Pro can pull just its weights without the whole set.
+        wanted = set(args.only)
+        rows = [r for r in models.inventory() if r["id"] in wanted]
+        unknown = wanted - {r["id"] for r in rows}
+        if unknown:
+            print("  unknown model id(s):", ", ".join(sorted(unknown)))
+            return 2
+    else:
+        # A default run fetches the required models and the light optional
+        # ones, but NOT the `extra` engines: S2 Pro's 11 GB on top of the
+        # other ~7.5 GB overflows a Kaggle working volume, and nothing loads
+        # it unless the user pins VIDEOTRANS_TTS_ENGINE=s2pro.
+        rows = [r for r in models.inventory()
+                if (r["required"] or not args.core)
+                and (args.extras or not r.get("extra"))]
     want_background = not args.no_background
     background_present = separation.checkpoint_present()
 

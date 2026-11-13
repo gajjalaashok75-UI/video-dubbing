@@ -20,23 +20,92 @@ import os
 
 REPO_URL = "https://github.com/gajjalaashok75-UI/video-dubbing"
 
-# Colab mounts /content; Kaggle mounts /kaggle/working. Both are writable for
-# the life of the session, which is all a runtime tree needs. Written as one
-# parenthesised expression so it can be pasted into a cell as `REPO_DIR = ...`,
-# and self-contained because the clone cell runs before the checkout it is
-# creating can be imported.
-#
-# The tests are in the SAME ORDER as `deploy_helpers.detect_platform`, and that
-# is not cosmetic: that function returns "colab" on any machine with /content,
-# so testing /kaggle first put the checkout at /kaggle/working/video-dubbing
-# while the runtime tree (and the server log the user is told to read) went to
-# /content/videotrans-runtime - one session split across two volumes.
-# `tests/test_platform_layout.py` keeps this expression and `repo_dir()` equal.
+# Where the checkout lives by default, per platform. Kaggle is tested FIRST and
+# the environment variables are tested before the directories: a Kaggle image
+# also mounts `/content`, so keying on `/content` alone labelled Kaggle as Colab
+# and the runtime tree landed under /content while the checkout was under
+# /kaggle/working - one session split across two volumes. This order matches
+# `deploy_helpers.detect_platform` exactly, and `tests/test_platform_layout.py`
+# keeps the two equal.
 REPO_DIR_EXPR = ('(\n'
-                 '    "/content/video-dubbing" if os.path.isdir("/content")\n'
-                 '    else "/kaggle/working/video-dubbing" if os.path.isdir("/kaggle")\n'
+                 '    "/kaggle/working/video-dubbing"\n'
+                 '    if (os.environ.get("KAGGLE_KERNEL_RUN_TYPE")'
+                 ' or os.path.isdir("/kaggle"))\n'
+                 '    else "/content/video-dubbing"\n'
+                 '    if (os.environ.get("COLAB_GPU")'
+                 ' or os.path.isdir("/content"))\n'
                  '    else os.getcwd()\n'
                  ')')
+
+# Resolve the checkout ONCE, in the first cell, and remember it in the
+# environment. The cells used to recompute REPO_DIR independently and disagree:
+# the clone cell's walk-up found an unzipped copy and used it, while the next
+# cell recomputed the platform default and `os.chdir`'d into a directory that
+# did not exist:
+#
+#     FileNotFoundError: [Errno 2] No such file or directory:
+#     '/content/video-dubbing'
+#
+# on a Kaggle session whose checkout was at /kaggle/working/video-dubbing. One
+# resolver, one value, every cell - including the server subprocess.
+REPO_DIR_RESOLVER = '''
+def _resolve_repo_dir():
+    """
+    One checkout path for every cell, decided once.
+
+    Preference order: an explicit pin, then whichever platform candidate
+    actually holds a checkout, then a walk up from the working directory, then
+    the platform default. A checkout is recognised by requirements.txt, not by
+    `.git`, so an unzipped copy (which has no `.git`) is used as it is instead
+    of being cloned over.
+    """
+    import os
+
+    pinned = os.environ.get("VIDEOTRANS_REPO_DIR")
+    if pinned and os.path.isfile(os.path.join(pinned, "requirements.txt")):
+        return pinned
+
+    if os.environ.get("KAGGLE_KERNEL_RUN_TYPE") or os.path.isdir("/kaggle"):
+        default = "/kaggle/working/video-dubbing"
+    elif os.environ.get("COLAB_GPU") or os.path.isdir("/content"):
+        default = "/content/video-dubbing"
+    else:
+        default = os.getcwd()
+
+    candidates = [default, "/kaggle/working/video-dubbing",
+                  "/content/video-dubbing", os.getcwd()]
+    for path in candidates:
+        if os.path.isfile(os.path.join(path, "requirements.txt")):
+            return path
+
+    here = os.path.abspath(os.getcwd())
+    while True:
+        if os.path.isfile(os.path.join(here, "requirements.txt")):
+            return here
+        parent = os.path.dirname(here)
+        if parent == here:
+            break
+        here = parent
+
+    return default
+
+
+REPO_DIR = _resolve_repo_dir()
+os.environ["VIDEOTRANS_REPO_DIR"] = REPO_DIR
+'''
+
+
+def repo_bind() -> str:
+    """The prelude a later cell uses to agree on REPO_DIR and import the code.
+
+    Reads the path the first cell resolved; falls back to the platform default
+    so a cell run on its own (before the first) still works.
+    """
+    return ('REPO_DIR = os.environ.get("VIDEOTRANS_REPO_DIR") or ' +
+            REPO_DIR_EXPR + '\n'
+            'if REPO_DIR not in sys.path:\n'
+            '    sys.path.insert(0, REPO_DIR)\n'
+            'os.chdir(REPO_DIR)\n')
 
 
 def _src(text: str) -> list[str]:
@@ -107,7 +176,6 @@ import shutil
 import subprocess
 
 REPO_URL = "{REPO_URL}"
-REPO_DIR = {REPO_DIR_EXPR}
 
 # A checkout is recognised by requirements.txt, not by `.git`: a copy delivered
 # as a zip has no `.git`, and treating it as "absent" would clone the remote
@@ -116,19 +184,12 @@ def _is_checkout(path):
     return os.path.isfile(os.path.join(path, "requirements.txt"))
 
 
-# The copy the user unzipped may not be exactly at REPO_DIR, so also look at the
-# working directory and its parents before falling back to a clone. Without
-# this, an unzip one directory off sends the session back to the remote code.
-if not _is_checkout(REPO_DIR):
-    here = os.path.abspath(os.getcwd())
-    while True:
-        if _is_checkout(here):
-            REPO_DIR = here
-            break
-        parent = os.path.dirname(here)
-        if parent == here:
-            break
-        here = parent
+{REPO_DIR_RESOLVER}
+
+# The copy the user unzipped may not be exactly at the platform default; the
+# resolver above already looked at the platform candidates and walked up from
+# the working directory. Whatever it chose is now the ONE path every later cell
+# reads, via VIDEOTRANS_REPO_DIR - so no cell can recompute a different one.
 
 HAVE_CODE = _is_checkout(REPO_DIR)
 
@@ -175,11 +236,7 @@ import os
 import subprocess
 import sys
 
-REPO_DIR = {REPO_DIR_EXPR}
-if REPO_DIR not in sys.path:
-    sys.path.insert(0, REPO_DIR)
-os.chdir(REPO_DIR)
-
+{repo_bind()}
 # deploy_helpers has no heavy imports at module level, so importing it here is
 # free and the runtime cell below reuses it.
 from engine import deploy_helpers as runtime
@@ -328,10 +385,7 @@ import sys
 # Locate repository
 # ============================================================
 
-REPO_DIR = ''' + REPO_DIR_EXPR + '''
-
-os.chdir(REPO_DIR)
-
+''' + repo_bind() + '''
 print("Repository:", REPO_DIR)
 print("Python:", sys.version)
 print()
@@ -821,106 +875,167 @@ else:
 #
 # Comment this block out to skip S2 Pro entirely.
 
-print()
-print("=" * 70)
-print("INSTALLING OPTIONAL EXTRA (FISH AUDIO S2 PRO VOICE ENGINE)")
-print("=" * 70)
 
-# pyaudio is deliberately absent: it cannot build without PortAudio headers and
-# nothing on the TTS path imports it.
-S2PRO_PACKAGES = [
-    "hydra-core",
-    "omegaconf",
-    "einx",
-    "einops",
-    "descript-audio-codec",
-    "kui",
-    "ormsgpack",
-    "resampy",
-    "natsort",
-    "loguru",
-    "pyrootutils",
-    "opencc-python-reimplemented",
-    "silero-vad",
-    "cachetools",
-    "modelscope",
-    "tiktoken",
-    "click",
-    "tensorboard",
-]
+# S2 Pro is OFF by default. It is a ~5B model whose 10+ GB of weights
+# load onto the GPU and, on a free T4 (14.56 GiB), leave nothing for
+# Whisper or Wav2Lip - so a session that installs and boots it OOMs the
+# rest of the pipeline. The Indian languages use IndicF5 by default and do
+# not need this. Set VIDEOTRANS_INSTALL_S2PRO=1 (and use a bigger GPU)
+# only if you actually want S2 Pro.
+INSTALL_S2PRO = os.environ.get("VIDEOTRANS_INSTALL_S2PRO", "").strip().lower() in ("1", "true", "yes")
 
-s2pro_pkg = subprocess.run(
-    [
-        sys.executable,
-        "-m",
-        "pip",
-        "install",
-        "--no-cache-dir",
-        "--no-deps",
-        "git+https://github.com/fishaudio/fish-speech.git",
-    ],
-    text=True,
-    capture_output=True,
-)
+if INSTALL_S2PRO:
+    print()
+    print("=" * 70)
+    print("INSTALLING OPTIONAL EXTRA (FISH AUDIO S2 PRO VOICE ENGINE)")
+    print("=" * 70)
 
-if s2pro_pkg.returncode == 0:
-    print("ok   fish_speech installed")
-    failed = pip_install(
-        S2PRO_PACKAGES,
-        label="     installing the modules it imports:",
-    )
-    if failed:
-        print("--   these did not install:", ", ".join(failed))
-        print("     S2 Pro may still work if none of them is on its import path.")
-else:
-    print("--   fish_speech did not install; S2 Pro will be unavailable")
-    for line in (s2pro_pkg.stderr or s2pro_pkg.stdout or "").strip().splitlines()[-3:]:
-        print("       ", line)
+    # pyaudio is deliberately absent: it cannot build without PortAudio headers and
+    # nothing on the TTS path imports it.
+    S2PRO_PACKAGES = [
+        "hydra-core",
+        "omegaconf",
+        "einx",
+        "einops",
+        "descript-audio-codec",
+        "kui",
+        "ormsgpack",
+        "resampy",
+        "natsort",
+        "loguru",
+        "pyrootutils",
+        "opencc-python-reimplemented",
+        "silero-vad",
+        "cachetools",
+        "modelscope",
+        "tiktoken",
+        "click",
+        "tensorboard",
+    ]
 
-# `fish_speech/models/dac/inference.py` calls
-# `pyrootutils.setup_root(__file__, indicator=".project-root")` at import time,
-# which walks up looking for a `.project-root` marker. The wheel does not ship
-# one and site-packages has no such file above it, so the import dies with
-# `FileNotFoundError: Project root directory not found` - which is how "S2 Pro
-# is installed but cannot import" showed up in a real render. The repo keeps a
-# `.project-root` at its root for exactly this reason; drop the same marker
-# next to the installed package so the search terminates there.
-if s2pro_pkg.returncode == 0:
-    marker = subprocess.run(
+    s2pro_pkg = subprocess.run(
         [
             sys.executable,
-            "-c",
-            "import os, fish_speech;"
-            "p = os.path.join(fish_speech.__path__[0], '.project-root');"
-            "open(p, 'a').close();"
-            "print('marker:', p)",
+            "-m",
+            "pip",
+            "install",
+            "--no-cache-dir",
+            "--no-deps",
+            "git+https://github.com/fishaudio/fish-speech.git",
         ],
         text=True,
         capture_output=True,
     )
-    print("ok   " + (marker.stdout or "pyrootutils marker written").strip())
 
-# As with Demucs, only a real import proves it works - and `import fish_speech`
-# alone does NOT, because the heavy modules (and the pyrootutils call) live
-# deeper. Ask for the exact modules `S2ProEngine.load()` imports.
-S2PRO_IMPORT = (
-    "from fish_speech.inference_engine import TTSInferenceEngine;"
-    "from fish_speech.models.dac.inference import load_model;"
-    "from fish_speech.models.text2semantic.inference import "
-    "launch_thread_safe_queue, resolve_codec_path;"
-    "print('ok')"
-)
-s2pro_ready = subprocess.run(
-    [sys.executable, "-c", S2PRO_IMPORT],
-    text=True,
-    capture_output=True,
-)
-if s2pro_ready.returncode == 0:
-    print("ok   fish_speech imports (S2 Pro is selectable once its weights are downloaded)")
+    if s2pro_pkg.returncode == 0:
+        print("ok   fish_speech installed")
+        failed = pip_install(
+            S2PRO_PACKAGES,
+            label="     installing the modules it imports:",
+        )
+        if failed:
+            print("--   these did not install:", ", ".join(failed))
+            print("     S2 Pro may still work if none of them is on its import path.")
+    else:
+        print("--   fish_speech did not install; S2 Pro will be unavailable")
+        for line in (s2pro_pkg.stderr or s2pro_pkg.stdout or "").strip().splitlines()[-3:]:
+            print("       ", line)
+
+    # `fish_speech/models/dac/inference.py` calls
+    # `pyrootutils.setup_root(__file__, indicator=".project-root")` at import time,
+    # which walks up looking for a `.project-root` marker. The wheel does not ship
+    # one and site-packages has no such file above it, so the import dies with
+    # `FileNotFoundError: Project root directory not found` - which is how "S2 Pro
+    # is installed but cannot import" showed up in a real render. The repo keeps a
+    # `.project-root` at its root for exactly this reason; drop the same marker
+    # next to the installed package so the search terminates there.
+    if s2pro_pkg.returncode == 0:
+        marker = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import os, fish_speech;"
+                "p = os.path.join(fish_speech.__path__[0], '.project-root');"
+                "open(p, 'a').close();"
+                "print('marker:', p)",
+            ],
+            text=True,
+            capture_output=True,
+        )
+        print("ok   " + (marker.stdout or "pyrootutils marker written").strip())
+
+    # As with Demucs, only a real import proves it works - and `import fish_speech`
+    # alone does NOT, because the heavy modules (and the pyrootutils call) live
+    # deeper. Ask for the exact modules `S2ProEngine.load()` imports.
+    S2PRO_IMPORT = (
+        "from fish_speech.inference_engine import TTSInferenceEngine;"
+        "from fish_speech.models.dac.inference import load_model;"
+        "from fish_speech.models.text2semantic.inference import "
+        "launch_thread_safe_queue, resolve_codec_path;"
+        "print('ok')"
+    )
+    s2pro_ready = subprocess.run(
+        [sys.executable, "-c", S2PRO_IMPORT],
+        text=True,
+        capture_output=True,
+    )
+    if s2pro_ready.returncode == 0:
+        print("ok   fish_speech imports (S2 Pro is selectable once its weights are downloaded)")
+    else:
+        print("--   fish_speech is installed but cannot import; S2 Pro is unavailable")
+        for line in (s2pro_ready.stderr or s2pro_ready.stdout or "").strip().splitlines()[-3:]:
+            print("       ", line)
+
 else:
-    print("--   fish_speech is installed but cannot import; S2 Pro is unavailable")
-    for line in (s2pro_ready.stderr or s2pro_ready.stdout or "").strip().splitlines()[-3:]:
-        print("       ", line)
+    print("Skipping the optional S2 Pro voice engine.")
+    print("  The Indian languages use IndicF5 by default; S2 Pro is not")
+    print("  needed. Set VIDEOTRANS_INSTALL_S2PRO=1 before this cell to")
+    print("  install it (needs a GPU with ~16 GB free).")
+
+
+# ============================================================
+# protobuf: a stale <3.20 pin breaks the NLLB translator
+# ============================================================
+#
+# `descript-audiotools` (pulled in by the S2 Pro group above) declares
+# `protobuf<3.20`. That pin is stale: protobuf 3.19 ships neither
+# `google.protobuf.runtime_version` nor `google.protobuf.internal.builder`,
+# which the generated code in transformers and sentencepiece imports at import
+# time. The symptom appears at boot, in the translation stage:
+#
+#     [BOOT] Loading translator failed: cannot import name 'runtime_version'
+#     from 'google.protobuf' ... [ImportError] A package the loader imports is
+#     missing. Install it with: pip install transformers sentencepiece
+#
+# protobuf 5.29.5 has both symbols, and tensorboard, transformers and
+# audiotools all import cleanly under it. It cannot be pinned in
+# deploy/constraints.txt: that file is passed as `-c` to the install that pulls
+# audiotools, and `protobuf>=5.29.5` directly contradicts audiotools'
+# `protobuf<3.20`, so pip refuses the whole resolution. Instead it is repaired
+# afterwards, force-reinstalled with --no-deps so the stale pin cannot drag it
+# back down.
+
+PROTOBUF_PROBE = (
+    "import google.protobuf as p;"
+    "from google.protobuf import runtime_version;"
+    "from google.protobuf.internal import builder;"
+    "print(p.__version__)"
+)
+
+protobuf_probe = subprocess.run([sys.executable, "-c", PROTOBUF_PROBE],
+                                capture_output=True, text=True)
+if protobuf_probe.returncode != 0:
+    print("  protobuf is missing runtime_version (a stale pin downgraded it);"
+          " restoring...")
+    subprocess.run(
+        [sys.executable, "-m", "pip", "install", "-q", "--no-deps",
+         "--force-reinstall", "protobuf==5.29.5"],
+        check=False,
+    )
+    protobuf_probe = subprocess.run([sys.executable, "-c", PROTOBUF_PROBE],
+                                    capture_output=True, text=True)
+print("  protobuf", (protobuf_probe.stdout or "?").strip().splitlines()[0]
+      if protobuf_probe.stdout else "?")
 
 
 # ============================================================
@@ -1313,17 +1428,22 @@ fetch is reported here instead of surfacing as a broken render later.
 
 MODELS = code(f"""
 import os
+import sys
 
 # Locate the checkout and work from it, so this cell does not depend on an
 # earlier cell having run in this session.
-REPO_DIR = {REPO_DIR_EXPR}
-os.chdir(REPO_DIR)
-
+{repo_bind()}
 import subprocess
-import sys
+
+# The default set excludes the multi-gigabyte alternative engines (S2 Pro,
+# ~11 GB) so a standard Colab or Kaggle volume is not filled. Ask for them only
+# when S2 Pro was opted into in the install cell.
+_download = [sys.executable, "scripts/download_models.py"]
+if os.environ.get("VIDEOTRANS_INSTALL_S2PRO", "").strip().lower() in ("1", "true", "yes"):
+    _download.append("--extras")
 
 proc = subprocess.Popen(
-    [sys.executable, "scripts/download_models.py"],
+    _download,
     stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
 )
 for line in proc.stdout:
@@ -1342,8 +1462,14 @@ print()
 print("=" * 62)
 print("  Model cache:", models.cache_root())
 for r in models.inventory():
+    if r.get("extra"):
+        # Not fetched by default: it is an alternative engine whose weights
+        # are ~11 GB, which does not fit beside the rest on a Kaggle volume.
+        print(f"  [ skipped] {{r['label']:<20}} {{r['size']:>7}}  (optional extra)")
+        continue
     mark = "present" if r["present"] else "MISSING"
-    print(f"  [{{mark:>7}}] {{r['label']:<20}} {{r['size']:>7}}")
+    tag = "" if r["required"] else "  (optional)"
+    print(f"  [{{mark:>7}}] {{r['label']:<20}} {{r['size']:>7}}{{tag}}")
 print("=" * 62)
 
 # A gated model that was skipped is a warning, not a failure: without it the
@@ -1397,11 +1523,7 @@ VERIFY = code(f"""
 import os
 import sys
 
-REPO_DIR = {REPO_DIR_EXPR}
-if REPO_DIR not in sys.path:
-    sys.path.insert(0, REPO_DIR)
-os.chdir(REPO_DIR)
-
+{repo_bind()}
 import json
 import readiness
 
@@ -1479,10 +1601,9 @@ print("=" * 62)
 if url.startswith(("http://127.0.0.1", "http://localhost")):
     print()
     print("That is the loopback address - reachable only from inside this")
-    print("VM. If this is Colab, the port proxy did not answer; re-run this")
-    print("cell, or open the app through Colab's own proxy with:")
-    print("  from google.colab.output import eval_js")
-    print(f"  eval_js('google.colab.kernel.proxyPort({PORT})')")
+    print("VM. Run the next cell (Open a public URL): on Colab it asks the")
+    print("kernel proxy for a browser-reachable URL, and on Kaggle it opens")
+    print("a Cloudflare tunnel.")
 print()
 print("Keep this notebook tab open while you use the app.")
 if server.log_file is not None:
@@ -1634,56 +1755,46 @@ replaces it.
 """)
 
 TUNNEL_MD = md("""
-## 7b. Open a public URL (Kaggle only)
+## 7c. Open a public URL
 
-Kaggle has no built-in port proxy like Colab's, so to open the interface from
-your own browser we start a Cloudflare quick tunnel. It needs no account and
-prints a throwaway `https://...trycloudflare.com` URL.
+Colab can proxy the port itself, so on Colab the server cell usually prints a
+working `https://...` URL and this cell just confirms it.
 
-Run this cell, copy the URL it prints, and open it with `/app/` on the end. It
-is valid only while this notebook is running.
+Kaggle has no such proxy, so this cell opens a Cloudflare quick tunnel - no
+account, no token - and prints a throwaway `https://...trycloudflare.com` URL.
+Copy it and open it with `/app/` on the end. It is valid only while this
+notebook is running.
+
+It is also the fallback when Colab's proxy does not answer.
 """)
 
 TUNNEL = code("""
 import os
-import re
-import subprocess
-import time
 
-CLOUDFLARED = "/kaggle/working/cloudflared"
-if not os.path.exists(CLOUDFLARED):
-    print("Downloading cloudflared...")
-    subprocess.run(
-        ["wget", "-q", "-O", CLOUDFLARED,
-         "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"],
-        check=True,
-    )
-    os.chmod(CLOUDFLARED, 0o755)
+# If the server cell already produced a reachable public URL - Colab's kernel
+# proxy - there is nothing to do. Otherwise open a Cloudflare quick tunnel,
+# which works on Colab and Kaggle alike and needs no account.
+current = runtime.notebook_public_url(PORT)
 
-log_path = "/kaggle/working/cloudflared.log"
-log = open(log_path, "w+")
-tunnel = subprocess.Popen(
-    [CLOUDFLARED, "tunnel", "--url", f"http://127.0.0.1:{PORT}", "--no-autoupdate"],
-    stdout=log, stderr=subprocess.STDOUT,
-)
-
-public = None
-for _ in range(60):
-    time.sleep(1)
-    log.flush()
-    log.seek(0)
-    match = re.search(r"https://[-a-z0-9]+\\.trycloudflare\\.com", log.read())
-    if match:
-        public = match.group(0)
-        break
-
-if public:
-    os.environ["PUBLIC_HOST"] = public.replace("https://", "")
-    print("=" * 62)
-    print("  Public URL:", public + "/app/")
-    print("=" * 62)
+if not current.startswith(("http://127.0.0.1", "http://localhost")):
+    print("Already reachable from your browser at:")
+    print("  " + current + "/app/")
 else:
-    print("The tunnel did not come up. See", log_path)
+    print("No public URL yet; opening a Cloudflare quick tunnel...")
+    public = runtime.cloudflared_public_url(PORT)
+    if public:
+        print()
+        print("=" * 62)
+        print("  Public URL: " + public + "/app/")
+        print("=" * 62)
+        print("Open that in your browser. It is valid only while this")
+        print("notebook is running.")
+    else:
+        print()
+        print("The tunnel did not come up. The app is reachable only from")
+        print("inside this VM at " + current + "/app/.")
+        print("Re-run this cell, or open the app through the platform proxy")
+        print("if there is one.")
 """)
 
 STOP_MD = md("""
@@ -1697,10 +1808,8 @@ STOP = code("""
 server.stop()
 print("Server stopped:", not server.is_running())
 
-# Also stop the tunnel if one was started in the tunnel cell.
-_tunnel = globals().get("tunnel")
-if _tunnel is not None:
-    _tunnel.terminate()
+# Also stop a Cloudflare tunnel if the URL cell opened one.
+if runtime.stop_tunnel():
     print("Tunnel stopped.")
 """)
 
@@ -1721,6 +1830,8 @@ TROUBLE = md("""
 | `WARNING: ... was skipped (gated, no HF_TOKEN)` | Expected without a token. Indian languages are unavailable; everything else works. |
 | A language is refused when you press Render | That language's voice model is not installed. The language list says which and why. Indian languages need `HF_TOKEN`; the others need `pip install "TTS>=0.22.0"`. |
 | S2 Pro is refused even though it installed | Its ~11 GB weights are a separate download. Fetch `extraplus/s2-pro` from Settings, or set the voice engine back to *Automatic*. |
+| `S2 Pro needs about 12 GB of free GPU memory` | The card is too small to hold S2 Pro beside Whisper and Wav2Lip. Use a larger GPU, or leave the voice engine on *Automatic* (IndicF5). |
+| The runtime dies with "max usage of RAM" | The session ran out of system memory, not VRAM. This build frees scratch memory between boot stages and does not install or load the 11 GB S2 Pro engine unless `VIDEOTRANS_INSTALL_S2PRO=1` is set. Make sure that variable is unset, then restart and re-run from cell 1. |
 | S2 Pro renders sound wrong after installing it | `fish_speech` pins `torch==2.8`; installing it without `--no-deps` replaces the CUDA-12 torch 2.6 build and breaks CTranslate2 with `libcublas.so.12`. Re-run the install cell, which installs it `--no-deps`. |
 | `401`/`403` when fetching models | The gated voice model needs a token. Accept the licence at <https://huggingface.co/ai4bharat/IndicF5>, set `HF_TOKEN`, re-run the token and model cells. |
 | Renders are still slow | Confirm the GPU line in cell 2. A CPU render is correct, just slow. |
@@ -1742,10 +1853,11 @@ TROUBLE = md("""
 SHARED = [TITLE, GET_CODE_MD, GET_CODE, CHECK_MD, CHECK, RUNTIME_MD, RUNTIME,
           TOKEN_MD, TOKEN, INSTALL_MD, INSTALL, MODELS_MD, MODELS,
           VERIFY_MD, VERIFY,
-          SERVER_MD, SERVER, LOG_MD, LOG, STAGES_MD, STAGES, USE_MD]
+          SERVER_MD, SERVER, LOG_MD, LOG, STAGES_MD, STAGES, USE_MD,
+          TUNNEL_MD, TUNNEL]
 
 COLAB = SHARED + [STOP_MD, STOP, TROUBLE]
-KAGGLE = SHARED + [TUNNEL_MD, TUNNEL, STOP_MD, STOP, TROUBLE]
+KAGGLE = SHARED + [STOP_MD, STOP, TROUBLE]
 
 
 def write(path: str, cells: list[dict]) -> None:

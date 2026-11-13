@@ -147,16 +147,20 @@ def engine_for(code: str) -> str:
     """
     The engine that should speak `code`.
 
-    Each language has a house engine (IndicF5 for the Indian eleven, XTTS for
-    the rest), but S2 Pro speaks most of both sets and is the preferred voice.
-    The preference lives in `VIDEOTRANS_TTS_ENGINE` (an operator can export it)
-    or the stored studio setting, whichever is set:
+    Each language has a house engine: IndicF5 for the Indian eleven, XTTS for
+    the rest. That house engine is the DEFAULT, and `auto` always returns it.
 
-      `auto` (the default) prefers S2 Pro wherever it can speak the language
-      AND is actually installed — the `fish_speech` package plus its ~11 GB of
-      weights. When it is not installed, which is the normal state of a fresh
-      clone, `auto` falls back to the house engine, so a default install keeps
-      working untouched.
+    S2 Pro speaks most of both sets and is a larger, optional voice model, but
+    it is a ~5B model with 10+ GB of weights that loads entirely onto the GPU.
+    On a free T4 (14.56 GiB) that leaves nothing for Whisper or Wav2Lip, so a
+    session that boots it OOMs the rest of the pipeline. It is therefore
+    OPT-IN: chosen only when the operator or the studio setting asks for it by
+    name. The preference lives in `VIDEOTRANS_TTS_ENGINE` (an operator can
+    export it) or the stored studio setting, whichever is set:
+
+      `auto` (the default) keeps the house engine - IndicF5 for the Indian
+      languages, XTTS for the rest. These are the small models a free GPU can
+      hold alongside Whisper and Wav2Lip.
 
       Any other value is honoured only when that engine actually covers the
       language, so pinning S2 Pro does not silently break Odia, which it cannot
@@ -168,32 +172,14 @@ def engine_for(code: str) -> str:
     house = LANGUAGES[c]["engine"]
     want = preferred_engine()
     if want in ("", "auto"):
-        # The requested default. `_engine_ready` is what keeps it safe: S2 Pro
-        # is only chosen when it can actually run here.
-        if (house != ENGINE_S2PRO and engine_supports(ENGINE_S2PRO, c)
-                and _engine_ready(ENGINE_S2PRO)):
-            return ENGINE_S2PRO
+        # The default is the house engine. S2 Pro is never selected implicitly:
+        # it is a 5B model that fills the GPU and starves the other stages, so
+        # only an explicit pin may choose it.
         return house
     if want in _ENGINE_NATIVE and c in _ENGINE_NATIVE[want]:
         return want
     # The pin does not cover this language; the house engine still does.
     return house
-
-
-def _engine_ready(engine: str) -> bool:
-    """
-    Whether an engine is installed and usable here, without importing it eagerly.
-
-    `tts_engines` owns the availability checks and imports this module at the
-    top, so the import is local to keep the pair acyclic. A failure to import
-    means "not ready", which is the safe answer: it can only ever send a
-    language back to its house engine, never break a render.
-    """
-    try:
-        import tts_engines
-        return bool(tts_engines.engine_available(engine))
-    except Exception:                                        # noqa: BLE001
-        return False
 
 
 def engine_supports(engine: str, code: str) -> bool:

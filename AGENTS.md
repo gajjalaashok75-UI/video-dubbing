@@ -548,3 +548,61 @@ make that fight silent. What actually bites:
   any change under `apps/studio/src`, run `cd apps/studio && npm run build` and
   commit `web/` in the same change; commit 48f2486 changed the source and left
   the committed bundle stale.
+
+## Hosted-runtime memory and the S2 Pro engine
+
+The reported failure on Colab was the kernel dying with "max usage of RAM" after
+the RAM climbed 0 -> 4.6 -> 9.6 -> ~12.5 GB. System RAM, not VRAM, and the voice
+engine was the cause:
+
+- S2 Pro is a ~5B model whose ~11 GB of weights are downloaded and loaded onto
+  the GPU at boot. It was in the DEFAULT model set and `engine_for("auto")`
+  preferred it wherever it could speak the language, so a plain top-to-bottom
+  run pulled the 11 GB, loaded it, and died. It is now opt-in end to end:
+  - `VIDEOTRANS_INSTALL_S2PRO=1` gates the notebook install block.
+  - `engine/models.py` marks the weights `extra=True`; `download_models.py`
+    excludes extras unless `--extras` (or `--only <id>`) is passed, and the
+    notebook passes `--extras` only when the install was opted in. 11 GB beside
+    the other ~7.5 GB overflows a Kaggle working volume.
+  - `languages.engine_for("auto")` returns the house engine (IndicF5/XTTS)
+    unconditionally; S2 Pro is chosen only when pinned by name.
+- `tts_engines._require_room_for_s2pro` refuses a load with under 12 GB free
+  (S2 Pro beside Whisper/Wav2Lip on a 14.56 GiB T4), raising a named
+  `SynthesisError` instead of letting the allocator take the kernel down.
+- `app._release_memory()` (`gc.collect` + `torch.cuda.empty_cache`/`ipc_collect`)
+  runs after EVERY warmup stage, in a `finally`, so a stage that fails still
+  returns what it allocated. `dubbing.synthesize_timeline` collects every
+  `_RELEASE_EVERY_UNITS` phrases.
+- `configure_runtime` sets `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`
+  (a default only; an operator's value is kept) so the caching allocator hands
+  back the transient load-time peaks instead of holding the running sum.
+
+## Platform detection and the notebook checkout path
+
+`detect_platform` is environment-variable first and tests Kaggle before Colab: a
+Kaggle image also mounts `/content`, so a `/content`-first test called it "colab"
+and split one session across two volumes (runtime tree under `/content`,
+checkout under `/kaggle/working`). The notebooks resolve the checkout ONCE, in
+cell 1, via `_resolve_repo_dir()` and publish it as `VIDEOTRANS_REPO_DIR`; every
+later cell reads that (`repo_bind()`), so no cell recomputes a different path and
+`os.chdir`s into a directory that does not exist. A checkout is recognised by
+`requirements.txt`, not `.git`, so an unzipped copy is used as-is.
+
+## The public URL cell
+
+Both notebooks share one "Open a public URL" cell (Colab no longer needs a
+Kaggle-only tunnel). It calls `runtime.notebook_public_url(PORT)` first - Colab's
+kernel proxy answers there - and only opens a Cloudflare quick tunnel
+(`runtime.cloudflared_public_url`) when that returned loopback. The tunnel
+process is kept in `deploy_helpers._TUNNEL_PROC` so the Stop cell can end it with
+`runtime.stop_tunnel()`; the tunnel cell no longer carries its own global.
+
+## protobuf repair
+
+`descript-audiotools` (pulled in by the S2 Pro group) pins `protobuf<3.20`,
+which removes `google.protobuf.runtime_version` and
+`google.protobuf.internal.builder`; the NLLB translator then fails to import at
+boot. It cannot be pinned in `deploy/constraints.txt` (that would contradict
+audiotools' pin and pip refuses the resolution), so the install cell probes for
+both symbols and force-reinstalls `protobuf==5.29.5 --no-deps` when they are
+missing.

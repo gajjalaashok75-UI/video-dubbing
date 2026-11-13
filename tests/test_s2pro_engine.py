@@ -15,6 +15,7 @@ import os
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "engine"))
@@ -63,6 +64,17 @@ class RegistrationTests(_NoEnv):
         entry = next(e for e in M.MODELS if e["id"] == "extraplus/s2-pro")
         self.assertFalse(entry.get("gated", False))
 
+    def test_the_weights_are_not_in_the_default_download_set(self):
+        # 11 GB beside the other ~7.5 GB overflows a Kaggle working volume, and
+        # nothing loads it unless the user pins the engine. `extra` keeps it out
+        # of a default fetch and out of `missing(core_only=True)`.
+        entry = next(e for e in M.MODELS if e["id"] == "extraplus/s2-pro")
+        self.assertTrue(entry.get("extra"))
+        core = [r["id"] for r in M.missing(core_only=True)]
+        self.assertNotIn("extraplus/s2-pro", core)
+        full = [r["id"] for r in M.missing(core_only=False)]
+        self.assertIn("extraplus/s2-pro", full)
+
     def test_the_catalogue_offers_a_voice_stage(self):
         self.assertIn("voice", E.CATALOG)
         ids = {o["id"] for o in E.CATALOG["voice"]["options"]}
@@ -81,26 +93,18 @@ class PreferenceTests(_NoEnv):
         self.assertEqual(L.engine_for("hi"), "indicf5")
         self.assertEqual(L.engine_for("en"), "xtts")
 
-    def test_auto_falls_back_to_the_house_engine_without_the_weights(self):
-        # The reported request was "set S2 Pro as the default". It is the
-        # preferred voice, but a fresh clone has neither the fish_speech
-        # package nor the 11 GB of weights, so auto must not send every render
-        # to an engine that cannot load. Here nothing is installed, so every
-        # language stays on its house engine.
-        T._AVAILABLE.clear()
-        for code in ("hi", "te", "en", "ja"):
-            self.assertNotEqual(L.engine_for(code), "s2pro")
-
-    def test_auto_prefers_s2pro_once_it_is_installed(self):
-        # With the package and weights present, auto becomes S2 Pro for every
-        # language it covers - the "default" the request asked for.
+    def test_auto_never_selects_s2pro_even_when_it_is_installed(self):
+        # S2 Pro is a ~5B model whose weights fill a free T4 and starve Whisper
+        # and Wav2Lip. It must stay OPT-IN: `auto` keeps the house engine even
+        # when the package and the 11 GB of weights are present. Only an
+        # explicit pin may choose it.
         T._AVAILABLE["s2pro"] = True
         try:
-            self.assertEqual(L.engine_for("hi"), "s2pro")
-            self.assertEqual(L.engine_for("en"), "s2pro")
-            # Odia is still IndicF5: S2 Pro cannot speak it, so preferring it
-            # must never take Odia's voice away.
-            self.assertEqual(L.engine_for("or"), "indicf5")
+            for code in ("hi", "te", "en", "ja", "or"):
+                self.assertNotEqual(L.engine_for(code), "s2pro",
+                                    "auto must not implicitly boot S2 Pro")
+            self.assertEqual(L.engine_for("hi"), "indicf5")
+            self.assertEqual(L.engine_for("en"), "xtts")
         finally:
             T._AVAILABLE.clear()
 
@@ -260,6 +264,59 @@ class GracefulFailureTests(_NoEnv):
         with self.assertRaises(T.SynthesisError) as ctx:
             T.S2ProEngine().load()
         self.assertIn("fish-speech", str(ctx.exception))
+
+
+class VramGuardTests(_NoEnv):
+    """
+    A load that cannot fit must be refused, not left to the allocator.
+
+    S2 Pro's bf16 weights are ~11 GB. Loading it on a 14.56 GiB T4 with the
+    other models resident does not just fail - the allocator takes the whole
+    kernel down, which the user sees as the runtime dying. The guard reads the
+    free memory first and raises a named error instead.
+    """
+
+    def test_a_tight_gpu_is_refused(self):
+        with mock.patch.object(T, "_free_vram_gb", lambda: 4.0):
+            with self.assertRaises(T.SynthesisError) as ctx:
+                T._require_room_for_s2pro("cuda")
+        self.assertIn("12 GB", str(ctx.exception))
+        self.assertIn("IndicF5", str(ctx.exception))
+
+    def test_a_roomy_gpu_is_allowed(self):
+        with mock.patch.object(T, "_free_vram_gb", lambda: 15.0):
+            T._require_room_for_s2pro("cuda")     # does not raise
+
+    def test_an_unknown_free_memory_does_not_block(self):
+        # `_free_vram_gb` returns None when the query is unavailable (CPU, MPS,
+        # a driver hiccup). That must not read as "zero free" and refuse a load
+        # that would in fact have worked.
+        with mock.patch.object(T, "_free_vram_gb", lambda: None):
+            T._require_room_for_s2pro("cuda")     # does not raise
+
+    def test_a_non_cuda_device_is_never_blocked(self):
+        with mock.patch.object(T, "_free_vram_gb",
+                               side_effect=AssertionError("must not query")):
+            T._require_room_for_s2pro("cpu")
+            T._require_room_for_s2pro("mps")
+
+    def test_the_free_memory_reads_the_device(self):
+        # A real read, not a mock: on a machine without CUDA it must say so
+        # rather than invent a number.
+        free = T._free_vram_gb()
+        if _cuda():
+            self.assertIsInstance(free, float)
+            self.assertGreater(free, 0)
+        else:
+            self.assertIsNone(free)
+
+
+def _cuda() -> bool:
+    try:
+        import torch
+        return torch.cuda.is_available()
+    except Exception:                                        # noqa: BLE001
+        return False
 
 
 class PipInstallTests(unittest.TestCase):

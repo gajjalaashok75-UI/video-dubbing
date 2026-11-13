@@ -17,9 +17,11 @@ notebooks, since those are what actually run.
 from __future__ import annotations
 
 import json
+import os
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "engine"))
@@ -43,16 +45,19 @@ class _FakePath:
 class _FakeOs:
     """Just enough of `os` to evaluate the notebook's expression."""
 
-    def __init__(self, dirs: set[str], cwd: str = "/somewhere") -> None:
+    def __init__(self, dirs: set[str], cwd: str = "/somewhere",
+                 env: dict | None = None) -> None:
         self.path = _FakePath(dirs)
         self._cwd = cwd
+        self.environ = dict(env or {})
 
     def getcwd(self) -> str:
         return self._cwd
 
 
-def repo_dir_from_notebook(dirs: set[str]) -> str:
-    return eval(build_notebooks.REPO_DIR_EXPR, {"os": _FakeOs(dirs)})  # noqa: S307
+def repo_dir_from_notebook(dirs: set[str], env: dict | None = None) -> str:
+    return eval(build_notebooks.REPO_DIR_EXPR,          # noqa: S307
+                {"os": _FakeOs(dirs, env=env)})
 
 
 def notebook_source(path: Path) -> str:
@@ -71,10 +76,23 @@ class RepoDirRuleTests(unittest.TestCase):
                     "different volumes",
                 )
 
-    def test_notebook_rule_picks_colab_first(self):
-        # The regression: both directories exist, so order decides.
+    def test_notebook_rule_picks_kaggle_when_both_directories_exist(self):
+        # The regression: a Kaggle image also mounts /content, so the two
+        # markers are not mutually exclusive and order decides. Kaggle is tested
+        # first, matching `detect_platform`, so the checkout and the runtime tree
+        # land on the same volume.
         self.assertEqual(repo_dir_from_notebook({"/content", "/kaggle"}),
-                         "/content/video-dubbing")
+                         "/kaggle/working/video-dubbing")
+
+    def test_the_platform_environment_variables_decide(self):
+        # The marker each platform actually sets is definitive; the directories
+        # are only a fallback for an image that sets neither.
+        self.assertEqual(
+            repo_dir_from_notebook(set(), {"KAGGLE_KERNEL_RUN_TYPE": "Interactive"}),
+            "/kaggle/working/video-dubbing")
+        self.assertEqual(
+            repo_dir_from_notebook(set(), {"COLAB_GPU": "1"}),
+            "/content/video-dubbing")
 
     def test_notebook_rule_on_each_platform(self):
         self.assertEqual(repo_dir_from_notebook({"/content"}), "/content/video-dubbing")
@@ -92,6 +110,67 @@ class RepoDirRuleTests(unittest.TestCase):
             with self.subTest(platform=platform):
                 self.assertEqual(repo_dir_from_notebook(dirs),
                                  runtime.repo_dir(platform).as_posix())
+
+    def test_notebook_rule_and_detect_platform_agree_when_both_exist(self):
+        # The two must not disagree: the bug was detect_platform saying "colab"
+        # (runtime tree under /content) while the checkout went to /kaggle.
+        for dirs in ({"/content", "/kaggle"}, {"/content"}, {"/kaggle"}, set()):
+            with self.subTest(dirs=dirs):
+                chosen = repo_dir_from_notebook(dirs)
+                fake = _FakeOs(dirs)
+                if fake.environ.get("KAGGLE_KERNEL_RUN_TYPE") or "/kaggle" in dirs:
+                    platform = "kaggle"
+                elif fake.environ.get("COLAB_GPU") or "/content" in dirs:
+                    platform = "colab"
+                else:
+                    platform = None
+                if platform is not None:
+                    self.assertEqual(chosen, runtime.repo_dir(platform).as_posix())
+
+
+class DetectPlatformTests(unittest.TestCase):
+    """Kaggle must win over Colab when both markers are present.
+
+    A Kaggle image also mounts /content, so a `/content`-first test called a
+    Kaggle session "colab": the runtime tree went to /content/videotrans-runtime
+    while the checkout was under /kaggle/working. The environment variables come
+    first because they are definitive; the directories are only a fallback.
+    """
+
+    def _detect(self, dirs, env):
+        with mock.patch.dict(os.environ, env, clear=True), \
+                mock.patch("os.path.isdir", lambda p: p in dirs), \
+                mock.patch("os.path.exists", lambda p: p == "/.dockerenv"
+                           and "/.dockerenv" in dirs):
+            return runtime.detect_platform()
+
+    def test_kaggle_env_var_beats_a_content_mount(self):
+        self.assertEqual(
+            self._detect({"/content", "/kaggle"},
+                         {"KAGGLE_KERNEL_RUN_TYPE": "Interactive"}),
+            "kaggle")
+
+    def test_kaggle_directory_beats_a_content_mount(self):
+        self.assertEqual(self._detect({"/content", "/kaggle"}, {}), "kaggle")
+
+    def test_colab_env_var(self):
+        self.assertEqual(self._detect(set(), {"COLAB_GPU": "1"}), "colab")
+
+    def test_colab_directory(self):
+        self.assertEqual(self._detect({"/content"}, {}), "colab")
+
+    def test_docker(self):
+        self.assertEqual(self._detect({"/.dockerenv"}, {}), "docker")
+
+    def test_local(self):
+        self.assertEqual(self._detect(set(), {}), "local")
+
+    def test_agrees_with_repo_dir_for_kaggle_when_both_exist(self):
+        # detect_platform and repo_dir must pick the same platform.
+        platform = self._detect({"/content", "/kaggle"}, {})
+        self.assertEqual(platform, "kaggle")
+        self.assertEqual(runtime.repo_dir(platform).as_posix(),
+                         "/kaggle/working/video-dubbing")
 
 
 class GeneratedNotebookTests(unittest.TestCase):
@@ -114,11 +193,18 @@ class GeneratedNotebookTests(unittest.TestCase):
                               "fetched during setup")
 
     def test_both_notebooks_use_the_shared_repo_dir_rule(self):
+        # One resolver, decided once, in the first cell. The cells used to
+        # recompute REPO_DIR independently and disagree, so a Kaggle session
+        # whose checkout was at /kaggle/working/video-dubbing had a later cell
+        # `os.chdir` into /content/video-dubbing and raise FileNotFoundError.
         for path in NOTEBOOKS:
             with self.subTest(notebook=path.name):
                 src = notebook_source(path)
-                self.assertIn('"/content/video-dubbing" if os.path.isdir("/content")', src)
-                self.assertIn('else "/kaggle/working/video-dubbing" if os.path.isdir("/kaggle")', src)
+                self.assertIn("def _resolve_repo_dir():", src)
+                self.assertIn('os.environ["VIDEOTRANS_REPO_DIR"] = REPO_DIR', src)
+                self.assertIn('os.environ.get("VIDEOTRANS_REPO_DIR")', src)
+                self.assertIn('"/kaggle/working/video-dubbing"', src)
+                self.assertIn('"/content/video-dubbing"', src)
 
     def test_both_notebooks_read_the_platform_secret(self):
         # A secret added after the kernel started is not in os.environ; the

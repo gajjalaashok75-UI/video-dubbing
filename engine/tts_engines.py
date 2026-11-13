@@ -59,8 +59,54 @@ def _ensure_mps_fallback():
         _MPS_FALLBACK_SET = True
 
 
+def _free_vram_gb() -> float | None:
+    """
+    Free device memory in GB, or None when it cannot be read.
+
+    Used to refuse a load that would not fit rather than let the allocator OOM
+    the whole kernel. Returns None on CPU/MPS or when the driver query fails, so
+    the caller treats "unknown" as "do not block".
+    """
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            return None
+        free, _total = torch.cuda.mem_get_info()
+        return free / (1024 ** 3)
+    except Exception:                                        # noqa: BLE001
+        return None
+
+
 class SynthesisError(RuntimeError):
     pass
+
+
+# S2 Pro's bf16 weights are ~11 GB and the load peak is higher still. Below
+# this much free device memory the load cannot finish without starving the
+# models already resident.
+_S2PRO_MIN_FREE_GB = 12.0
+
+
+def _require_room_for_s2pro(device: str) -> None:
+    """
+    Raise `SynthesisError` when S2 Pro cannot fit on `device`.
+
+    On a free T4 (14.56 GiB) a load that leaves no headroom takes Whisper and
+    Wav2Lip down with it - the whole session dies with an allocator error that
+    reads like a platform crash. Refusing up front, with a message that names
+    the fix, turns that into a clean per-engine failure. A device that is not
+    CUDA, or whose free memory cannot be read, is never blocked.
+    """
+    if device != "cuda":
+        return
+    free = _free_vram_gb()
+    if free is not None and free < _S2PRO_MIN_FREE_GB:
+        raise SynthesisError(
+            f"S2 Pro needs about {_S2PRO_MIN_FREE_GB:.0f} GB of free GPU memory "
+            f"but only {free:.1f} GB is free. It will not fit beside the other "
+            f"models on this GPU. Use a larger GPU, or set the voice engine to "
+            f"Automatic (IndicF5) for the Indian languages."
+        )
 
 
 _TORCHAUDIO_PATCHED = False
@@ -702,6 +748,8 @@ class S2ProEngine:
             import torch
             _ensure_mps_fallback()
             self.device = _pick_device()
+            # Refuse a load that cannot fit before it starts (see the helper).
+            _require_room_for_s2pro(self.device)
             checkpoint = _s2pro_checkpoint_dir()
             # bfloat16 is the upstream server's default (`--half` opts into
             # fp16). It is the safer of the two across Ampere and older cards,

@@ -83,10 +83,13 @@ MODELS = [
     # deployment can pin it with VIDEOTRANS_TTS_ENGINE=s2pro. Not `required`:
     # IndicF5 is the default voice and this is a ~11 GB alternative. Ungated on
     # the Hub, but under the Fish Audio Research License (non-commercial).
+    # `extra` marks it as not part of the default set: 11 GB on top of the
+    # other ~7.5 GB overflows a Kaggle working volume, and a default run never
+    # loads it. The notebook fetches it only when S2 Pro is opted into.
     dict(label="Voice cloning (S2 Pro)", id="extraplus/s2-pro",
          why="An alternative cloning engine for VIDEOTRANS_TTS_ENGINE=s2pro. "
              "Needs the fish_speech package; research/non-commercial only",
-         size="11 GB", required=False,
+         size="11 GB", required=False, extra=True,
          files=("config.json", "codec.pth", "model.safetensors.index.json",
                 "model-00001-of-00002.safetensors",
                 "model-00002-of-00002.safetensors",
@@ -341,6 +344,7 @@ def inventory() -> list[dict]:
             "id": entry["id"], "label": entry["label"], "why": entry["why"],
             "size": entry["size"], "required": bool(entry["required"]),
             "kind": "hub", "gated": bool(entry.get("gated")),
+            "extra": bool(entry.get("extra")),
             "present": is_cached(entry["id"], entry["files"]),
         })
     for label, rel, size, want_bytes, want_sha, mirrors in WEIGHTS:
@@ -349,6 +353,7 @@ def inventory() -> list[dict]:
             "id": rel, "label": label,
             "why": WEIGHT_NOTES.get(label, ""),
             "size": size, "required": True, "kind": "file", "gated": False,
+            "extra": False,
             "present": os.path.isfile(path)
                        and os.path.getsize(path) == want_bytes,
         })
@@ -356,8 +361,16 @@ def inventory() -> list[dict]:
 
 
 def missing(core_only: bool = False) -> list[dict]:
+    """
+    Models that are not here yet.
+
+    `core_only` also drops the `extra` entries - the alternative engines whose
+    weights are many gigabytes and that a default run never loads - so a hosted
+    setup does not pull them just because they are absent.
+    """
     return [r for r in inventory()
-            if not r["present"] and (r["required"] or not core_only)]
+            if not r["present"] and (r["required"] or not core_only)
+            and not (core_only and r.get("extra"))]
 
 
 # ---------------------------------------------------------------------------

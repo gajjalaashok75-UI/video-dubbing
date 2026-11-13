@@ -28,6 +28,7 @@ speaker's reference voice. A video with no diarization has one implicit
 unchanged; see `speakers`.
 """
 
+import gc
 import os
 from contextlib import contextmanager
 
@@ -38,6 +39,11 @@ import speakers as SPK
 import tts_engines
 
 SAMPLE_RATE = 24000
+
+# How often the synth loop collects garbage, in units. Chosen so a long video
+# collects every few seconds of speech without the collection itself showing up
+# in the render time.
+_RELEASE_EVERY_UNITS = 8
 
 # How far the speaking rate may deviate from the reference speaker's natural
 # rate. r = natural_duration / allotted_duration; r > 1 means talking faster.
@@ -867,6 +873,13 @@ def synthesize_timeline(plan: list, ref_path: str, ref_text: str, ref_duration: 
         waves[unit["index"]] = wave
         if cache_dir:
             write_unit(cache_dir, unit["index"], wave)
+
+        # The synth loop is the longest part of a render and allocates a fresh
+        # wave (and the model's scratch buffers) per phrase. A periodic
+        # collection keeps the Python-side footprint flat on a long video
+        # instead of letting cyclic garbage accumulate for the whole job.
+        if (n + 1) % _RELEASE_EVERY_UNITS == 0:
+            gc.collect()
 
     if failures and len(failures) == len(plan):
         raise RuntimeError(

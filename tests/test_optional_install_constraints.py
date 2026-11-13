@@ -185,10 +185,20 @@ class CheckoutCellTests(unittest.TestCase):
         self.assertIn("HAVE_CODE = _is_checkout(REPO_DIR)", self.generator)
 
     def test_an_unzipped_copy_away_from_repo_dir_is_still_found(self):
-        # The user may unzip into a differently named folder; walking up from
-        # the working directory finds it before the clone fallback.
+        # The user may unzip into a differently named folder; the resolver looks
+        # at the platform candidates and then walks up from the working
+        # directory before falling back to a clone.
+        self.assertIn("def _resolve_repo_dir():", self.generator)
         self.assertIn("while True:", self.generator)
-        self.assertIn("REPO_DIR = here", self.generator)
+        self.assertIn("return here", self.generator)
+
+    def test_the_resolved_path_is_shared_through_the_environment(self):
+        # One value, every cell. The cells used to recompute REPO_DIR and
+        # disagree; a later cell then chdir'd into a directory that did not
+        # exist on that platform.
+        self.assertIn('os.environ["VIDEOTRANS_REPO_DIR"] = REPO_DIR',
+                      self.generator)
+        self.assertIn('os.environ.get("VIDEOTRANS_REPO_DIR")', self.generator)
 
     def test_an_existing_checkout_is_not_re_cloned(self):
         self.assertIn("Using the repository already present", self.generator)

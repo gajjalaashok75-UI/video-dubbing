@@ -44,6 +44,7 @@ from pathlib import Path
 
 __all__ = [
     "ServerHandle",
+    "cloudflared_public_url",
     "configure_runtime",
     "constraints_path",
     "default_runtime_root",
@@ -60,6 +61,7 @@ __all__ = [
     "server_log_path",
     "stale_modules",
     "start_server",
+    "stop_tunnel",
     "stray_cuda13_packages",
     "wait_until_ready",
 ]
@@ -98,14 +100,22 @@ def detect_platform() -> str:
     Which hosted environment this is: `colab`, `kaggle`, `docker`, or `local`.
 
     Detection is by the marker each platform actually sets, not by guessing from
-    the hostname: Colab sets `COLAB_*` environment variables and mounts
-    `/content`, Kaggle ships a `/kaggle` directory, and Docker leaves
-    `/.dockerenv`.
+    the hostname. Environment variables come FIRST, because they are definitive
+    and the directory markers are not: a Kaggle image also mounts `/content`, so
+    testing `/content` first mislabelled Kaggle as Colab. The runtime tree then
+    went to `/content/videotrans-runtime` while the checkout was under
+    `/kaggle/working`, and the next cell's `os.chdir("/content/video-dubbing")`
+    raised `FileNotFoundError` on a session that had cloned perfectly well.
+
+    Order for the directory fallback: `/kaggle` before `/content`, matching the
+    notebook's repo-dir expression, so the two never disagree on a machine that
+    carries both.
     """
+    if (os.environ.get("KAGGLE_KERNEL_RUN_TYPE") is not None
+            or os.path.isdir("/kaggle")):
+        return "kaggle"
     if os.environ.get("COLAB_GPU") is not None or os.path.isdir("/content"):
         return "colab"
-    if os.path.isdir("/kaggle") or os.environ.get("KAGGLE_KERNEL_RUN_TYPE"):
-        return "kaggle"
     if os.path.exists("/.dockerenv"):
         return "docker"
     return "local"
@@ -207,6 +217,14 @@ def configure_runtime(root: str | Path | None = None) -> dict[str, Path]:
     # discarded on restart, so the ~7.5 GB of weights would be re-fetched every
     # session (and can fail outright when the home volume is full).
     os.environ.setdefault("HF_HOME", str(dirs["hf"]))
+    # Four models share one GPU here (Whisper, NLLB, Wav2Lip, the voice model),
+    # and their load-time peaks are transient. The default caching allocator
+    # keeps those freed blocks reserved, so the reserved total climbs to the sum
+    # of every peak and a 14.56 GiB T4 OOMs even though the live tensors fit.
+    # `expandable_segments` lets the allocator hand those blocks back, which is
+    # what keeps the peak near the high-water mark of the *live* set instead of
+    # the running sum. Only a default: an operator who set it keeps theirs.
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     return dirs
 
 
@@ -455,6 +473,97 @@ def notebook_public_url(port: int, host: str = "0.0.0.0") -> str:
         if proxy is not None:
             return proxy
     return public_url(port, host)
+
+
+# The tunnel process `cloudflared_public_url` starts, if any, so the notebook's
+# Stop cell can end it without a global the cell has to carry itself.
+_TUNNEL_PROC = None
+
+
+def cloudflared_public_url(port: int, timeout: int = 90) -> str | None:
+    """
+    A public https URL for `port` from a Cloudflare quick tunnel, or None.
+
+    Kaggle has no built-in port proxy, so a tunnel is the only way to open the
+    studio from the user's own browser; on Colab the kernel proxy is preferred
+    and this is the fallback. A quick tunnel needs no account and prints a
+    throwaway `https://<random>.trycloudflare.com` that lives only as long as
+    the notebook.
+
+    The binary is fetched once into the runtime tree - a writable volume - not
+    into the checkout, which can be read-only. Never raises: a failed download,
+    a spawn failure, or a timeout waiting for the URL all return None so the
+    caller can fall back to the loopback URL and say so.
+    """
+    import re
+
+    proc = None
+    try:
+        tools = runtime_dirs()["logs"].parent / "tools"
+        tools.mkdir(parents=True, exist_ok=True)
+        binary = tools / "cloudflared"
+        if not binary.exists():
+            url = ("https://github.com/cloudflare/cloudflared/releases/latest/"
+                   "download/cloudflared-linux-amd64")
+            fetched = subprocess.run(
+                ["wget", "-q", "-O", str(binary), url],
+                capture_output=True, text=True, timeout=300)
+            if fetched.returncode != 0 or not binary.exists():
+                return None
+            binary.chmod(0o755)
+
+        log_path = tools / "cloudflared.log"
+        log = open(log_path, "w")
+        try:
+            proc = subprocess.Popen(
+                [str(binary), "tunnel", "--url", f"http://127.0.0.1:{port}",
+                 "--no-autoupdate"],
+                stdout=log, stderr=subprocess.STDOUT)
+        finally:
+            log.close()
+
+        pattern = re.compile(r"https://[-a-z0-9]+\.trycloudflare\.com")
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            time.sleep(1)
+            try:
+                text = log_path.read_text(errors="replace")
+            except OSError:
+                continue
+            match = pattern.search(text)
+            if match:
+                global _TUNNEL_PROC
+                _TUNNEL_PROC = proc
+                host = match.group(0).replace("https://", "")
+                os.environ["PUBLIC_HOST"] = host
+                return match.group(0)
+            if proc.poll() is not None:
+                return None
+        return None
+    except Exception:                                        # noqa: BLE001
+        if proc is not None:
+            with contextlib.suppress(Exception):
+                proc.terminate()
+        return None
+
+
+def stop_tunnel() -> bool:
+    """
+    Terminate the tunnel `cloudflared_public_url` started, if any.
+
+    Returns whether one was running. The tunnel is a child of the kernel, so it
+    dies with the kernel anyway; this is for the notebook's Stop cell, which
+    frees the port and the GPU while the kernel stays up.
+    """
+    global _TUNNEL_PROC
+    proc = _TUNNEL_PROC
+    _TUNNEL_PROC = None
+    if proc is None or proc.poll() is not None:
+        return False
+    with contextlib.suppress(Exception):
+        proc.terminate()
+        proc.wait(timeout=10)
+    return True
 
 
 def _colab_proxy_url(port: int, attempts: int = 3) -> str | None:

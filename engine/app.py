@@ -1,4 +1,5 @@
 import asyncio
+import gc
 import os
 import re
 import shutil
@@ -481,6 +482,27 @@ def _boot(stage: str, index: int):
     print(f"[BOOT] {index}/{BOOT['total']} {stage}")
 
 
+def _release_memory():
+    """
+    Drop the scratch allocations a stage leaves behind before the next one loads.
+
+    On a free Colab T4 the pipeline has to fit Whisper, NLLB, Wav2Lip and a
+    voice model at once, and the peaks are transient: a stage allocates large
+    temporary buffers while loading and never needs them again. Python holds
+    them until GC runs, and torch holds freed GPU blocks in its caching
+    allocator. Returning both before the next stage is what keeps the summed
+    footprint under the ceiling instead of on top of it.
+    """
+    gc.collect()
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+    except Exception:                                        # noqa: BLE001
+        pass
+
+
 def _warmup():
     """
     Preload weights so the first render does not pay the load cost.
@@ -507,6 +529,8 @@ def _warmup():
             # splash can say so rather than claiming everything is ready.
             print(f"[BOOT] {label} failed: {e}")
             BOOT["notes"].append(_boot_note(label, e))
+        finally:
+            _release_memory()
     BOOT["stage"] = "Ready"
     BOOT["ready"] = True
     print("[BOOT] Warmup complete")
